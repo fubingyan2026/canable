@@ -93,17 +93,19 @@ class CANWorker(QObject):
             if ver:
                 logger.info("固件版本: %s", ver)
 
-            # 检查 FD 支持
+            # FD 模式设置
             if self.fd_mode:
                 fd_ok = self._bus.check_fd_support()
                 if not fd_ok:
                     self.error.emit(
-                        "⚠️ 固件可能不支持 CAN FD (Y 命令返回错误)。"
+                        "⚠️ 固件可能不支持 CAN FD。"
                         "FD 帧发送可能失败，建议切换为经典 CAN 模式。"
                     )
                 else:
                     if self.data_bitrate:
                         self._bus.set_data_bitrate(self.data_bitrate)
+                # 设置 gs_usb 后端的 FD 模式标志
+                self._bus._fd_mode = True
 
             self._bus.start()
             self._connected = True
