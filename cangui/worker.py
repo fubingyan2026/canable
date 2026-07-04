@@ -113,7 +113,7 @@ class CANWorker(QObject):
                     if self.data_bitrate:
                         self._bus.set_data_bitrate(self.data_bitrate)
                     # 仅在固件支持 FD 时才设置标志
-                    self._bus._fd_mode = True
+                    self._bus.fd_mode = True
 
             self._bus.start()
             self._connected = True
@@ -167,7 +167,7 @@ class CANWorker(QObject):
         if self._bus is None or not self._connected:
             self.error.emit("未连接，无法发送")
             return
-        if not self._bus._running:
+        if not self._bus.running:
             self.error.emit("控制器未启动，无法发送")
             return
         # 标记为本机发送，让 trace 面板用绿色区分

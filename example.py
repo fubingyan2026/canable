@@ -90,13 +90,13 @@ def example_listen():
 
 
 # -----------------------------------------------------------------------------
-# 示例 5：自发自收回环测试（需要把 CANH/CANL 短接或总线只有一台设备）
+# 示例 5：自发自收回环测试（启用控制器内部 loopback）
 # -----------------------------------------------------------------------------
 def example_loopback():
     print("\n=== 示例 5：自发自收回环测试 ===")
     with ZDTCanable() as bus:
         bus.set_bitrate(500_000)
-        bus.start()
+        bus.start(loopback=True)
 
         received = []
 
@@ -125,7 +125,7 @@ def example_loopback():
         if len(received) >= len(test_frames):
             print("  ✓ 回环测试通过")
         else:
-            print("  ✗ 未收到全部回环（请检查 CANH/CANL 是否短接）")
+            print("  ✗ 未收到全部回环")
 
 
 # -----------------------------------------------------------------------------

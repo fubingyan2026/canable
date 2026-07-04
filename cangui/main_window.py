@@ -197,10 +197,9 @@ class MainWindow(QMainWindow):
         act_id.triggered.connect(self._on_identify)
         hw_menu.addAction(act_id)
         hw_menu.addSeparator()
-        # canable2 固件 slcan 模式：M0=Normal, M1=Silent (listen only, 不允许 TX)
-        # 注意：canable2 slcan 固件**没有 loopback** 命令，
-        # 想要"自己发自己收"必须接两个 CAN 节点。
-        self.act_silent = QAction("Silent 模式 (M1 只听不发)", self)
+        # ElmueSoft 协议 ListenOnly 模式：只听不发，不发送 ACK
+        # 注意：想要"自己发自己收"必须接两个 CAN 节点。
+        self.act_silent = QAction("Silent 模式 (只听不发)", self)
         self.act_silent.setCheckable(True)
         self.act_silent.toggled.connect(self._on_silent_toggle)
         hw_menu.addAction(self.act_silent)

@@ -1,412 +1,605 @@
-#!/usr/bin/env python3
-"""ZDT_CANable_2.0pro Python 驱动
+"""CANable 2.5 ElmueSoft USB-CAN 驱动。
 
-兼容 gs_usb (candleLight) 和 slcan (CDC ACM) 两种固件模式。
-构造时 backend="auto" 会自动检测。
-
-依赖: pip install pyusb pyserial
+支持 CANable 2.5 固件的 ElmueSoft 变长协议和 Legacy 80 字节协议。
+设备: VID=0x1D50, PID=0x606F, EP_IN=0x81, EP_OUT=0x02
 """
+from __future__ import annotations
 
-import struct
-import time
-import threading
 import logging
+import struct
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-try:
-    import usb.core
-    import usb.util
-except ImportError:
-    raise ImportError("缺少 pyusb，请先执行: pip install pyusb")
+import usb.core
+import usb.util
 
 logger = logging.getLogger("zdt_canable")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
 
-
-# ----------------------------------------------------------------------------
+# =====================================================================
 #  USB 标识
-# ----------------------------------------------------------------------------
-# 所有已知的 gs_usb 兼容设备 VID/PID。
-# ZDT_CANable 2.0 PRO 出厂固件通常是 canable2（github.com/normaldotcom/canable2），
-# VID/PID 为 16D0:117E。
-KNOWN_DEVICES = [
-    (0x16D0, 0x117E, "MCS CANable2 (canable2 固件)"),
-    (0x1D50, 0x606F, "candleLight 默认"),
-    (0x1D50, 0x6069, "candleLight 派生"),
-    (0x1D50, 0x606A, "candleLight 派生"),
-    (0x1D50, 0x606B, "candleLight 派生"),
-    (0x1D50, 0x606C, "candleLight 派生"),
-    (0x1D50, 0x606D, "candleLight 派生"),
-    (0x1D50, 0x606E, "candleLight 派生"),
-    (0x1D50, 0x60AC, "cantact / CANAble (兼容)"),
-    (0x1209, 0x2323, "pid.codes gs_usb"),
-    (0x1209, 0x2322, "pid.codes 派生"),
-    (0x16D0, 0x0FDB, "MDFLY CANable (旧版)"),
-]
+# =====================================================================
+CANABLE_VID = 0x1D50
+CANABLE_PID = 0x606F
+EP_IN  = 0x81
+EP_OUT = 0x02
+MAX_PACKET_SIZE = 64
 
-# ----------------------------------------------------------------------------
-#  gs_usb 控制请求
-# ----------------------------------------------------------------------------
-GS_USB_BREQ_HOST_FORMAT     = 0
-GS_USB_BREQ_BITTIMING       = 1
-GS_USB_BREQ_MODE            = 2
-GS_USB_BREQ_BERR            = 3
-GS_USB_BREQ_BT_CONST        = 4
-GS_USB_BREQ_DEVICE_CONFIG   = 5
-GS_USB_BREQ_DATA_BITTIMING  = 10
+# =====================================================================
+#  ElmueSoft 消息类型
+# =====================================================================
+MSG_TxFrame  = 10
+MSG_TxEcho   = 11
+MSG_RxFrame  = 12
+MSG_Error    = 13
+MSG_String   = 14
+MSG_Busload  = 15
 
-# gs_host_frame 标志位 (与 Linux 内核 gs_usb.c 一致)
-GS_CAN_FLAG_OVERFLOW = 0x01  # BIT(0)
-GS_CAN_FLAG_FD       = 0x02  # BIT(1)
-GS_CAN_FLAG_BRS      = 0x04  # BIT(2)
-GS_CAN_FLAG_ESI      = 0x08  # BIT(3)
+VALID_MSG_TYPES = {MSG_TxFrame, MSG_TxEcho, MSG_RxFrame, MSG_Error, MSG_String, MSG_Busload}
+MAX_ELMUE_MSG_SIZE = 128  # CAN FD 64字节 + header 约 75 字节，留安全余量
 
-# RX 帧的 echo_id 标记 (与 Linux 内核 gs_usb.c 一致)
-GS_HOST_FRAME_ECHO_ID_RX = 0xFFFFFFFF
+# =====================================================================
+#  控制请求码 (eUsbRequest)
+# =====================================================================
+GS_ReqSetHostFormat     = 0
+GS_ReqSetBitTiming      = 1
+GS_ReqSetDeviceMode     = 2
+GS_ReqGetCapabilities   = 4
+GS_ReqGetDeviceVersion  = 5
+GS_ReqGetTimestamp      = 6
+GS_ReqIdentify          = 7
+GS_ReqSetBitTimingFD    = 10
+GS_ReqGetCapabilitiesFD = 11
+GS_ReqSetTermination    = 12
+GS_ReqGetTermination    = 13
+ELM_ReqGetBoardInfo     = 20
+ELM_ReqSetFilter        = 21
+ELM_ReqGetLastError     = 22
+ELM_ReqSetBusLoadReport = 23
 
-# gs_device_mode 标志位
-GS_CAN_MODE_RESET        = 0
-GS_CAN_MODE_START        = 1
-GS_CAN_MODE_LISTEN_ONLY  = 0x01
-GS_CAN_MODE_LOOP_BACK    = 0x02
-GS_CAN_MODE_HW_TIMESTAMP = 0x10   # BIT(4) — 启用固件硬件时间戳
-GS_CAN_MODE_FD           = 0x100   # BIT(8)
-# PAD_PKTS_TO_MAX_PKT_SIZE 会将帧填充到 128 字节 (sizeof to_host_buf),
-# 产生 2×64 字节完整包无短包终止, 导致 pyusb 读取 80 字节后数据错位。
-# libusb/pyusb 不需要 PAD, 靠短包 (<64 字节) 终止传输。
-# GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE = 0x80  # 不使用
+# =====================================================================
+#  设备标志 (eDeviceFlags)
+# =====================================================================
+GS_DevFlagListenOnly       = 0x0001
+GS_DevFlagLoopback         = 0x0002
+GS_DevFlagOneShot          = 0x0008
+GS_DevFlagTimestamp        = 0x0010
+GS_DevFlagIdentify         = 0x0020
+GS_DevFlagCAN_FD           = 0x0100
+GS_DevFlagBitTimingFD      = 0x0400
+GS_DevFlagTermination      = 0x0800
+ELM_DevFlagProtocolElmue   = 0x4000
+ELM_DevFlagDisableTxEcho   = 0x8000
 
-# gs_usb HOST_FORMAT 魔数
-GS_USB_HOST_FORMAT_MAGIC = 0x0000BEEF
+# =====================================================================
+#  CAN ID 标志 (eCanIdFlags)
+# =====================================================================
+CAN_ID_Error  = 0x20000000
+CAN_ID_RTR    = 0x40000000
+CAN_ID_29Bit  = 0x80000000
+CAN_MASK_11   = 0x000007FF
+CAN_MASK_29   = 0x1FFFFFFF
 
-# 帧大小 (与 kazu-321 固件 gs_host_frame 结构一致)
-# 经典帧: 12(header) + 8(data) = 20 字节
-# FD帧:   12(header) + 64(data) + 4(timestamp) = 80 字节
-# 固件 PrepareReceive 使用 sizeof(gs_host_frame) = 80 (含 canfd_ts 联合体)
-# TX 也必须发送完整 80 字节，否则固件收不到完整传输
-GS_USB_FRAME_SIZE_FD = 80
+# =====================================================================
+#  帧标志 (eFrameFlags)
+# =====================================================================
+FRM_FDF = 0x02
+FRM_BRS = 0x04
+FRM_ESI = 0x08
 
-# CAN FD DLC 映射 (DLC码 → 实际字节数)
+# =====================================================================
+#  错误标志 (eErrFlagsCanID)
+# =====================================================================
+ERID_Tx_Timeout        = 0x0001
+ERID_Arbitration_lost  = 0x0002
+ERID_Controller_problem = 0x0004
+ERID_Protocol_violation = 0x0008
+ERID_Transceiver_error = 0x0010
+ERID_No_ACK_received   = 0x0020
+ERID_Bus_is_off        = 0x0040
+ERID_Bus_error         = 0x0080
+ERID_Controller_restarted = 0x0100
+ERID_CRC_Error         = 0x0200
+
+# 错误应用标志 (eErrorAppFlags, err_data[5])
+APP_CanRxFail      = 0x01
+APP_CanTxFail      = 0x02
+APP_CanTxOverflow   = 0x04
+APP_UsbInOverflow   = 0x08
+APP_CanTxTimeout    = 0x10
+
+# 错误总线状态 (eErrorBusStatus, err_data[1] 高4位)
+BUS_StatusActive  = 0x00
+BUS_StatusWarning = 0x10
+BUS_StatusPassive = 0x20
+BUS_StatusOff     = 0x30
+
+# 错误字节1标志 (eErrFlagsByte1)
+ER1_Rx_Errors_at_warning_level = 0x04
+ER1_Tx_Errors_at_warning_level = 0x08
+ER1_Rx_Passive_status_reached  = 0x10
+ER1_Tx_Passive_status_reached  = 0x20
+ER1_Bus_is_back_active         = 0x40
+
+# HOST_FORMAT 魔数
+HOST_FORMAT_MAGIC = 0x0000BEEF
+
+# Legacy 帧大小
+LEGACY_FRAME_SIZE = 80
+
+# CAN FD DLC 映射
 CAN_FD_DLC_MAP = {
     0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8,
-    9: 12, 0xA: 16, 0xB: 20, 0xC: 24, 0xD: 32, 0xE: 48, 0xF: 64,
-}
-# 反向映射: 字节数 → DLC码
-CAN_FD_DLC_REVERSE = {v: k for k, v in CAN_FD_DLC_MAP.items()}
-
-# CAN ID 标志位
-CAN_EFF_FLAG = 0x80000000   # 扩展帧
-CAN_RTR_FLAG = 0x40000000   # 远程帧
-CAN_ERR_FLAG = 0x20000000   # 错误帧
-
-# CAN 错误类型 (can_id 低字节掩码)
-CAN_ERR_ACK     = 0x00000020   # 未收到 ACK
-CAN_ERR_BUSOFF  = 0x00000040   # 总线关闭
-CAN_ERR_BUSERROR = 0x00000080  # 总线错误
-CAN_ERR_CRTL    = 0x00000004   # 控制器错误
-
-# ----------------------------------------------------------------------------
-#  位定时参数 — 从设备 BT_CONST 动态计算
-#  默认值基于 STM32G4 FDCAN 时钟 (kazu-321 FD 移植版: 160 MHz)
-#  注意：实际时钟在 _init_gsusb() 中从 BT_CONST 动态获取
-#  (brp, prop_seg, phase_seg1, phase_seg2, sjw)
-#  bit_rate = clk / (brp * (1 + prop_seg + phase_seg1 + phase_seg2))
-# ----------------------------------------------------------------------------
-DEFAULT_CAN_CLK = 160_000_000   # STM32G4 FDCAN 时钟 (kazu-321 FD 移植版)
-
-def _calc_btr(clk: int, bitrate: int):
-    """根据时钟频率和目标波特率计算位定时参数。
-
-    返回 (brp, prop_seg, phase_seg1, phase_seg2, sjw)。
-    遍历所有 brp，选择实际波特率误差最小的组合。
-    """
-    best = None          # (error, brp, total_tq)
-    for brp in range(1, 1025):
-        total_tq_f = clk / (bitrate * brp)
-        if total_tq_f < 8:
-            break       # brp 再大 total_tq 只会更小
-        if total_tq_f > 25:
-            continue
-        total_tq = round(total_tq_f)
-        if total_tq < 8 or total_tq > 25:
-            continue
-        actual = clk / (brp * total_tq)
-        err = abs(actual - bitrate) / bitrate
-        if best is None or err < best[0]:
-            best = (err, brp, total_tq)
-
-    if best is None:
-        raise ValueError(f"无法为 {bitrate} bps / {clk} Hz 计算位定时")
-
-    _, brp, total_tq = best
-    # 分配: sync_seg=1, prop_seg=1, phase_seg2=max(2, total_tq//4), phase_seg1=剩余
-    prop_seg = 1
-    phase_seg2 = max(2, total_tq // 4)
-    phase_seg1 = total_tq - 1 - prop_seg - phase_seg2
-    if phase_seg1 < 1:
-        phase_seg1 = 1
-        phase_seg2 = total_tq - 1 - prop_seg - phase_seg1
-    sjw = min(phase_seg2, 4)
-    return (brp, prop_seg, phase_seg1, phase_seg2, sjw)
-
-# 常用波特率预计算表 (170 MHz)
-BTR_TABLE = {
-    bitrate: _calc_btr(DEFAULT_CAN_CLK, bitrate)
-    for bitrate in [10_000, 20_000, 50_000, 100_000, 125_000,
-                    250_000, 500_000, 800_000, 1_000_000]
+    9: 12, 10: 16, 11: 20, 12: 24, 13: 32, 14: 48, 15: 64,
 }
 
-# 数据相位位定时 (CAN FD data phase)
-DATA_BTR_TABLE = {
-    bitrate: _calc_btr(DEFAULT_CAN_CLK, bitrate)
-    for bitrate in [1_000_000, 2_000_000, 4_000_000, 5_000_000, 8_000_000]
+DLC_BOUNDARIES = [8, 12, 16, 20, 24, 32, 48, 64]
+
+# =====================================================================
+#  位定时预定义表
+#  格式: (brp, seg1, seg2, sjw)
+#  CAN时钟 = 160 MHz
+#  按 PDF 2.13 建议：BRS 时使用尽可能小的预分频器，避免总线关闭
+# =====================================================================
+NOMINAL_BITTIMING = {
+    # 87.5% sample point, 尽可能小的预分频器 (参见 PDF 2.13)
+    10_000:    (80,  174, 25, 25),
+    20_000:    (40,  174, 25, 25),
+    50_000:    (16,  174, 25, 25),
+    83_333:    (10,  167, 24, 24),
+    100_000:   (8,   174, 25, 25),
+    125_000:   (8,   139, 20, 20),
+    250_000:   (4,   139, 20, 20),
+    500_000:   (2,   139, 20, 20),
+    800_000:   (1,   174, 25, 25),
+    1_000_000: (1,   139, 20, 20),
+}
+
+DATA_BITTIMING = {
+    # 注意：当数据波特率与标称相同时，使用与标称相同的参数以获得 "Perfect match"
+    500_000:   (2,  139, 20, 20),  # 与标称 500k 相同, 87.5%
+    1_000_000: (1,  139, 20, 20),  # 与标称 1M 相同, 87.5%
+    2_000_000: (1,  69,  10, 10),  # 160MHz / 80 = 2M, 87.5%
+    4_000_000: (1,  34,  5,  5),   # 160MHz / 40 = 4M, 87.5%
+    5_000_000: (1,  27,  4,  4),   # 160MHz / 32 = 5M, 87.5%
+    8_000_000: (1,  9,   10, 9),   # 160MHz / 20 = 8M, 50% (固件注释说8M用50%采样点)
 }
 
 
-# ----------------------------------------------------------------------------
-#  CAN 帧数据类
-# ----------------------------------------------------------------------------
+def _pad_to_dlc(data_len: int) -> int:
+    """CAN FD 数据长度按 DLC 边界向上填充。"""
+    if data_len <= 8:
+        return data_len
+    for b in DLC_BOUNDARIES:
+        if data_len <= b:
+            return b
+    return 64
+
+
+def _data_len_to_dlc(data_len: int) -> int:
+    """数据字节数 → DLC 码。"""
+    if data_len <= 8:
+        return data_len
+    for dlc, length in sorted(CAN_FD_DLC_MAP.items()):
+        if dlc > 8 and length >= data_len:
+            return dlc
+    return 15
+
+
+def _dlc_to_data_len(dlc: int) -> int:
+    """DLC 码 → 实际最大字节数。"""
+    return CAN_FD_DLC_MAP.get(dlc, 64)
+
+
+# =====================================================================
+#  CANFrame
+# =====================================================================
 @dataclass
 class CANFrame:
-    """CAN 2.0 / CAN FD 帧数据类。"""
-    can_id:    int                 # 仲裁 ID（11 位标准帧 或 29 位扩展帧）
-    data:      bytes = b""         # 数据域（经典 CAN: 0~8, CAN FD: 0~64 字节）
-    extended:  bool = False        # 是否扩展帧
-    rtr:       bool = False        # 是否远程帧
-    fd:        bool = False        # CAN FD 帧
-    brs:       bool = False        # Bit Rate Switch（仅 FD 有效）
-    esi:       bool = False        # Error State Indicator（仅 FD 有效）
-    timestamp: float = 0.0         # 接收时间戳（秒）
-    echo_id:   int = 0             # 用于回环匹配（发送时忽略）
-    is_tx:     bool = False        # 标记该帧来自本地发送（用于 UI 区分）
-    _error_info: str = ""         # 错误帧描述 (BUS-OFF, NO-ACK 等)
+    """CAN 帧数据类。"""
+    can_id:      int
+    data:        bytes = b""
+    extended:    bool  = False
+    rtr:         bool  = False
+    fd:          bool  = False
+    brs:         bool  = False
+    esi:         bool  = False
+    timestamp:   float = 0.0
+    echo_id:     int   = 0
+    is_tx:       bool  = False
+    _error_info: str   = ""
+
+    def __post_init__(self):
+        if not isinstance(self.data, bytes):
+            self.data = bytes(self.data)
 
     @property
     def is_error(self) -> bool:
         return bool(self._error_info)
 
-    def __post_init__(self):
-        # 错误帧跳过 ID 校验
-        if self._error_info:
-            return
-        if self.extended:
-            if not 0 <= self.can_id <= 0x1FFFFFFF:
-                raise ValueError(f"扩展帧 ID 越界: 0x{self.can_id:X}")
-        else:
-            if not 0 <= self.can_id <= 0x7FF:
-                raise ValueError(f"标准帧 ID 越界: 0x{self.can_id:X}")
-        max_len = 64 if self.fd else 8
-        if len(self.data) > max_len:
-            raise ValueError(f"{'CAN FD' if self.fd else '经典 CAN'} 数据不能超过 {max_len} 字节")
-        if not isinstance(self.data, (bytes, bytearray)):
-            self.data = bytes(self.data)
-
     @property
     def dlc(self) -> int:
-        """返回 DLC 码。经典 CAN 直接等于 len(data)，CAN FD 使用映射表。"""
-        n = len(self.data)
-        if not self.fd or n <= 8:
-            return n
-        return CAN_FD_DLC_REVERSE.get(n, 0xF)
+        if self.fd:
+            return _data_len_to_dlc(len(self.data))
+        return min(len(self.data), 8)
 
     @staticmethod
     def dlc_to_len(dlc: int) -> int:
-        """DLC 码 → 实际字节数。"""
-        return CAN_FD_DLC_MAP.get(dlc, 64)
+        return _dlc_to_data_len(dlc)
 
-    def to_bytes(self) -> bytes:
-        """打包为 gs_host_frame (TX 方向, host → device)。
+    def __str__(self) -> str:
+        id_fmt = f"{self.can_id:08X}" if self.extended else f"{self.can_id:03X}"
+        kind = "EFF" if self.extended else "SFF"
+        parts = [kind]
+        if self.fd:
+            parts.append("FD")
+        if self.brs:
+            parts.append("BRS")
+        if self.esi:
+            parts.append("ESI")
+        if self.rtr:
+            parts.append("RTR")
+        data_hex = " ".join(f"{b:02X}" for b in self.data)
+        return f"[{id_fmt} {' '.join(parts)}] {data_hex}"
 
-        与 kazu-321 固件 gs_host_frame 结构一致:
-          header: echo_id(u32) + can_id(u32) + can_dlc(u8) + channel(u8)
-                  + flags(u8) + reserved(u8) = 12 字节
-          经典帧: header + data(8) = 20 字节 (短包 < 64, USB 自动终止)
-          FD帧:   header + data(64) + timestamp(4) = 80 字节 (64+16 短包终止)
+    def __repr__(self) -> str:
+        return f"CANFrame({self})"
 
-        固件 PrepareReceive 请求 sizeof(gs_host_frame)=80 字节,
-        USB 控制器自动处理多包重组, TX 发 20 或 80 字节均可。
-        TX 的 timestamp 字段填 0, 固件忽略 (仅 RX 帧填充时间戳)。
+    # ----- ElmueSoft TX 打包 ----- #
+    def to_elmue_bytes(self, marker: int = 0) -> bytes:
+        """打包为 ElmueSoft kTxFrameElmue 格式。
+
+        kTxFrameElmue: {size(u8), MSG_TxFrame(u8), flags(u8), can_id(u32), marker(u8)} + data[]
         """
         can_id_raw = self.can_id
         if self.extended:
-            can_id_raw |= CAN_EFF_FLAG
+            can_id_raw |= CAN_ID_29Bit
         if self.rtr:
-            can_id_raw |= CAN_RTR_FLAG
+            can_id_raw |= CAN_ID_RTR
 
         flags = 0
         if self.fd:
-            flags |= GS_CAN_FLAG_FD
+            flags |= FRM_FDF
         if self.brs:
-            flags |= GS_CAN_FLAG_BRS
+            flags |= FRM_BRS
         if self.esi:
-            flags |= GS_CAN_FLAG_ESI
+            flags |= FRM_ESI
 
-        echo_id = self.echo_id if self.echo_id else 1
-
+        # CAN FD 数据按 DLC 边界填充
+        raw_data = bytes(self.data)
         if self.fd:
-            # canfd_ts 格式: data(64) + timestamp(4, TX时填0)
-            data_padded = bytes(self.data).ljust(64, b'\x00')
-            return struct.pack('<IIBBBB64sI',
-                               echo_id, can_id_raw, self.dlc, 0,
-                               flags, 0, data_padded, 0)
+            padded_len = _pad_to_dlc(len(raw_data))
+            raw_data = raw_data.ljust(padded_len, b'\x00')
         else:
-            data_padded = bytes(self.data).ljust(8, b'\x00')
-            return struct.pack('<IIBBBB8s',
-                               echo_id, can_id_raw, self.dlc, 0,
-                               flags, 0, data_padded)
+            raw_data = raw_data.ljust(min(len(raw_data), 8), b'\x00')[:8] if raw_data else b''
 
+        size = 8 + len(raw_data)  # kHeader(2) + flags(1) + can_id(4) + marker(1) + data
+        header = struct.pack('<BB', size, MSG_TxFrame)
+        body = struct.pack('<BIB', flags, can_id_raw, marker)
+        return header + body + raw_data
+
+    # ----- ElmueSoft RX 解析 ----- #
     @classmethod
-    def from_bytes(cls, raw: bytes) -> "CANFrame":
-        """从 gs_host_frame 还原成 CANFrame。
+    def from_elmue_rx(cls, raw: bytes, has_timestamp: bool) -> "CANFrame":
+        """从 ElmueSoft kRxFrameElmue 解析。"""
+        offset = 2  # 跳过 kHeader
+        flags = raw[offset]
+        can_id_raw = struct.unpack_from('<I', raw, offset + 1)[0]
+        offset += 5  # flags(1) + can_id(4)
 
-        与 kazu-321 固件 gs_host_frame 结构一致:
-              echo_id(u32) + can_id(u32) + can_dlc(u8) + channel(u8)
-              + flags(u8) + reserved(u8) = 12 字节 header
-        启用 HW_TIMESTAMP 后固件发送的帧大小:
-          经典帧: header(12) + data(8) + timestamp(4) = 24 字节
-          FD帧:   header(12) + data(64) + timestamp(4) = 80 字节
-        USB bulk 传输靠短包 (<64字节) 终止:
-          24 字节经典帧: 短包, 直接终止
-          80 字节FD帧:   64(完整包) + 16(短包) 终止
+        ts_us = 0
+        if has_timestamp:
+            ts_us = struct.unpack_from('<I', raw, offset)[0]
+            offset += 4
+
+        data = raw[offset:]
+
+        extended = bool(can_id_raw & CAN_ID_29Bit)
+        rtr = bool(can_id_raw & CAN_ID_RTR)
+        can_id = can_id_raw & CAN_MASK_29 if extended else can_id_raw & CAN_MASK_11
+        is_fd = bool(flags & FRM_FDF)
+        ts = ts_us / 1_000_000.0 if ts_us else time.time()
+
+        return cls(
+            can_id=can_id, data=bytes(data), extended=extended, rtr=rtr,
+            fd=is_fd, brs=bool(flags & FRM_BRS), esi=bool(flags & FRM_ESI),
+            timestamp=ts, is_tx=False,
+        )
+
+    # ----- ElmueSoft TX Echo 解析 ----- #
+    @classmethod
+    def from_elmue_echo(cls, raw: bytes, has_timestamp: bool,
+                        tx_frames: dict = None) -> "CANFrame":
+        """从 ElmueSoft kTxEchoElmue 解析。
+
+        使用 marker 匹配原始 TX 帧，重建完整帧信息。
         """
+        marker = raw[2]
+        ts_us = 0
+        if has_timestamp and len(raw) >= 7:
+            ts_us = struct.unpack_from('<I', raw, 3)[0]
+        ts = ts_us / 1_000_000.0 if ts_us else time.time()
+
+        # 如果有缓存的 TX 帧，用 marker 找回
+        if tx_frames and marker in tx_frames:
+            orig = tx_frames[marker]
+            return cls(
+                can_id=orig.can_id, data=orig.data, extended=orig.extended,
+                rtr=orig.rtr, fd=orig.fd, brs=orig.brs, esi=orig.esi,
+                timestamp=ts, echo_id=marker, is_tx=True,
+            )
+
+        return cls(can_id=0, data=b"", timestamp=ts, echo_id=marker, is_tx=True)
+
+    # ----- Legacy 解析 ----- #
+    @classmethod
+    def from_legacy_bytes(cls, raw: bytes) -> "CANFrame":
+        """从 Legacy kHostFrameLegacy (80字节) 解析。"""
         if len(raw) < 12:
             return None
 
-        # 字段顺序: echo_id 在前, can_id 在后 (与内核 gs_usb.c 一致)
         echo_id, can_id_full = struct.unpack('<II', raw[:8])
-        dlc, _channel = struct.unpack('<BB', raw[8:10])
+        dlc = raw[8]
         flags = raw[10]
 
-        # 帧验证: DLC > 15 对经典和 FD 都无效, 可能是数据错位
         if dlc > 15:
-            logger.warning("帧无效 (DLC=%d, raw=%d字节), 跳过", dlc, len(raw))
+            logger.warning("Legacy帧无效 (DLC=%d), 跳过", dlc)
             return None
 
-        # 错误帧 (CAN_ERR_FLAG) — 生成带错误类型的 CANFrame
-        if can_id_full & CAN_ERR_FLAG:
-            err_bits = can_id_full & ~CAN_ERR_FLAG
+        is_fd = bool(flags & FRM_FDF)
+        actual_len = cls.dlc_to_len(dlc) if is_fd else min(dlc, 8)
+        data = raw[12:12 + actual_len]
+
+        ts = time.time()
+        if is_fd and len(raw) >= 80:
+            ts_us = struct.unpack_from('<I', raw, 76)[0]
+            if ts_us:
+                ts = ts_us / 1_000_000.0
+        elif not is_fd and len(raw) >= 24:
+            ts_us = struct.unpack_from('<I', raw, 20)[0]
+            if ts_us:
+                ts = ts_us / 1_000_000.0
+
+        extended = bool(can_id_full & CAN_ID_29Bit)
+        rtr = bool(can_id_full & CAN_ID_RTR)
+        can_id = can_id_full & CAN_MASK_29 if extended else can_id_full & CAN_MASK_11
+
+        is_error = bool(can_id_full & CAN_ID_Error)
+        if is_error:
             parts = []
-            if err_bits & CAN_ERR_BUSOFF:
+            if can_id_full & ERID_Bus_is_off:
                 parts.append("BUS-OFF")
-            if err_bits & CAN_ERR_ACK:
+            if can_id_full & ERID_No_ACK_received:
                 parts.append("NO-ACK")
-            if err_bits & CAN_ERR_BUSERROR:
-                parts.append("BUS-ERROR")
-            if err_bits & CAN_ERR_CRTL:
-                parts.append("CTRL-ERR")
+            if can_id_full & ERID_CRC_Error:
+                parts.append("CRC-ERR")
             if not parts:
-                parts.append(f"ERR-0x{err_bits:02X}")
+                parts.append(f"ERR-0x{can_id_full & ~CAN_ID_Error:02X}")
             return cls(
-                can_id=0,
-                data=bytes([err_bits & 0xFF]),
-                timestamp=time.time(),
-                is_tx=False,
+                can_id=0, data=bytes([can_id_full & 0xFF]),
+                timestamp=time.time(), is_tx=False,
                 _error_info=" ".join(parts),
             )
 
-        # RX 帧: echo_id == GS_HOST_FRAME_ECHO_ID_RX (0xFFFFFFFF)
-        # TX echo: echo_id != GS_HOST_FRAME_ECHO_ID_RX
-        is_tx = (echo_id != GS_HOST_FRAME_ECHO_ID_RX)
-
-        is_fd = bool(flags & GS_CAN_FLAG_FD)
-        actual_len = cls.dlc_to_len(dlc) if is_fd else min(dlc, 8)
-        data_start = 12
-        data = raw[data_start:data_start + actual_len]
-
-        # 解析固件时间戳 (canfd_ts / classic_can_ts 格式)
-        ts = time.time()
-        if is_fd and len(raw) >= 80:
-            # canfd_ts: data[64] 之后 4 字节时间戳
-            timestamp_us = struct.unpack_from('<I', raw, 76)[0]
-            if timestamp_us:
-                ts = timestamp_us / 1_000_000.0
-        elif not is_fd and len(raw) >= 20:
-            # classic_can_ts: data[8] 之后可能有 4 字节时间戳
-            if len(raw) >= 24:
-                timestamp_us = struct.unpack_from('<I', raw, 20)[0]
-                if timestamp_us:
-                    ts = timestamp_us / 1_000_000.0
-
-        extended = bool(can_id_full & CAN_EFF_FLAG)
-        rtr      = bool(can_id_full & CAN_RTR_FLAG)
-        can_id   = can_id_full & 0x1FFFFFFF if extended else can_id_full & 0x7FF
-
+        is_tx = (echo_id != 0xFFFFFFFF)
         return cls(
-            can_id=can_id,
-            data=bytes(data),
-            extended=extended,
-            rtr=rtr,
-            fd=is_fd,
-            brs=bool(flags & GS_CAN_FLAG_BRS),
-            esi=bool(flags & GS_CAN_FLAG_ESI),
-            timestamp=ts,
-            echo_id=echo_id if is_tx else 0,
-            is_tx=is_tx,
+            can_id=can_id, data=bytes(data), extended=extended, rtr=rtr,
+            fd=is_fd, brs=bool(flags & FRM_BRS), esi=bool(flags & FRM_ESI),
+            timestamp=ts, echo_id=echo_id if is_tx else 0, is_tx=is_tx,
         )
 
-    def __str__(self) -> str:
-        if self._error_info:
-            return f"[ERROR: {self._error_info}]"
-        kind = "EFF" if self.extended else "SFF"
-        tags = []
-        if self.fd:
-            tags.append("FD")
-        if self.brs:
-            tags.append("BRS")
-        if self.esi:
-            tags.append("ESI")
+    # ----- Legacy TX 打包 ----- #
+    def to_legacy_bytes(self) -> bytes:
+        """打包为 Legacy kHostFrameLegacy (80字节)。"""
+        can_id_raw = self.can_id
+        if self.extended:
+            can_id_raw |= CAN_ID_29Bit
         if self.rtr:
-            tags.append("RTR")
-        tag_str = " ".join(tags)
-        id_s = f"{self.can_id:08X}" if self.extended else f"{self.can_id:03X}"
-        return f"[{id_s} {kind} {tag_str}] {self.data.hex(' ').upper()}"
+            can_id_raw |= CAN_ID_RTR
+
+        flags = 0
+        if self.fd:
+            flags |= FRM_FDF
+        if self.brs:
+            flags |= FRM_BRS
+        if self.esi:
+            flags |= FRM_ESI
+
+        echo_id = self.echo_id if self.echo_id else 1
+        dlc = self.dlc
+
+        if self.fd:
+            data_padded = bytes(self.data).ljust(64, b'\x00')
+            return struct.pack('<IIBBBB64sI',
+                               echo_id, can_id_raw, dlc, 0,
+                               flags, 0, data_padded, 0)
+        else:
+            data_padded = bytes(self.data).ljust(8, b'\x00')[:8]
+            return struct.pack('<IIBBBB8s',
+                               echo_id, can_id_raw, dlc, 0,
+                               flags, 0, data_padded)
 
 
-# ----------------------------------------------------------------------------
-#  设备驱动
-# ----------------------------------------------------------------------------
+# =====================================================================
+#  ElmueSoft 消息流解析器
+# =====================================================================
+class _ElmueProtocol:
+    """ElmueSoft 变长协议消息流解析器。"""
+
+    def __init__(self):
+        self._buffer = bytearray()
+        self._has_timestamp = False
+        self._tx_frames: dict = {}  # marker -> CANFrame (用于 TX echo 匹配)
+        self._pending_frames: list = []
+
+    def set_timestamp_mode(self, enabled: bool):
+        self._has_timestamp = enabled
+
+    def store_tx_frame(self, marker: int, frame: CANFrame):
+        """缓存 TX 帧以便 TX echo 匹配。"""
+        self._tx_frames[marker] = frame
+
+    def clear(self):
+        """清空内部缓冲区。"""
+        self._buffer.clear()
+        self._pending_frames.clear()
+        self._tx_frames.clear()
+
+    def feed(self, raw: bytes) -> list:
+        """将 USB 读取的原始字节喂入解析器，返回解析出的 CANFrame 列表。"""
+        self._buffer.extend(raw)
+        frames = []
+        while len(self._buffer) >= 2:
+            size = self._buffer[0]
+            msg_type = self._buffer[1]
+
+            # 同步恢复: 丢弃非法 header，直到找到合法消息边界
+            if size < 2 or size > MAX_ELMUE_MSG_SIZE or msg_type not in VALID_MSG_TYPES:
+                self._buffer.pop(0)
+                continue
+
+            if len(self._buffer) < size:
+                break
+
+            msg = bytes(self._buffer[:size])
+            del self._buffer[:size]
+
+            frame = self._parse_message(msg, msg_type)
+            if frame is not None:
+                frames.append(frame)
+
+        return frames
+
+    def flush_frames(self) -> list:
+        """返回之前解析但未消费的帧。"""
+        frames = self._pending_frames
+        self._pending_frames = []
+        return frames
+
+    def _parse_message(self, msg: bytes, msg_type: int) -> Optional[CANFrame]:
+        logger.debug("解析消息: type=%d size=%d data=%s", msg_type, len(msg), msg.hex())
+        if msg_type == MSG_RxFrame:
+            return CANFrame.from_elmue_rx(msg, self._has_timestamp)
+        elif msg_type == MSG_TxEcho:
+            return CANFrame.from_elmue_echo(msg, self._has_timestamp, self._tx_frames)
+        elif msg_type == MSG_Error:
+            return self._parse_error(msg)
+        elif msg_type == MSG_String:
+            self._parse_string(msg)
+            return None
+        elif msg_type == MSG_Busload:
+            self._parse_busload(msg)
+            return None
+        else:
+            logger.warning("未知 ElmueSoft 消息类型: %d (size=%d)", msg_type, len(msg))
+            return None
+
+    def _parse_error(self, msg: bytes) -> CANFrame:
+        """解析 kErrorElmue: {header(2), err_id(4), err_data(8), [timestamp(4)]}"""
+        if len(msg) < 6:
+            return CANFrame(can_id=0, _error_info="ERR-SHORT")
+
+        err_id = struct.unpack_from('<I', msg, 2)[0]
+        err_data = msg[6:14] if len(msg) >= 14 else b'\x00' * 8
+
+        parts = []
+
+        # eErrFlagsCanID
+        if err_id & ERID_Bus_is_off:
+            parts.append("BUS-OFF")
+        if err_id & ERID_No_ACK_received:
+            parts.append("NO-ACK")
+        if err_id & ERID_CRC_Error:
+            parts.append("CRC-ERR")
+        if err_id & ERID_Tx_Timeout:
+            parts.append("TX-TIMEOUT")
+        if err_id & ERID_Arbitration_lost:
+            parts.append("ARB-LOST")
+
+        # err_data[1] = eErrFlagsByte1
+        byte1 = err_data[1] if len(err_data) > 1 else 0
+        bus_status = byte1 & 0x30
+        if bus_status == BUS_StatusOff:
+            parts.append("BUS-OFF")
+        elif bus_status == BUS_StatusPassive:
+            parts.append("ERROR-PASSIVE")
+        elif bus_status == BUS_StatusWarning:
+            parts.append("ERROR-WARNING")
+        elif byte1 & ER1_Bus_is_back_active:
+            parts.append("BACK-ACTIVE")
+
+        # err_data[5] = eErrorAppFlags
+        app_flags = err_data[5] if len(err_data) > 5 else 0
+        if app_flags & APP_CanTxOverflow:
+            parts.append("TX-OVERFLOW")
+        if app_flags & APP_CanTxTimeout:
+            parts.append("TX-TIMEOUT")
+        if app_flags & APP_CanRxFail:
+            parts.append("RX-FAIL")
+        if app_flags & APP_CanTxFail:
+            parts.append("TX-FAIL")
+        if app_flags & APP_UsbInOverflow:
+            parts.append("USB-OVERFLOW")
+
+        # err_data[6] = TX error count, err_data[7] = RX error count
+        tx_err = err_data[6] if len(err_data) > 6 else 0
+        rx_err = err_data[7] if len(err_data) > 7 else 0
+        if tx_err or rx_err:
+            parts.append(f"TEC={tx_err} REC={rx_err}")
+
+        if not parts:
+            parts.append(f"ERR-0x{err_id:02X}")
+
+        return CANFrame(
+            can_id=0, data=bytes([err_id & 0xFF]),
+            timestamp=time.time(), is_tx=False,
+            _error_info=" ".join(parts),
+        )
+
+    def _parse_string(self, msg: bytes):
+        text = msg[2:].decode('ascii', errors='ignore')
+        logger.info("设备: %s", text)
+
+    def _parse_busload(self, msg: bytes):
+        if len(msg) >= 3:
+            load = msg[2]
+            logger.debug("总线负载: %d%%", load)
+
+
+# =====================================================================
+#  ZDTCanable 主驱动类
+# =====================================================================
 class ZDTCanable:
-    """ZDT_CANable_2.0pro 设备驱动，自动选择 gs_usb 或 slcan 后端。"""
+    """CANable 2.5 USB-CAN 适配器驱动 (ElmueSoft 协议)。"""
 
-    def __init__(self,
-                 vid: Optional[int] = None,
-                 pid: Optional[int] = None,
-                 serial: Optional[str] = None,
-                 port: Optional[str] = None,
-                 backend: str = "auto"):
-        self.vid    = vid
-        self.pid    = pid
+    def __init__(self, vid=None, pid=None, serial=None, port=None, backend=None):
+        self.vid    = vid or CANABLE_VID
+        self.pid    = pid or CANABLE_PID
         self.serial = serial
-        self.port   = port
-        self.backend = backend
-
-        # gs_usb 状态
+        # port/backend 参数保留兼容性但不使用
         self.dev:    Optional[usb.core.Device] = None
         self.ep_out: Optional[usb.core.Endpoint] = None
         self.ep_in:  Optional[usb.core.Endpoint] = None
 
-        # 公共
         self._lock       = threading.Lock()
         self._running    = False
-        self._recv_thr:  Optional[threading.Thread] = None
-        self._callbacks: List[Callable[[CANFrame], None]] = []
-        self._overflow_cb: Optional[Callable[[], None]] = None
+        self._fd_mode    = False
         self._bitrate:   Optional[int] = None
         self._data_bitrate: Optional[int] = None
-        self._fd_mode:   bool = False
-        self._can_clk:   int = DEFAULT_CAN_CLK
-        self._feature_flags: int = 0
-
-        # TX 节流: 错误状态时暂停发送, 避免淹没固件缓冲池导致 Pipe error
+        self._capabilities: int = 0
+        self._capabilities_fd: int = 0
+        self._protocol:  Optional[str] = None  # "elmue" or "legacy"
+        self._parser:    Optional[_ElmueProtocol] = None
+        self._marker_counter: int = 0
+        self._has_timestamp: bool = False
+        self._listen_only: bool = False
+        self._loopback: bool = False
+        self._callbacks: List[Callable[[CANFrame], None]] = []
+        self._overflow_cb: Optional[Callable[[], None]] = None
+        self._last_error_info: Optional[str] = None
         self._tx_blocked_until: float = 0.0
 
-        # 后端分发
-        self._is_slcan = False
-        self._slcan:    Optional[object] = None   # ZDTCanableSLCAN 实例
-
-    # ----------------- 上下文管理器 -----------------
     def __enter__(self):
         self.open()
         return self
@@ -414,184 +607,149 @@ class ZDTCanable:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    # ----------------- 后端调度辅助 -----------------
-    def _slcan_obj(self):
-        if self._slcan is None:
-            from zdt_canable_slcan import ZDTCanableSLCAN
-            self._slcan = ZDTCanableSLCAN(port=self.port)
-        return self._slcan
+    @property
+    def running(self) -> bool:
+        return self._running
 
-    def _delegate(self, method_name, *args, **kwargs):
-        """slcan 模式下，转发到 slcan 后端。"""
-        obj = self._slcan_obj()
-        return getattr(obj, method_name)(*args, **kwargs)
+    @property
+    def fd_mode(self) -> bool:
+        return self._fd_mode
 
-    # ----------------- 枚举 / 打开 / 关闭 -----------------
+    @fd_mode.setter
+    def fd_mode(self, value: bool):
+        self._fd_mode = value
+
+    # ================================================================
+    #  静态方法: 设备枚举
+    # ================================================================
     @staticmethod
     def list_devices() -> List[dict]:
-        """列出当前所有支持的设备（合并 gs_usb 和 slcan 扫描结果）。"""
-        devs: List[dict] = []
-
-        # 1) gs_usb
-        for vid, pid, _desc in KNOWN_DEVICES:
-            for d in usb.core.find(find_all=True, idVendor=vid, idProduct=pid):
-                # 排除 CDC ACM 类（它们走 slcan 后端）
-                try:
-                    if d.bDeviceClass == 0x02:
-                        continue
-                except Exception:
-                    pass
-                try:
-                    mfg = usb.util.get_string(d, d.iManufacturer) or ""
-                    prd = usb.util.get_string(d, d.iProduct) or ""
-                    ser = usb.util.get_string(d, d.iSerialNumber) or ""
-                except Exception:
-                    mfg = prd = ser = ""
-                devs.append({
-                    "backend": "gs_usb",
-                    "vid": vid, "pid": pid,
-                    "manufacturer": mfg, "product": prd, "serial": ser,
-                    "path": None,
-                })
-
-        # 2) slcan / CDC ACM
-        try:
-            from zdt_canable_slcan import list_serial_devices
-            for d in list_serial_devices():
-                devs.append({
-                    "backend": "slcan",
-                    "vid": d["vid"], "pid": d["pid"],
-                    "manufacturer": d["manufacturer"], "product": d["product"],
-                    "serial": "",
-                    "path": d["path"],
-                })
-        except Exception as e:
-            logger.debug("扫描 slcan 设备失败: %s", e)
+        """列出所有 CANable 设备。"""
+        devs = []
+        for d in usb.core.find(find_all=True, idVendor=CANABLE_VID, idProduct=CANABLE_PID):
+            try:
+                mfg = usb.util.get_string(d, d.iManufacturer) or ""
+                prd = usb.util.get_string(d, d.iProduct) or ""
+                ser = usb.util.get_string(d, d.iSerialNumber) or ""
+            except Exception:
+                mfg = prd = ser = ""
+            devs.append({
+                "backend": "elmue",
+                "vid": CANABLE_VID, "pid": CANABLE_PID,
+                "manufacturer": mfg, "product": prd, "serial": ser,
+                "path": None,
+            })
         return devs
 
+    # ================================================================
+    #  设备连接与断开
+    # ================================================================
     def open(self):
         """查找并打开设备。"""
-        if self.backend == "slcan":
-            self._is_slcan = True
-            return self._slcan_obj().open()
+        kwargs = dict(idVendor=self.vid, idProduct=self.pid)
+        if self.serial:
+            kwargs.setdefault("serial_number", self.serial)
+        self.dev = usb.core.find(**kwargs)
+        if self.dev is None:
+            raise RuntimeError(f"未找到 CANable 设备 (VID=0x{self.vid:04X}, PID=0x{self.pid:04X})")
 
-        if self.backend == "gs_usb":
-            self._is_slcan = False
-            return self._open_gsusb()
-
-        # auto：先 gs_usb，失败再 slcan
-        try:
-            self._open_gsusb()
-            self._is_slcan = False
-            return
-        except RuntimeError as e:
-            logger.info("gs_usb 不可用 (%s)，尝试 slcan 后端", e)
-            self._is_slcan = True
-            try:
-                return self._slcan_obj().open()
-            except Exception as e2:
-                raise RuntimeError(
-                    f"gs_usb 和 slcan 后端都不可用：\n"
-                    f"  gs_usb: {e}\n  slcan: {e2}"
-                )
-
-    def _open_gsusb(self):
-        # 1) 精确查找
-        if self.vid is not None and self.pid is not None:
-            if self.serial:
-                self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid,
-                                         serial_number=self.serial)
-            else:
-                self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
-            if self.dev is None:
-                raise RuntimeError(
-                    f"未找到 ZDT_CANable 设备 (VID=0x{self.vid:04X}, "
-                    f"PID=0x{self.pid:04X})。请检查 USB 连接或 udev 权限。"
-                )
-        else:
-            # 2) 自动扫描所有已知设备
-            self.dev = None
-            for vid, pid, desc in KNOWN_DEVICES:
-                kwargs = dict(idVendor=vid, idProduct=pid)
-                if self.serial:
-                    kwargs["serial_number"] = self.serial
-                dev = usb.core.find(**kwargs)
-                if dev is None:
-                    continue
-                # 跳过 CDC ACM 类设备（它们走 slcan）
-                try:
-                    if dev.bDeviceClass == 0x02:
-                        logger.debug("跳过 CDC ACM 设备: 0x%04X:0x%04X", vid, pid)
-                        continue
-                except Exception:
-                    pass
-                self.dev = dev
-                self.vid = vid
-                self.pid = pid
-                logger.info("自动匹配 gs_usb: 0x%04X:0x%04X  %s", vid, pid, desc)
-                break
-            if self.dev is None:
-                ids = ", ".join(f"0x{v:04X}:0x{p:04X}" for v, p, _ in KNOWN_DEVICES)
-                raise RuntimeError(
-                    f"未找到任何已知的 gs_usb 设备。已尝试: {ids}"
-                )
-
-        # 脱离内核驱动（如有）
-        try:
-            if self.dev.is_kernel_driver_active(0):
-                self.dev.detach_kernel_driver(0)
-                logger.info("已脱离内核驱动")
-        except (usb.core.USBError, NotImplementedError) as e:
-            logger.debug("脱离内核驱动失败: %s", e)
-
-        self.dev.set_configuration()
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, 0)]
-
-        # 找端点
-        self.ep_out = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e:
-                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-        )
-        self.ep_in = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e:
-                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-        )
-        if self.ep_out is None or self.ep_in is None:
-            raise RuntimeError("找不到所需的 USB 端点")
-
-        try:
-            mfg = usb.util.get_string(self.dev, self.dev.iManufacturer) or ""
-            prd = usb.util.get_string(self.dev, self.dev.iProduct) or ""
-            ser = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
-            logger.info("设备已打开: %s %s (S/N: %s)", mfg, prd, ser)
-        except Exception:
-            logger.info("设备已打开: %04X:%04X", self.vid, self.pid)
-
-        # gs_usb 协议初始化
-        self._init_gsusb()
+        self._setup_usb()
+        self._init_device()
+        self._detect_protocol()
 
     def close(self):
-        """关闭并释放设备。"""
-        if self._is_slcan and self._slcan is not None:
-            self._slcan.close()
-            return
-        try:
-            self.stop()
-        except Exception:
-            pass
+        """关闭设备。"""
+        if self._running:
+            try:
+                self.stop()
+            except Exception:
+                pass
         if self.dev is not None:
             try:
                 usb.util.dispose_resources(self.dev)
             except Exception:
                 pass
             self.dev = None
-        logger.info("设备已关闭")
+        self.ep_in = self.ep_out = None
+        self._running = False
 
-    # ----------------- 控制传输 -----------------
-    def _ctrl_out(self, req, value: int = 0, index: int = 0, data=None, timeout: int = 1000):
+    def _setup_usb(self):
+        """USB 配置和端点查找。"""
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        except (usb.core.USBError, NotImplementedError):
+            pass
+
+        self.dev.set_configuration()
+        cfg = self.dev.get_active_configuration()
+        intf = cfg[(0, 0)]
+
+        self.ep_in = usb.util.find_descriptor(
+            intf, custom_match=lambda e: e.bEndpointAddress == EP_IN)
+        self.ep_out = usb.util.find_descriptor(
+            intf, custom_match=lambda e: e.bEndpointAddress == EP_OUT)
+
+        if self.ep_out is None:
+            self.ep_out = usb.util.find_descriptor(
+                intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                                               == usb.util.ENDPOINT_OUT)
+        if self.ep_in is None:
+            self.ep_in = usb.util.find_descriptor(
+                intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                                               == usb.util.ENDPOINT_IN)
+
+        if self.ep_out is None or self.ep_in is None:
+            raise RuntimeError(f"找不到 USB 端点 (需要 EP_IN=0x81, EP_OUT=0x02)")
+
+    def _init_device(self):
+        """设备初始化: RESET + HOST_FORMAT + 读取能力。"""
+        # 先 RESET (与 C++ demo 一致)
+        self._reset_device()
+
+        # GS_ReqSetHostFormat: 0xBEEF = little-endian
+        self._ctrl_out_checked(GS_ReqSetHostFormat,
+                               data=struct.pack('<I', HOST_FORMAT_MAGIC))
+
+        # GS_ReqGetCapabilities
+        caps = self._ctrl_in(GS_ReqGetCapabilities, length=44)
+        if caps and len(caps) >= 4:
+            self._capabilities = struct.unpack_from('<I', bytes(caps), 0)[0]
+            logger.info("能力标志: 0x%X", self._capabilities)
+
+        # GS_ReqGetDeviceVersion
+        ver = self._ctrl_in(GS_ReqGetDeviceVersion, length=16)
+        if ver and len(ver) >= 12:
+            sw = struct.unpack_from('<I', bytes(ver), 4)[0]
+            hw = struct.unpack_from('<I', bytes(ver), 8)[0]
+            logger.info("固件版本: 0x%08X, 硬件版本: 0x%08X", sw, hw)
+
+    def _reset_device(self):
+        """发送 RESET 命令。"""
+        flags = ELM_DevFlagProtocolElmue
+        try:
+            self._ctrl_out(GS_ReqSetDeviceMode,
+                           data=struct.pack('<II', 0, flags))
+            time.sleep(0.05)
+        except usb.core.USBError:
+            logger.debug("RESET 命令失败 (可能设备已关闭)")
+
+    def _detect_protocol(self):
+        """自动检测协议版本。"""
+        if self._capabilities & ELM_DevFlagProtocolElmue:
+            self._protocol = "elmue"
+            self._parser = _ElmueProtocol()
+            logger.info("使用 ElmueSoft 变长协议")
+        else:
+            self._protocol = "legacy"
+            self._parser = None
+            logger.info("使用 Legacy 固定长度协议 (80 字节)")
+
+    # ================================================================
+    #  USB 控制传输
+    # ================================================================
+    def _ctrl_out(self, req, value=0, index=0, data=None, timeout=1000):
+        """发送控制 OUT 请求。"""
         bmRequestType = (usb.util.CTRL_OUT
                          | usb.util.CTRL_TYPE_VENDOR
                          | usb.util.CTRL_RECIPIENT_INTERFACE)
@@ -599,424 +757,411 @@ class ZDTCanable:
             data = []
         return self.dev.ctrl_transfer(bmRequestType, req, value, index, data, timeout)
 
-    def _ctrl_in(self, req, value: int = 0, index: int = 0, length: int = 64, timeout: int = 1000):
+    def _ctrl_in(self, req, value=0, index=0, length=64, timeout=1000):
+        """发送控制 IN 请求。"""
         bmRequestType = (usb.util.CTRL_IN
                          | usb.util.CTRL_TYPE_VENDOR
                          | usb.util.CTRL_RECIPIENT_INTERFACE)
         return self.dev.ctrl_transfer(bmRequestType, req, value, index, length, timeout)
 
-    def _init_gsusb(self):
-        """gs_usb 设备初始化：发送 HOST_FORMAT、查询时钟和特性。"""
-        # 1) HOST_FORMAT — 告知设备主机字节序
-        hfc = struct.pack('<I', GS_USB_HOST_FORMAT_MAGIC)
-        self._ctrl_out(GS_USB_BREQ_HOST_FORMAT, value=1, data=hfc)
+    def _ctrl_out_checked(self, req, value=0, index=0, data=None, timeout=1000):
+        """发送控制 OUT 请求，然后自动检查 ELM_ReqGetLastError。"""
+        self._ctrl_out(req, value, index, data, timeout)
+        self._check_last_error()
 
-        # 2) DEVICE_CONFIG — 查询设备信息
-        raw = self._ctrl_in(GS_USB_BREQ_DEVICE_CONFIG, length=12)
-        if raw and len(raw) >= 12:
-            data = bytes(raw)
-            sw_version = struct.unpack_from('<I', data, 4)[0]
-            hw_version = struct.unpack_from('<I', data, 8)[0]
-            logger.info("固件版本: sw=0x%08X hw=0x%08X", sw_version, hw_version)
+    def _check_last_error(self):
+        """调用 ELM_ReqGetLastError 检查上一个控制 OUT 是否成功。"""
+        try:
+            result = self._ctrl_in(ELM_ReqGetLastError, length=1)
+            if result and len(result) >= 1:
+                feedback = result[0]
+                if feedback != 0 and feedback != 2:
+                    logger.warning("控制请求失败: eFeedback=%d", feedback)
+        except usb.core.USBError:
+            pass
 
-        # 3) BT_CONST — 查询位定时常量和 CAN 时钟
-        # candlelight 固件 v2 的布局: feature(u32) + clk(u32) + tseg1_min..brp_inc
-        # 标准 gs_usb 布局: clk(u32) + tseg1_min..brp_inc
-        raw = self._ctrl_in(GS_USB_BREQ_BT_CONST, length=64)
-        if raw and len(raw) >= 36:
-            data = bytes(raw)
-            fields = struct.unpack_from('<10I', data[:40])
+    # ================================================================
+    #  CAN 控制器生命周期
+    # ================================================================
+    def start(self, loopback: bool = False):
+        """启动 CAN 控制器。loopback=True 启用内部回环（单设备自发自收测试）。"""
+        flags = 0
+        if self._protocol == "elmue":
+            flags |= ELM_DevFlagProtocolElmue
 
-            # 自动检测格式：第一个字段是 clk 还是 feature
-            # clk 通常是 MHz 级别 (>=1_000_000)，feature 通常 < 0x10000
-            first_val = fields[0]
-            if first_val >= 1_000_000:
-                # 标准格式: clk, tseg1_min, ...
-                self._can_clk = fields[0]
-                self._feature_flags = fields[8] if len(fields) > 8 else 0
-                bt_info = dict(zip(
-                    ['clk', 'tseg1_min', 'tseg1_max', 'tseg2_min', 'tseg2_max',
-                     'sjw_max', 'brp_min', 'brp_max', 'brp_inc'],
-                    fields[:9]))
-            else:
-                # candlelight 格式: feature, clk, tseg1_min, ...
-                self._can_clk = fields[1]
-                self._feature_flags = fields[0]
-                bt_info = dict(zip(
-                    ['feature', 'clk', 'tseg1_min', 'tseg1_max', 'tseg2_min',
-                     'tseg2_max', 'sjw_max', 'brp_min', 'brp_max', 'brp_inc'],
-                    fields[:10]))
+        if self._listen_only:
+            flags |= GS_DevFlagListenOnly
 
-            logger.info("CAN 时钟: %d Hz (%g MHz), 特性: 0x%X, BT_CONST: %s",
-                        self._can_clk, self._can_clk / 1e6, self._feature_flags, bt_info)
+        if loopback or self._loopback:
+            flags |= GS_DevFlagLoopback
 
-            # 如果时钟不是默认值，重新计算 BTR 表
-            if self._can_clk != DEFAULT_CAN_CLK and self._can_clk > 0:
-                logger.info("时钟非默认值，重新计算位定时表")
-                for bitrate in list(BTR_TABLE.keys()):
-                    try:
-                        BTR_TABLE[bitrate] = _calc_btr(self._can_clk, bitrate)
-                    except ValueError:
-                        BTR_TABLE.pop(bitrate, None)
-                for bitrate in list(DATA_BTR_TABLE.keys()):
-                    try:
-                        DATA_BTR_TABLE[bitrate] = _calc_btr(self._can_clk, bitrate)
-                    except ValueError:
-                        DATA_BTR_TABLE.pop(bitrate, None)
-        else:
-            self._can_clk = DEFAULT_CAN_CLK
-            self._feature_flags = 0
-            logger.warning("无法读取 BT_CONST，使用默认时钟 %d MHz", self._can_clk / 1e6)
+        if self._fd_mode:
+            flags |= GS_DevFlagCAN_FD
 
-    # ----------------- 配置 / 启动 -----------------
-    def set_bitrate(self, bitrate: int):
-        """设置 CAN 波特率。"""
-        if self._is_slcan:
-            return self._delegate("set_bitrate", bitrate)
-        if bitrate not in BTR_TABLE:
-            raise ValueError(
-                f"不支持的波特率 {bitrate}。可选: {sorted(BTR_TABLE.keys())}"
-            )
-        brp, prop_seg, phase_seg1, phase_seg2, sjw = BTR_TABLE[bitrate]
-        # gs_device_bittiming: 5 x u32 (prop_seg, phase_seg1, phase_seg2, sjw, brp)
-        payload = struct.pack('<IIIII', prop_seg, phase_seg1, phase_seg2, sjw, brp)
-        self._ctrl_out(GS_USB_BREQ_BITTIMING, data=payload)
-        self._bitrate = bitrate
-        logger.info("波特率已设置: %d bps  (brp=%d seg=%d/%d sjw=%d)",
-                    bitrate, brp, prop_seg + phase_seg1, phase_seg2, sjw)
+        # ElmueSoft: 不使用 GS_DevFlagTimestamp (减少USB流量，用软件时间戳)
+        # 如需硬件时间戳可添加 GS_DevFlagTimestamp
 
-    def set_data_bitrate(self, data_bitrate: int):
-        """设置 CAN FD 数据相波特率。"""
-        if self._is_slcan:
-            return self._delegate("set_data_bitrate", data_bitrate)
-        if data_bitrate not in DATA_BTR_TABLE:
-            raise ValueError(
-                f"不支持的数据相波特率 {data_bitrate}。可选: {sorted(DATA_BTR_TABLE.keys())}"
-            )
-        brp, prop_seg, phase_seg1, phase_seg2, sjw = DATA_BTR_TABLE[data_bitrate]
-        payload = struct.pack('<IIIII', prop_seg, phase_seg1, phase_seg2, sjw, brp)
-        # 尝试标准 DATA_BITTIMING (BREQ=10)，失败则尝试 CANTACT_PRO quirk (BREQ=8)
-        ok = False
-        for breq in (GS_USB_BREQ_DATA_BITTIMING, 8):
-            try:
-                self._ctrl_out(breq, data=payload)
-                self._data_bitrate = data_bitrate
-                logger.info("数据相波特率已设置: %d bps (brp=%d seg=%d/%d sjw=%d, BREQ=%d)",
-                            data_bitrate, brp, prop_seg + phase_seg1, phase_seg2, sjw, breq)
-                ok = True
-                break
-            except usb.core.USBError as e:
-                logger.debug("BREQ=%d 设置数据相波特率失败: %s", breq, e)
-        if not ok:
-            logger.warning("设置数据相波特率失败，固件可能不支持 CAN FD 数据相位定时")
+        mode = 1  # GS_ModeStart
+        payload = struct.pack('<II', mode, flags)
+        self._ctrl_out_checked(GS_ReqSetDeviceMode, data=payload)
 
-    def get_version(self) -> Optional[str]:
-        """读取固件版本。"""
-        if self._is_slcan:
-            return self._delegate("get_version")
-        return None
+        self._has_timestamp = bool(flags & GS_DevFlagTimestamp)
+        if self._parser and isinstance(self._parser, _ElmueProtocol):
+            self._parser.set_timestamp_mode(self._has_timestamp)
 
-    def check_fd_support(self) -> bool:
-        """检测固件是否支持 CAN FD。"""
-        if self._is_slcan:
-            return self._delegate("check_fd_support")
-        # 使用 _init_gsusb() 中缓存的特性标志
-        # GS_CAN_FEATURE_FD = BIT(8) (与 Linux 内核 gs_usb.c 一致)
-        fd_supported = bool(self._feature_flags & (1 << 8))
-        logger.info("FD 支持: %s (feature=0x%X)", fd_supported, self._feature_flags)
-        return fd_supported
+        self._running = True
+        logger.info("CAN 控制器已启动 (协议=%s, FD=%s, loopback=%s, flags=0x%X, bitrate=%s, data_bitrate=%s)",
+                    self._protocol, self._fd_mode, bool(flags & GS_DevFlagLoopback),
+                    flags, self._bitrate, self._data_bitrate)
+
+    def stop(self):
+        """停止 CAN 控制器。"""
+        flags = 0
+        if self._protocol == "elmue":
+            flags |= ELM_DevFlagProtocolElmue
+        try:
+            self._ctrl_out_checked(GS_ReqSetDeviceMode,
+                                   data=struct.pack('<II', 0, flags))
+        except usb.core.USBError as e:
+            logger.warning("停止时 USB 错误: %s", e)
+        self._running = False
+        logger.info("CAN 控制器已停止")
 
     def recover(self):
         """从 bus-off 等错误状态恢复。"""
-        if self._is_slcan:
-            return self._delegate("recover")
-        # gs_usb: RESET → 重新设置位定时 → START
-        self._ctrl_out(GS_USB_BREQ_MODE, data=struct.pack('<II', 0, 0))
+        # RESET
+        flags = ELM_DevFlagProtocolElmue if self._protocol == "elmue" else 0
+        self._ctrl_out(GS_ReqSetDeviceMode, data=struct.pack('<II', 0, flags))
         time.sleep(0.05)
 
-        # 刷新 IN 端点: 读取并丢弃残留的陈旧帧, 避免恢复后数据错位
-        # (固件 RESET 后, to_host 队列中的帧可能已失效)
-        try:
-            while True:
-                self.ep_in.read(GS_USB_FRAME_SIZE_FD, timeout=10)
-        except usb.core.USBError:
-            pass  # 超时或无数据, 正常
+        # 清空解析器残留数据，避免 recover 后错位解析
+        if self._parser is not None:
+            self._parser.clear()
 
-        # RESET 后必须重新设置位定时
+        # 清空 IN 端点残留数据 (多轮大读取，确保清干净)
+        try:
+            for _ in range(16):
+                self.ep_in.read(256, timeout=10)
+        except usb.core.USBError:
+            pass
+
+        # 重新设置位定时
         if self._bitrate:
             self.set_bitrate(self._bitrate)
         if self._fd_mode and self._data_bitrate:
             self.set_data_bitrate(self._data_bitrate)
-        # START (与 start() 一致: 启用 HW_TIMESTAMP, 不启用 PAD)
-        flags = GS_CAN_MODE_HW_TIMESTAMP
-        if self._fd_mode:
-            flags |= GS_CAN_MODE_FD
-        self._ctrl_out(GS_USB_BREQ_MODE, data=struct.pack('<II', 1, flags))
-        self._running = True
+
+        # START (保持 loopback 模式)
+        self.start(loopback=self._loopback)
+        self._tx_blocked_until = time.time() + 0.3
         logger.info("CAN 控制器已恢复")
 
-    def start(self):
-        """启动 CAN 控制器。
+    # ================================================================
+    #  位定时配置
+    # ================================================================
+    def set_bitrate(self, bitrate: int):
+        """设置 CAN 标称波特率。"""
+        if bitrate not in NOMINAL_BITTIMING:
+            # 尝试动态计算
+            brp, seg1, seg2, sjw = self._calc_bitrate_params(bitrate)
+        else:
+            brp, seg1, seg2, sjw = NOMINAL_BITTIMING[bitrate]
 
-        与 Linux 内核 gs_can_open() (v5.15) 一致:
-        位定时已在 connect() 中设置，直接发送 START 命令。
-        不做 RESET — RESET 会使固件丢失配置并进入不稳定状态。
-        """
-        if self._is_slcan:
-            self._delegate("start")
-            self._running = True
-            return
+        prop = 0
+        payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
+        self._ctrl_out_checked(GS_ReqSetBitTiming, data=payload)
+        self._bitrate = bitrate
+        logger.info("标称波特率已设置: %d bps (brp=%d seg1=%d seg2=%d sjw=%d)",
+                    bitrate, brp, seg1, seg2, sjw)
 
-        # START with flags
-        # HW_TIMESTAMP: 固件在帧尾附加 4 字节微秒时间戳
-        #   - 经典帧: 24 字节 (短包 < 64, USB 自动终止传输)
-        #   - FD帧:   80 字节 = 64 + 16 (短包终止传输)
-        # 不启用 PAD_PKTS_TO_MAX_PKT_SIZE: 它将帧填充到 128 字节 (2×64 完整包),
-        # 无短包终止信号, 导致 pyusb 读取 80 字节后剩余 48 字节错位。
-        flags = GS_CAN_MODE_HW_TIMESTAMP
-        if self._fd_mode:
-            flags |= GS_CAN_MODE_FD
-        self._ctrl_out(GS_USB_BREQ_MODE, data=struct.pack('<II', 1, flags))
-        self._running = True
-        logger.info("CAN 控制器已启动 (FD=%s, flags=0x%X, bitrate=%s, data_bitrate=%s)",
-                    self._fd_mode, flags, self._bitrate, self._data_bitrate)
+    def set_data_bitrate(self, data_bitrate: int):
+        """设置 CAN FD 数据相波特率。"""
+        if data_bitrate not in DATA_BITTIMING:
+            brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate)
+        else:
+            brp, seg1, seg2, sjw = DATA_BITTIMING[data_bitrate]
 
-    def stop(self):
-        """停止 CAN 控制器。"""
-        if self._is_slcan:
-            self._delegate("stop")
-            self._running = False
-            return
-        if self._running:
-            try:
-                mode = GS_CAN_MODE_RESET
-                self._ctrl_out(GS_USB_BREQ_MODE, data=struct.pack('<II', mode, 0))
-            except usb.core.USBError as e:
-                logger.warning("停止时 USB 错误: %s", e)
-            self._running = False
-            logger.info("CAN 控制器已停止")
+        prop = 0
+        payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
+        self._ctrl_out_checked(GS_ReqSetBitTimingFD, data=payload)
+        self._data_bitrate = data_bitrate
+        logger.info("数据相波特率已设置: %d bps", data_bitrate)
 
-    def identify(self, duration_ms: int = 1500):
-        """让设备 LED 闪烁以便识别多台设备。
+    def _calc_bitrate_params(self, bitrate: int):
+        """动态计算位定时参数。"""
+        clock = 160_000_000
+        best_err = float('inf')
+        best = None
+        for seg1 in range(1, 33):
+            for seg2 in range(1, min(seg1 + 1, 17)):
+                total = 1 + seg1 + seg2
+                for brp in range(1, 513):
+                    calc = clock / brp / total
+                    err = abs(calc - bitrate) / bitrate
+                    if err < best_err:
+                        best_err = err
+                        best = (brp, seg1, seg2, min(seg2, 4))
+                    if err < 0.001:
+                        return best
+        if best_err > 0.05:
+            raise ValueError(f"无法计算 {bitrate} bps 的位定时参数 (误差 {best_err:.1%})")
+        return best
 
-        - gs_usb 后端：发 GS_USB_BREQ_IDENTIFY 控制传输
-        - slcan  后端：切换 DTR 让 canable2 等固件的 LED 闪烁
-        """
-        if self._is_slcan:
-            return self._delegate("identify", duration_ms)
-        self._ctrl_out(GS_USB_BREQ_IDENTIFY, value=duration_ms)
-
-    def set_silent(self, enable: bool) -> bool:
-        """打开 / 关闭 canable2 固件 M1 silent (listen-only) 模式。
-
-        注意：canable2 slcan 固件**没有 loopback** 命令，
-        silent 模式是只听不发，不能用来测 TX 回环。
-        """
-        if self._is_slcan:
-            return self._delegate("set_silent", enable)
-        # gs_usb 后端暂未实现
-        logger.warning("set_silent 当前仅支持 slcan 后端")
-        return False
-
-    # ----------------- 收发 -----------------
+    # ================================================================
+    #  收发
+    # ================================================================
     def send(self, frame: CANFrame, timeout: int = 1000):
         """发送单帧 CAN 报文。"""
-        if self._is_slcan:
-            return self._delegate("send", frame)
         if not self._running:
             raise RuntimeError("CAN 控制器未启动")
 
-        # TX 节流: 错误恢复后等待冷却, 避免淹没固件缓冲池
+        # TX 节流
         now = time.time()
         if now < self._tx_blocked_until:
             raise RuntimeError("CAN 控制器错误恢复中, 请稍候")
 
-        raw = frame.to_bytes()
+        if self._protocol == "elmue":
+            self._marker_counter = (self._marker_counter + 1) & 0xFF
+            if self._marker_counter == 0:
+                self._marker_counter = 1
+            marker = self._marker_counter
+            raw = frame.to_elmue_bytes(marker=marker)
+            # 缓存 TX 帧用于 echo 匹配
+            if self._parser and isinstance(self._parser, _ElmueProtocol):
+                self._parser.store_tx_frame(marker, frame)
+        else:
+            raw = frame.to_legacy_bytes()
+
         try:
             with self._lock:
                 self.ep_out.write(raw, timeout=timeout)
+                # ZLP: 如果发送长度是 64 的倍数
+                if len(raw) > 0 and len(raw) % MAX_PACKET_SIZE == 0:
+                    self.ep_out.write(b'', timeout=timeout)
         except usb.core.USBError as e:
             if getattr(e, 'errno', None) == 32 or 'pipe' in str(e).lower():
-                # Pipe error = endpoint STALLed (固件缓冲池耗尽或 bus-off)
-                logger.warning("USB Pipe error, 尝试清除 STALL 并恢复...")
+                logger.warning("USB Pipe error, 清除 STALL...")
                 try:
                     usb.util.clear_stall(self.ep_out)
                 except Exception:
                     pass
                 self.recover()
-                # 节流 500ms, 等待控制器稳定 + 固件缓冲池回收
                 self._tx_blocked_until = time.time() + 0.5
             raise
 
-    def read_error_register(self) -> Optional[str]:
-        """读取 CAN 错误寄存器 (slcan E 命令)。
-
-        返回值: 字符串形式的错误寄存器值，或 None (gs_usb 不支持)。
-        0 = 正常, 非0 = 物理层问题 (接线/终端电阻/位速率)。
-        """
-        if self._is_slcan:
-            return self._delegate("read_error_register")
-        return None
-
-    def send_periodic(self, frame: CANFrame, interval_s: float, count: int = 0):
-        """周期性发送 `count` 次，count=0 表示无限循环。"""
-        deadline = 0 if count == 0 else count
+    def send_periodic(self, frame: CANFrame, interval_s: float = 0.01, count: int = 0):
+        """周期性发送 CAN 帧。count=0 表示无限发送。"""
         sent = 0
-        while True:
+        while count == 0 or sent < count:
             self.send(frame)
             sent += 1
-            if deadline and sent >= deadline:
-                break
-            time.sleep(interval_s)
+            if count == 0 or sent < count:
+                time.sleep(interval_s)
 
     def receive(self, timeout: float = 1.0) -> Optional[CANFrame]:
-        """阻塞接收一帧。timeout 单位为秒，0 表示非阻塞。"""
-        if self._is_slcan:
-            return self._delegate("receive", timeout)
+        """阻塞接收一帧。timeout 单位为秒。"""
         if not self._running:
             raise RuntimeError("CAN 控制器未启动")
+
+        if self._protocol == "elmue":
+            return self._recv_elmue(timeout)
+        else:
+            return self._recv_legacy(timeout)
+
+    def _recv_elmue(self, timeout: float = 1.0) -> Optional[CANFrame]:
+        """ElmueSoft 协议接收。"""
+        if self._parser is not None:
+            frames = self._parser.flush_frames()
+            if frames:
+                return frames[0]
+
         try:
-            # 始终读取 80 字节 (sizeof(gs_host_frame) = union 最大成员 canfd_ts)
-            # 固件实际发送 (启用 HW_TIMESTAMP):
-            #   经典帧: 24 字节 (短包 < 64, USB 自动终止)
-            #   FD帧:   80 字节 (64 完整包 + 16 短包终止)
-            data = self.ep_in.read(GS_USB_FRAME_SIZE_FD, timeout=int(timeout * 1000))
+            data = self.ep_in.read(256, timeout=int(timeout * 1000))
         except usb.core.USBError as e:
-            # errno 110 = ETIMEDOUT (libusb timeout)
             if getattr(e, "errno", None) == 110 or "timeout" in str(e).lower():
                 return None
-            # errno 75 = EOVERFLOW (固件发送的数据超过请求大小)
-            # 通常是因为帧格式与预期不同，尝试读取更多数据清空缓冲区
             if getattr(e, "errno", None) == 75 or "overflow" in str(e).lower():
                 logger.debug("USB overflow, 清空端点缓冲区")
                 try:
-                    self.ep_in.read(GS_USB_FRAME_SIZE_FD, timeout=10)
+                    self.ep_in.read(256, timeout=10)
                 except Exception:
                     pass
                 return None
             raise
+
         if not data:
             return None
-        raw = bytes(data)
-        # 溢出帧：can_dlc=0, flags & GS_CAN_FLAG_OVERFLOW
-        if len(raw) >= 11 and raw[10] & GS_CAN_FLAG_OVERFLOW:
-            logger.warning("硬件接收溢出")
-            if self._overflow_cb:
-                self._overflow_cb()
-            return None
-        return CANFrame.from_bytes(raw)
 
-    # ----------------- 回调 / 监听 -----------------
+        raw = bytes(data)
+        logger.debug("USB IN 读取 %d 字节: %s", len(raw), raw[:32].hex())
+        frames = self._parser.feed(raw)
+        logger.debug("解析出 %d 帧", len(frames))
+
+        if frames:
+            return frames[0]
+        return None
+
+    def _recv_legacy(self, timeout: float = 1.0) -> Optional[CANFrame]:
+        """Legacy 80 字节固定长度帧接收。"""
+        try:
+            data = self.ep_in.read(LEGACY_FRAME_SIZE, timeout=int(timeout * 1000))
+        except usb.core.USBError as e:
+            if getattr(e, "errno", None) == 110 or "timeout" in str(e).lower():
+                return None
+            if getattr(e, "errno", None) == 75 or "overflow" in str(e).lower():
+                try:
+                    self.ep_in.read(LEGACY_FRAME_SIZE, timeout=10)
+                except Exception:
+                    pass
+                return None
+            raise
+
+        if not data:
+            return None
+
+        return CANFrame.from_legacy_bytes(bytes(data))
+
+    # ================================================================
+    #  功能查询与设置
+    # ================================================================
+    def check_fd_support(self) -> bool:
+        """检测固件是否支持 CAN FD。"""
+        try:
+            caps_fd = self._ctrl_in(GS_ReqGetCapabilitiesFD, length=72)
+            if caps_fd and len(caps_fd) >= 4:
+                self._capabilities_fd = struct.unpack_from('<I', bytes(caps_fd), 0)[0]
+        except usb.core.USBError:
+            pass
+
+        fd_supported = bool((self._capabilities | self._capabilities_fd) & GS_DevFlagCAN_FD)
+        fd_timing = bool((self._capabilities | self._capabilities_fd) & GS_DevFlagBitTimingFD)
+        supported = fd_supported and fd_timing
+        logger.info("FD 支持: %s (caps=0x%X, caps_fd=0x%X)",
+                    supported, self._capabilities, self._capabilities_fd)
+        return supported
+
+    def get_version(self) -> Optional[str]:
+        """读取固件版本信息。"""
+        try:
+            ver = self._ctrl_in(GS_ReqGetDeviceVersion, length=16)
+            if ver and len(ver) >= 12:
+                sw = struct.unpack_from('<I', bytes(ver), 4)[0]
+                return f"0x{sw:08X}"
+        except usb.core.USBError:
+            pass
+        return None
+
+    def read_error_register(self) -> Optional[str]:
+        """读取 CAN 错误状态 (API 兼容，新固件通过 MSG_Error 自动上报)。"""
+        return self._last_error_info
+
+    def identify(self, duration_ms: int = 1500):
+        """让设备 LED 闪烁。"""
+        try:
+            self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 1))
+        except usb.core.USBError:
+            pass
+
+    def set_silent(self, enable: bool) -> bool:
+        """设置 Listen-Only 模式。"""
+        was_running = self._running
+        if was_running:
+            self.stop()
+        self._listen_only = enable
+        if was_running:
+            self.start()
+        return True
+
+    # ================================================================
+    #  新增功能
+    # ================================================================
+    def set_filter(self, operation: int = 0, can_id: int = 0, mask: int = 0):
+        """设置硬件 CAN ID 过滤器。
+
+        operation: 0=清除所有, 1=11位掩码, 2=29位掩码
+        """
+        payload = struct.pack('<BIIII', operation, can_id, mask, 0, 0)
+        self._ctrl_out_checked(ELM_ReqSetFilter, data=payload)
+        logger.info("过滤器已设置: op=%d id=0x%X mask=0x%X", operation, can_id, mask)
+
+    def get_termination(self) -> Optional[bool]:
+        """读取 CAN 总线终端电阻状态。"""
+        try:
+            result = self._ctrl_in(GS_ReqGetTermination, length=4)
+            if result and len(result) >= 4:
+                return bool(struct.unpack_from('<I', bytes(result), 0)[0])
+        except usb.core.USBError:
+            pass
+        return None
+
+    def set_termination(self, enabled: bool):
+        """设置 CAN 总线终端电阻开关。"""
+        payload = struct.pack('<I', 1 if enabled else 0)
+        self._ctrl_out_checked(GS_ReqSetTermination, data=payload)
+        logger.info("终端电阻: %s", "开启" if enabled else "关闭")
+
+    def set_bus_load_report(self, interval: int = 0):
+        """设置总线负载报告间隔 (0=关闭, 1-100=100ms-10s)。"""
+        payload = struct.pack('<B', interval)
+        self._ctrl_out_checked(ELM_ReqSetBusLoadReport, data=payload)
+
+    # ================================================================
+    #  回调
+    # ================================================================
     def on_receive(self, callback: Callable[[CANFrame], None]):
-        """注册接收回调（监听模式下使用）。"""
         self._callbacks.append(callback)
 
     def on_overflow(self, callback: Callable[[], None]):
-        """注册溢出回调。"""
         self._overflow_cb = callback
 
     def start_listening(self):
-        """启动后台接收线程，把帧分发给所有回调。"""
-        if not self._running:
-            raise RuntimeError("CAN 控制器未启动")
-        if self._recv_thr and self._recv_thr.is_alive():
-            return
-        self._recv_thr = threading.Thread(target=self._recv_loop, daemon=True)
+        """启动监听线程 (非 Qt 环境使用)。"""
+        self._running = True
+        self._recv_thr = threading.Thread(target=self._listen_loop, daemon=True)
         self._recv_thr.start()
 
-    def stop_listening(self):
-        """停止后台接收线程。"""
-        self._running = False
-        if self._recv_thr:
-            self._recv_thr.join(timeout=1.0)
-            self._recv_thr = None
-
-    def _recv_loop(self):
+    def _listen_loop(self):
         while self._running:
             try:
                 frame = self.receive(timeout=0.1)
+                if frame is not None:
+                    for cb in self._callbacks:
+                        try:
+                            cb(frame)
+                        except Exception:
+                            pass
             except Exception as e:
                 if self._running:
-                    logger.warning("接收异常（继续重试）: %s", e)
-                time.sleep(0.1)
-                continue
-            if frame is None:
-                continue
-            for cb in self._callbacks:
-                try:
-                    cb(frame)
-                except Exception as e:
-                    logger.warning("回调异常: %s", e)
+                    logger.warning("接收错误: %s", e)
+                time.sleep(0.01)
 
 
-# ----------------------------------------------------------------------------
-#  命令行小工具
-# ----------------------------------------------------------------------------
+# =====================================================================
+#  命令行工具
+# =====================================================================
 def _cli():
-    import argparse, sys, signal
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    ap = argparse.ArgumentParser(
-        description="ZDT_CANable_2.0pro 命令行工具（发送 / 监听）",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap.add_argument("-b", "--bitrate", type=int, default=500_000,
-                    help="CAN 波特率")
-    ap.add_argument("-l", "--listen", action="store_true",
-                    help="监听模式（接收并打印 CAN 帧）")
-    ap.add_argument("-i", "--id", type=lambda x: int(x, 0), default=0x123,
-                    help="发送帧 ID（可写 0x123 或 123）")
-    ap.add_argument("-d", "--data", type=str, default="DE AD BE EF",
-                    help="发送数据（十六进制，空格分隔）")
-    ap.add_argument("-e", "--extended", action="store_true",
-                    help="扩展帧 (29-bit ID)")
-    ap.add_argument("-c", "--count", type=int, default=1,
-                    help="发送次数；0 表示持续发送")
-    ap.add_argument("-p", "--period", type=float, default=0.1,
-                    help="发送周期（秒）")
-    args = ap.parse_args()
-
-    if not args.listen and args.count != 1:
-        # 持续发送模式默认开启监听
-        args.listen = False
-
-    def stop(sig, frame):
-        print("\n退出…")
-        sys.exit(0)
-    signal.signal(signal.SIGINT, stop)
-
-    # 列出设备
     devs = ZDTCanable.list_devices()
     if not devs:
-        print("未发现 candleLight 设备，请检查 USB 连接。")
-        sys.exit(1)
-    print("发现设备:")
+        print("未找到 CANable 设备")
+        return
+
+    print(f"发现 {len(devs)} 个设备:")
     for i, d in enumerate(devs):
-        print(f"  [{i}] {d['manufacturer']} {d['product']}  S/N={d['serial']}")
+        print(f"  [{i}] {d['manufacturer']} {d['product']} S/N: {d['serial']}")
 
     with ZDTCanable() as bus:
-        bus.set_bitrate(args.bitrate)
+        bus.set_bitrate(500_000)
         bus.start()
 
-        if args.listen:
-            bus.on_receive(lambda f: print(f"RX {f}  t={f.timestamp:.6f}"))
-            bus.start_listening()
-            print(f"监听中 @ {args.bitrate} bps ... Ctrl-C 退出")
-            signal.pause()
-
-        # 发送模式
-        data = bytes.fromhex(args.data.replace(",", " ").replace("0x", " "))
-        frame = CANFrame(args.id, data, extended=args.extended)
-        sent = 0
+        print("接收中... (Ctrl+C 退出)")
         try:
             while True:
-                bus.send(frame)
-                sent += 1
-                print(f"TX {frame}  ({sent})")
-                if args.count and sent >= args.count:
-                    break
-                if args.count == 1:
-                    break
-                time.sleep(args.period)
+                frame = bus.receive(timeout=1.0)
+                if frame is not None:
+                    print(frame)
         except KeyboardInterrupt:
             pass
 

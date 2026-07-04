@@ -2,7 +2,6 @@
 """cangui 启动脚本。直接 python cangui.py 即可运行。
 
 启动时会在终端输出 INFO 级别的日志，包含：
-  - 后端选择（gs_usb / slcan）
   - CAN 控制器状态（连接 / 启动 / 停止）
   - 每次 TX / RX 帧内容（标准帧 [123 SFF] DE AD BE EF）
   - 错误与警告
