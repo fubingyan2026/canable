@@ -9,6 +9,7 @@ import logging
 import time
 from typing import List, Optional
 
+import usb.core
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker, QObject, Slot
 
 from zdt_canable import ZDTCanable, CANFrame
@@ -59,6 +60,9 @@ class CANWorker(QObject):
         self.bitrate = 500_000
         self.fd_mode = False
         self.data_bitrate: Optional[int] = None
+        self._last_error_notify = 0.0    # 上次错误帧通知时间
+        self._error_count = 0            # 连续错误帧计数
+        self._last_error_time = 0.0     # 上次错误帧时间
 
     # ---------- 过滤 ---------- #
     def set_filters(self, filters: List[CANFilter]):
@@ -66,7 +70,9 @@ class CANWorker(QObject):
             self._filters = list(filters)
 
     def _pass(self, frame: CANFrame) -> bool:
-        """返回 True 表示接收。"""
+        """返回 True 表示接收。错误帧始终放行。"""
+        if frame.is_error:
+            return True
         with QMutexLocker(self._mutex):
             filters = self._filters
         if not filters:
@@ -98,14 +104,16 @@ class CANWorker(QObject):
                 fd_ok = self._bus.check_fd_support()
                 if not fd_ok:
                     self.error.emit(
-                        "⚠️ 固件可能不支持 CAN FD。"
-                        "FD 帧发送可能失败，建议切换为经典 CAN 模式。"
+                        "⚠️ 固件不支持 CAN FD，已回退到经典 CAN 模式。"
+                        "请取消勾选 CAN FD 选项。"
                     )
+                    # 固件不支持 FD，不启用 FD 模式
+                    self.fd_mode = False
                 else:
                     if self.data_bitrate:
                         self._bus.set_data_bitrate(self.data_bitrate)
-                # 设置 gs_usb 后端的 FD 模式标志
-                self._bus._fd_mode = True
+                    # 仅在固件支持 FD 时才设置标志
+                    self._bus._fd_mode = True
 
             self._bus.start()
             self._connected = True
@@ -159,6 +167,9 @@ class CANWorker(QObject):
         if self._bus is None or not self._connected:
             self.error.emit("未连接，无法发送")
             return
+        if not self._bus._running:
+            self.error.emit("控制器未启动，无法发送")
+            return
         # 标记为本机发送，让 trace 面板用绿色区分
         frame.is_tx = True
         frame.timestamp = time.time()
@@ -167,9 +178,11 @@ class CANWorker(QObject):
             logger.info("TX  %s", frame)
             # 同步进 trace 列表（不等回环），让用户立即看到发送成功
             self.frame_received.emit(frame)
-            # 记录最近一次发送 FD 帧的时间，用于 bus-off 检测
-            if frame.fd:
-                self._last_fd_tx_time = time.time()
+        except usb.core.USBError as e:
+            # Pipe error: zdt_canable.py 已在 send() 内部完成 recover + TX 节流
+            # 此处仅通知 UI, 不重复恢复
+            logger.warning("TX  USB 错误 (已自动恢复): %s", e)
+            self.error.emit("发送失败: 控制器已自动恢复，请重试")
         except Exception as e:
             self.error.emit(f"发送失败: {e}")
             logger.warning("TX  失败 %s : %s", frame, e)
@@ -180,9 +193,6 @@ class CANWorker(QObject):
         """Qt Concurrent / QThread 入口；也可直接循环调用。"""
         window_s = 1.0
         frame_times: List[float] = []
-        self._last_fd_tx_time: float = 0.0
-        self._last_rx_time: float = time.time()
-        _recovering = False
 
         while self._running and self._bus is not None:
             try:
@@ -196,35 +206,78 @@ class CANWorker(QObject):
 
             now = time.time()
             if frame is not None:
+                # 错误帧处理
+                if frame.is_error:
+                    is_busoff = "BUS-OFF" in frame._error_info
+                    is_noack  = "NO-ACK" in frame._error_info
+
+                    if is_busoff:
+                        # BUS-OFF: 真正严重错误, 需要恢复控制器
+                        if now - self._last_error_time > 1.0:
+                            self._error_count = 1
+                        else:
+                            self._error_count += 1
+                        self._last_error_time = now
+
+                        if now - self._last_error_notify >= 2.0:
+                            logger.warning("CAN 严重错误: %s (连续 %d 次)",
+                                           frame._error_info, self._error_count)
+                            self.error.emit(f"CAN: {frame._error_info}")
+                            self._last_error_notify = now
+
+                        if self._error_count >= 10:
+                            logger.warning("BUS-OFF 持续, 自动恢复控制器")
+                            try:
+                                self._bus.recover()
+                                self.error.emit("BUS-OFF, 已自动恢复控制器")
+                            except Exception as e:
+                                logger.warning("自动恢复失败: %s", e)
+                            self._error_count = 0
+                            time.sleep(0.2)
+                    elif is_noack:
+                        # NO-ACK: 固件 LEC 寄存器粘滞, 会持续发送错误帧
+                        # 根因: 总线上无设备应答本机发送的帧 (正常现象)
+                        # recover() 无法解决 NO-ACK, 仅首次通知, 之后静默
+                        if now - self._last_error_notify >= 5.0:
+                            logger.info("CAN NO-ACK (LEC 粘滞, 可能无设备应答)")
+                            self._last_error_notify = now
+                        # 不计数, 不触发 recover()
+                    else:
+                        # 非严重错误 (CTRL-ERR 等): 仅日志，不通知 UI
+                        logger.debug("CAN 状态: %s", frame._error_info)
+                    continue
+
+                # TX 回环帧: 固件回传的发送确认，已在 send() 中直接显示，跳过
+                if frame.is_tx:
+                    continue
+
                 frame.timestamp = now
                 frame_times.append(now)
                 frame_times = [t for t in frame_times if now - t <= window_s]
-                self._last_rx_time = now
-                _recovering = False
                 logger.info("RX  %s", frame)
                 if self._pass(frame):
                     self.frame_received.emit(frame)
 
-            # Bus-off 检测：发送 FD 帧后超过 3 秒未收到任何数据，尝试恢复
-            if (self._last_fd_tx_time > 0
-                    and now - self._last_fd_tx_time > 3.0
-                    and now - self._last_rx_time > 3.0
-                    and not _recovering):
-                logger.warning("疑似 bus-off（FD 发送后 %0.1fs 无接收），尝试恢复",
-                               now - self._last_fd_tx_time)
-                try:
-                    self._bus.recover()
-                    self._last_rx_time = time.time()
-                    self._last_fd_tx_time = 0.0
-                    _recovering = True
-                    self.error.emit("CAN 控制器疑似 bus-off，已自动恢复。"
-                                    "FD 帧可能未被总线 ACK。")
-                except Exception as e:
-                    logger.warning("恢复失败: %s", e)
-
-            # 统计：fps + 总线负载（按 8 字节 ≈ 128 bit 计算）
+            # 统计：fps + 总线负载
+            # 经典 CAN: ~128 bit/帧 (含仲裁+控制+数据+CRC+ACK+EOF)
+            # CAN FD: 仲裁相 ~128 bit + 数据相 (data_len * 10 bit)
+            #   - 无 BRS: 全程按标称波特率
+            #   - 有 BRS: 数据相按 data_bitrate，需折算
             fps = len(frame_times)
-            load = min(100.0, fps * 128.0 * 100.0 / self.bitrate) if self.bitrate else 0.0
+            if frame is not None and fps > 0:
+                if frame.fd:
+                    arb_bits = 128
+                    data_bits = len(frame.data) * 10
+                    if frame.brs and self.data_bitrate and self.data_bitrate > 0:
+                        # BRS: 数据相用更高波特率，折算到标称波特率
+                        effective_bits = arb_bits + data_bits * (self.bitrate / self.data_bitrate)
+                    else:
+                        effective_bits = arb_bits + data_bits
+                else:
+                    effective_bits = 128
+                load = min(100.0, fps * effective_bits * 100.0 / self.bitrate) if self.bitrate else 0.0
+            else:
+                load = 0.0
             self.bus_stats.emit(load, fps)
 
 

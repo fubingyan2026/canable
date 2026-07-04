@@ -114,8 +114,11 @@ class MainWindow(QMainWindow):
         bf.addRow("", self.fd_chk)
 
         self.data_bitrate_combo = QComboBox()
+        self.data_bitrate_combo.addItem("1,000,000 bps", 1_000_000)
         self.data_bitrate_combo.addItem("2,000,000 bps", 2_000_000)
+        self.data_bitrate_combo.addItem("4,000,000 bps", 4_000_000)
         self.data_bitrate_combo.addItem("5,000,000 bps", 5_000_000)
+        self.data_bitrate_combo.addItem("8,000,000 bps", 8_000_000)
         self.data_bitrate_combo.setEnabled(False)
         bf.addRow("Data Bitrate:", self.data_bitrate_combo)
 

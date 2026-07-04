@@ -68,20 +68,28 @@ class TraceModel(QAbstractTableModel):
                 t = f.timestamp % 1000.0
                 return f"{t:12.6f}"
             if col == self.COL_CH:
-                return "TX" if f.is_tx else "CAN1"
+                return "ERR" if f.is_error else ("TX" if f.is_tx else "CAN1")
             if col == self.COL_ID:
+                if f.is_error:
+                    return "ERROR"
                 return f"{f.can_id:08X}" if f.extended else f"{f.can_id:03X}"
             if col == self.COL_TYPE:
+                if f.is_error:
+                    return "ERR"
                 if f.rtr:    return "RTR"
                 if f.fd and f.brs: return "FD+BRS"
                 if f.fd:     return "FD"
                 if f.extended: return "Ext"
                 return "Std"
             if col == self.COL_DLC:
-                return str(f.dlc)
+                return "" if f.is_error else str(f.dlc)
             if col == self.COL_DATA:
+                if f.is_error:
+                    return f._error_info
                 return f.data.hex(' ').upper()
             if col == self.COL_ASCII:
+                if f.is_error:
+                    return f._error_info
                 return ''.join(chr(b) if 32 <= b < 127 else '·' for b in f.data)
             if col == self.COL_DELTA:
                 return f"{m['dt']:.1f}" if m['dt'] else ""
@@ -91,6 +99,9 @@ class TraceModel(QAbstractTableModel):
                 return str(m['count'])
 
         elif role == Qt.BackgroundRole:
+            # 错误帧用红色背景
+            if f.is_error:
+                return QBrush(QColor(140, 40, 40))
             # 本机发送的帧用绿色背景，与接收帧明显区分
             if f.is_tx:
                 return QBrush(QColor(50, 110, 60))   # 深绿

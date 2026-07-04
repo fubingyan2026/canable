@@ -1,5 +1,0 @@
-# Copy this file to /etc/udev/rules.d/
-
-# uses OpenMoko VID
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", MODE="660", GROUP="users", TAG+="uaccess"
-
