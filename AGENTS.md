@@ -20,6 +20,9 @@ ModemManager can interfere with slcan mode. The udev rules include `ID_MM_DEVICE
 ## Driver quirks (must know)
 
 - **CAN FD bit timing must be set BEFORE `start()`** — setting it after start fails silently.
+- **`start()` must include `GS_DevFlagCAN_FD` in flags when `.fd_mode == True`** — without it the STM32 FDCAN peripheral runs in Classic CAN mode and drops FD frames on RX. See `zdt_canable.py:798`.
+- **`DATA_BITTIMING` values differ from nominal timing** — STM32G4 FDCAN data-phase limits: TSEG1≤15, TSEG2≤15, SJW≤15. Driver table must use firmware's built-in values (Seg1=5, Seg2=2, 75% sample point), NOT the same as nominal bit timing. Wrong Seg1 values cause `FBK_InvalidParameter` (eFeedback=50) from firmware → data bitrate never stored → `start()` returns `FBK_BaudrateNotSet` (eFeedback=58). See `zdt_canable.py:159`.
+- **BRSE requires `data_bitrate > nominal_bitrate`** — firmware `can_using_BRS()` enables FDCAN BRSE bit only when data rate exceeds nominal rate. If they are equal, BRSE=0 and the FDCAN generates a protocol exception (drops) any received FD frame with BRS=1. To receive BRS frames from a peer, set data_bitrate to the peer's actual data-phase rate (e.g. nominal=1M, data=2M).
 - **Zero-length packet (ZLP)** required when USB transfer size is a multiple of 64 bytes (see `send()` in `zdt_canable.py`).
 - **Every `ctrl_out` must be followed by `ELM_ReqGetLastError` check** (`_ctrl_out_checked()` handles this).
 - Protocol auto-detection: ElmueSoft (variable-length) vs Legacy (80-byte fixed). The parser in `_ElmueProtocol` handles both.

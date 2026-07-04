@@ -157,13 +157,14 @@ NOMINAL_BITTIMING = {
 }
 
 DATA_BITTIMING = {
-    # 注意：当数据波特率与标称相同时，使用与标称相同的参数以获得 "Perfect match"
-    500_000:   (2,  139, 20, 20),  # 与标称 500k 相同, 87.5%
-    1_000_000: (1,  139, 20, 20),  # 与标称 1M 相同, 87.5%
-    2_000_000: (1,  69,  10, 10),  # 160MHz / 80 = 2M, 87.5%
-    4_000_000: (1,  34,  5,  5),   # 160MHz / 40 = 4M, 87.5%
-    5_000_000: (1,  27,  4,  4),   # 160MHz / 32 = 5M, 87.5%
-    8_000_000: (1,  9,   10, 9),   # 160MHz / 20 = 8M, 50% (固件注释说8M用50%采样点)
+    # STM32G4 FDCAN 数据相时序限制: TSEG1≤15, TSEG2≤15, SJW≤15
+    # 固件 can_set_data_baudrate() 内置表: Seg1=5, Seg2=2, 75% 采样点
+    500_000:   (40, 5, 2, 2),   # 160MHz / 40 / 8 = 500k
+    1_000_000: (20, 5, 2, 2),   # 160MHz / 20 / 8 = 1M
+    2_000_000: (10, 5, 2, 2),   # 160MHz / 10 / 8 = 2M
+    4_000_000: (5,  5, 2, 2),   # 160MHz / 5  / 8 = 4M
+    5_000_000: (4,  5, 2, 2),   # 160MHz / 4  / 8 = 5M
+    8_000_000: (5,  1, 2, 2),   # 160MHz / 5  / 4 = 8M, 50% (固件要求)
 }
 
 
@@ -1141,6 +1142,7 @@ class ZDTCanable:
 # =====================================================================
 def _cli():
     import sys
+    import time
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     devs = ZDTCanable.list_devices()
@@ -1152,11 +1154,46 @@ def _cli():
     for i, d in enumerate(devs):
         print(f"  [{i}] {d['manufacturer']} {d['product']} S/N: {d['serial']}")
 
+    fd_mode = "--fd" in sys.argv
+
     with ZDTCanable() as bus:
+        bus.fd_mode = fd_mode
         bus.set_bitrate(500_000)
+        if fd_mode:
+            bus.set_data_bitrate(2_000_000)
         bus.start()
 
-        print("接收中... (Ctrl+C 退出)")
+        print(f"接收中... (CAN FD={'开启' if fd_mode else '关闭'}, Ctrl+C 退出)")
+        try:
+            while True:
+                frame = bus.receive(timeout=1.0)
+                if frame is not None:
+                    print(frame)
+        except KeyboardInterrupt:
+            pass
+
+
+def _cli_fd_demo():
+    """FD 模式调用示例（用 python -c 或单独脚本运行）。"""
+    import time
+    from zdt_canable import ZDTCanable, CANFrame
+
+    logging.basicConfig(level=logging.INFO)
+
+    with ZDTCanable() as bus:
+        # 1. 开启 FD 模式
+        bus.fd_mode = True
+
+        # 2. 设置标称段波特率 (Nominal Bitrate)
+        bus.set_bitrate(500_000)
+
+        # 3. 设置数据段波特率 (Data Bitrate)
+        bus.set_data_bitrate(2_000_000)
+
+        # 4. 启动硬件（此时会把 GS_DevFlagCAN_FD 传给硬件）
+        bus.start()
+
+        print("CAN FD 接收中... (Ctrl+C 退出)")
         try:
             while True:
                 frame = bus.receive(timeout=1.0)
