@@ -123,6 +123,10 @@ class ZDTCanable:
                 self.stop()
             except Exception:
                 pass
+        try:
+            self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0))
+        except Exception:
+            pass
         if self.dev is not None:
             try:
                 usb.util.dispose_resources(self.dev)
@@ -423,6 +427,8 @@ class ZDTCanable:
         logger.debug("parsed %d frames", len(frames))
 
         if frames:
+            if len(frames) > 1:
+                self._parser._pending_frames = frames[1:]
             return frames[0]
         return None
 
@@ -476,9 +482,12 @@ class ZDTCanable:
     def read_error_register(self) -> Optional[str]:
         return self._last_error_info
 
-    def identify(self, duration_ms: int = 1500):
+    def identify(self, duration_ms: int = 1000):
         try:
             self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 1))
+            time.sleep(duration_ms / 1000.0)
+            self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0))
+            time.sleep(0.02)
         except usb.core.USBError:
             pass
 

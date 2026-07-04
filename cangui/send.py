@@ -1,6 +1,8 @@
 """Send 面板：单帧 / 周期发送（cangaroo 风格）。"""
 from __future__ import annotations
 
+import csv
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -14,6 +16,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 
 from canable_sdk import CANFrame
 from .style import id_color, FG_DIM
+
+SEND_CSV = "send_list.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -373,7 +377,6 @@ class SendPanel(QWidget):
 
     # ---- 序列化 ---- #
     def set_fd_mode(self, enabled: bool):
-        """切换 FD 模式，影响编辑对话框中的可用选项。"""
         self._fd_mode = enabled
 
     def to_dict_list(self):
@@ -402,3 +405,43 @@ class SendPanel(QWidget):
             self.entries.append(e)
         self._refresh_all()
         self._sync_timers()
+
+    CSV_HEADERS = ["can_id", "extended", "rtr", "fd", "brs", "dlc", "data", "period_ms", "enabled"]
+
+    def to_csv(self, path: str):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.CSV_HEADERS)
+            for e in self.entries:
+                w.writerow([
+                    f"0x{e.can_id:X}", e.extended, e.rtr, e.fd, e.brs,
+                    e.dlc, e.data.hex(" ").upper(), e.period_ms, e.enabled,
+                ])
+
+    def from_csv(self, path: str):
+        self.stop_all_timers()
+        self.entries.clear()
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                self.entries.append(SendEntry(
+                    can_id=int(row["can_id"], 16),
+                    extended=row["extended"].strip() == "True",
+                    rtr=row["rtr"].strip() == "True",
+                    fd=row["fd"].strip() == "True",
+                    brs=row["brs"].strip() == "True",
+                    dlc=int(row["dlc"]),
+                    data=bytes.fromhex(row["data"].replace(" ", "")),
+                    period_ms=float(row["period_ms"]),
+                    enabled=row["enabled"].strip() == "True",
+                ))
+        self._refresh_all()
+        self._sync_timers()
+
+    @staticmethod
+    def csv_path():
+        return SEND_CSV
+
+    @staticmethod
+    def exists():
+        return os.path.exists(SEND_CSV)

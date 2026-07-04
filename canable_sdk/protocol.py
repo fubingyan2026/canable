@@ -21,6 +21,8 @@ from .frame import CANFrame
 
 logger = logging.getLogger("canable_sdk.protocol")
 
+MAX_BUFFER_SIZE = 2048
+
 
 class _ElmueProtocol:
     def __init__(self):
@@ -42,6 +44,11 @@ class _ElmueProtocol:
 
     def feed(self, raw: bytes) -> list:
         self._buffer.extend(raw)
+        if len(self._buffer) > MAX_BUFFER_SIZE:
+            logger.warning("buffer overflow, discarding %d bytes", len(self._buffer))
+            self._buffer.clear()
+            return []
+
         frames = []
         while len(self._buffer) >= 2:
             size = self._buffer[0]

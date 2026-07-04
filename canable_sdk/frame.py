@@ -11,6 +11,7 @@ from typing import Optional
 
 from .constants import (
     CAN_FD_DLC_MAP, DLC_BOUNDARIES,
+    MSG_TxFrame,
     CAN_ID_29Bit, CAN_ID_RTR, CAN_MASK_11, CAN_MASK_29,
     FRM_FDF, FRM_BRS, FRM_ESI,
     ERID_Bus_is_off, ERID_No_ACK_received, ERID_CRC_Error,

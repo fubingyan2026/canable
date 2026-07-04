@@ -346,18 +346,12 @@ class MainWindow(QMainWindow):
     def _disconnect(self):
         if self._worker is None:
             return
-        try:
-            self._worker.disconnect()
-        except Exception:
-            pass
-        # 终止线程
+        # 通知 worker 线程退出（run() 的 finally 块会关闭设备并 emit state_changed）
+        self._worker._running = False
+        self._worker._connected = False
         if hasattr(self, "_worker_thread") and self._worker_thread is not None:
-            self._worker_thread.quit()
-            self._worker_thread.wait(2000)
-            self._worker_thread.deleteLater()
+            self._worker_thread.wait(500)
             self._worker_thread = None
-        # worker 和 thread 由 finished 信号统一 deleteLater，
-        # 这里仅释放 Python 引用，避免重复 delete 导致 libshiboken 报错
         self._worker = None
         self._update_connect_ui(False, "已断开")
 
@@ -380,11 +374,11 @@ class MainWindow(QMainWindow):
         def _run():
             try:
                 if self._worker is not None and self._worker._bus is not None:
-                    self._worker._bus.identify(1500)
+                    self._worker._bus.identify(1000)
                 else:
                     with ZDTCanable() as b:
-                        b.identify(1500)
-                self.status_label.setText("设备 LED 闪烁中…")
+                        b.identify(1000)
+                self.status_label.setText("LED 识别完成")
             except Exception as e:
                 QMessageBox.warning(self, "LED 识别", f"失败: {e}")
 
@@ -572,19 +566,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "加载失败", str(e))
 
     def _on_save_send_list(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存发送列表", "send_list.json", "JSON (*.json)")
-        if not path: return
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.send_panel.to_dict_list(), f, indent=2)
-        self.status_label.setText(f"发送列表已保存到 {path}")
+        self.send_panel.to_csv(self.send_panel.csv_path())
+        self.status_label.setText(f"发送列表已保存: {self.send_panel.csv_path()}")
 
     def _on_load_send_list(self):
-        path, _ = QFileDialog.getOpenFileName(self, "加载发送列表", "", "JSON (*.json)")
-        if not path: return
+        if not self.send_panel.exists():
+            self.status_label.setText("无历史记录")
+            return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                self.send_panel.from_dict_list(json.load(f))
-            self.status_label.setText(f"发送列表已加载: {path}")
+            self.send_panel.from_csv(self.send_panel.csv_path())
+            self.status_label.setText(f"发送列表已加载: {self.send_panel.csv_path()}")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
@@ -628,11 +619,22 @@ class MainWindow(QMainWindow):
             self.restoreState(state)
         # 自动扫描一次
         QTimer.singleShot(100, self._scan_devices)
+        # 自动恢复发送列表
+        if self.send_panel.exists():
+            try:
+                self.send_panel.from_csv(self.send_panel.csv_path())
+            except Exception:
+                pass
 
     def closeEvent(self, e):
         self._settings.setValue("bitrate", self.bitrate_combo.currentData())
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.setValue("state", self.saveState())
+        # 自动保存发送列表
+        try:
+            self.send_panel.to_csv(self.send_panel.csv_path())
+        except Exception:
+            pass
         if self._connected:
             self._disconnect()
         e.accept()

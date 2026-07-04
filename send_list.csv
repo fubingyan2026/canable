@@ -1,0 +1,2 @@
+can_id,extended,rtr,fd,brs,dlc,data,period_ms,enabled
+0x100,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False

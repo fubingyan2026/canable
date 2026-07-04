@@ -140,13 +140,6 @@ class CANWorker(QObject):
     def disconnect(self):
         self._running = False
         self._connected = False
-        if self._bus is not None:
-            try:
-                self._bus.close()
-            except Exception:
-                pass
-            self._bus = None
-        self.state_changed.emit(False, "已断开")
 
     @Slot(int)
     def set_bitrate_slot(self, bitrate: int):
@@ -161,6 +154,20 @@ class CANWorker(QObject):
                 self.error.emit(f"设置波特率失败: {e}")
         else:
             self.bitrate = bitrate
+
+    def _calc_bus_load(self, now: float, frame: CANFrame, fps: int) -> float:
+        if fps == 0 or not self.bitrate:
+            return 0.0
+        if frame.fd:
+            arb_bits = 128
+            data_bits = len(frame.data) * 10
+            if frame.brs and self.data_bitrate and self.data_bitrate > 0:
+                effective_bits = arb_bits + data_bits * (self.bitrate / self.data_bitrate)
+            else:
+                effective_bits = arb_bits + data_bits
+        else:
+            effective_bits = 128
+        return min(100.0, fps * effective_bits * 100.0 / self.bitrate)
 
     @Slot(object)
     def send(self, frame: CANFrame):
@@ -190,13 +197,12 @@ class CANWorker(QObject):
     # ---------- 主循环 ---------- #
     @Slot()
     def run(self):
-        """Qt Concurrent / QThread 入口；也可直接循环调用。"""
         window_s = 1.0
         frame_times: List[float] = []
 
         while self._running and self._bus is not None:
             try:
-                frame = self._bus.receive(timeout=0.05)
+                frame = self._bus.receive(timeout=0.01)
             except Exception as e:
                 if self._running:
                     self.error.emit(f"接收错误: {e}")
@@ -206,13 +212,11 @@ class CANWorker(QObject):
 
             now = time.time()
             if frame is not None:
-                # 错误帧处理
                 if frame.is_error:
                     is_busoff = "BUS-OFF" in frame._error_info
                     is_noack  = "NO-ACK" in frame._error_info
 
                     if is_busoff:
-                        # BUS-OFF: 真正严重错误, 需要恢复控制器
                         if now - self._last_error_time > 1.0:
                             self._error_count = 1
                         else:
@@ -235,20 +239,19 @@ class CANWorker(QObject):
                             self._error_count = 0
                             time.sleep(0.2)
                     elif is_noack:
-                        # NO-ACK: 固件 LEC 寄存器粘滞, 会持续发送错误帧
-                        # 根因: 总线上无设备应答本机发送的帧 (正常现象)
-                        # recover() 无法解决 NO-ACK, 仅首次通知, 之后静默
                         if now - self._last_error_notify >= 5.0:
                             logger.info("CAN NO-ACK (LEC 粘滞, 可能无设备应答)")
                             self._last_error_notify = now
-                        # 不计数, 不触发 recover()
                     else:
-                        # 非严重错误 (CTRL-ERR 等): 仅日志，不通知 UI
                         logger.debug("CAN 状态: %s", frame._error_info)
                     continue
 
-                # TX 回环帧: 固件回传的发送确认，已在 send() 中直接显示，跳过
                 if frame.is_tx:
+                    frame_times.append(now)
+                    frame_times = [t for t in frame_times if now - t <= window_s]
+                    fps = len(frame_times)
+                    load = self._calc_bus_load(now, frame, fps)
+                    self.bus_stats.emit(load, fps)
                     continue
 
                 frame.timestamp = now
@@ -258,26 +261,20 @@ class CANWorker(QObject):
                 if self._pass(frame):
                     self.frame_received.emit(frame)
 
-            # 统计：fps + 总线负载
-            # 经典 CAN: ~128 bit/帧 (含仲裁+控制+数据+CRC+ACK+EOF)
-            # CAN FD: 仲裁相 ~128 bit + 数据相 (data_len * 10 bit)
-            #   - 无 BRS: 全程按标称波特率
-            #   - 有 BRS: 数据相按 data_bitrate，需折算
             fps = len(frame_times)
             if frame is not None and fps > 0:
-                if frame.fd:
-                    arb_bits = 128
-                    data_bits = len(frame.data) * 10
-                    if frame.brs and self.data_bitrate and self.data_bitrate > 0:
-                        # BRS: 数据相用更高波特率，折算到标称波特率
-                        effective_bits = arb_bits + data_bits * (self.bitrate / self.data_bitrate)
-                    else:
-                        effective_bits = arb_bits + data_bits
-                else:
-                    effective_bits = 128
-                load = min(100.0, fps * effective_bits * 100.0 / self.bitrate) if self.bitrate else 0.0
+                load = self._calc_bus_load(now, frame, fps)
             else:
                 load = 0.0
             self.bus_stats.emit(load, fps)
+
+        # cleanup: close bus from correct thread
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+            self._bus = None
+        self.state_changed.emit(False, "已断开")
 
 
