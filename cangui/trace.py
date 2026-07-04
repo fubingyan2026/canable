@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QTableView, QHeaderView, QAbstractItemView,
                                 QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
                                 QCheckBox, QSpinBox, QLabel)
 
-from zdt_canable import CANFrame
+from canable_sdk import CANFrame
 from .style import id_color, FG_DIM
 
 

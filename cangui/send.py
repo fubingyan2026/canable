@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QFormLayout, QLineEdit, QComboBox, QDoubleSpinBox,
                                 QCheckBox, QLabel, QMessageBox)
 
-from zdt_canable import CANFrame
+from canable_sdk import CANFrame
 from .style import id_color, FG_DIM
 
 

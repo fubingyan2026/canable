@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "canable-sdk"
+version = "0.1.0"
+description = "Python USB-CAN driver for CANable 2.5 adapters (ElmueSoft firmware)"
+requires-python = ">=3.9"
+dependencies = ["pyusb>=1.2.1"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+
+[tool.setuptools.packages.find]
+include = ["canable_sdk*"]

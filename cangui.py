@@ -12,7 +12,7 @@ import logging
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 在 import 任何业务模块前配置 logging，确保 zdt_canable 内的 logger 也能输出
+# 在 import 任何业务模块前配置 logging，确保 canable_sdk 内的 logger 也能输出
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",

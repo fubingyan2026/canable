@@ -1,6 +1,6 @@
 """CAN I/O 工作线程。
 
-把 zdt_canable.ZDTCanable 封装进 QThread，
+把 canable_sdk.ZDTCanable 封装进 QThread，
 通过 Qt 信号把帧、状态、错误安全地抛到主线程。
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import List, Optional
 import usb.core
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker, QObject, Slot
 
-from zdt_canable import ZDTCanable, CANFrame
+from canable_sdk import ZDTCanable, CANFrame
 
 logger = logging.getLogger("cangui.worker")
 
@@ -179,7 +179,7 @@ class CANWorker(QObject):
             # 同步进 trace 列表（不等回环），让用户立即看到发送成功
             self.frame_received.emit(frame)
         except usb.core.USBError as e:
-            # Pipe error: zdt_canable.py 已在 send() 内部完成 recover + TX 节流
+            # Pipe error: canable_sdk 已在 send() 内部完成 recover + TX 节流
             # 此处仅通知 UI, 不重复恢复
             logger.warning("TX  USB 错误 (已自动恢复): %s", e)
             self.error.emit("发送失败: 控制器已自动恢复，请重试")

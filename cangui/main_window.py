@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                 QMessageBox, QInputDialog, QGroupBox, QFormLayout,
                                 QDoubleSpinBox, QCheckBox)
 
-from zdt_canable import ZDTCanable, CANFrame
+from canable_sdk import ZDTCanable, CANFrame
 from .style import QSS, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR
 from .worker import CANWorker
 from .trace import TracePanel
