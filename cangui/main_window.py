@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                                 QMessageBox, QInputDialog, QGroupBox, QFormLayout,
                                 QDoubleSpinBox, QCheckBox)
 
+from PySide6.QtCore import QMutexLocker
+
 from canable_sdk import ZDTCanable, CANFrame
 from .style import set_theme, get_qss, current_theme, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR
 from .i18n import _, language_changed, get_language, set_language
@@ -39,6 +41,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("CANable 2.5")
         self.resize(1400, 850)
+        self.setDockOptions(self.dockOptions() & ~QMainWindow.AnimatedDocks)
+
+        self._settings_dirty = False
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.timeout.connect(self._flush_settings)
 
         # 状态
         self._connected = False
@@ -54,6 +62,15 @@ class MainWindow(QMainWindow):
 
     def _set(self, key, value):
         self._settings[key] = value
+        if not self._settings_dirty:
+            self._settings_dirty = True
+            self._settings_timer.start(2000)
+
+    def _flush_settings(self):
+        if not self._settings_dirty:
+            return
+        self._settings_dirty = False
+        self._settings_timer.stop()
         try:
             with open(self._settings_path(), "w") as f:
                 json.dump(self._settings, f, indent=2)
@@ -96,6 +113,8 @@ class MainWindow(QMainWindow):
         self.send_dock = QDockWidget(_("Window.SendMessages"), self)
         self.send_dock.setObjectName("SendDock")
         self.send_dock.setWidget(self.send_panel)
+        self.send_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.send_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.send_dock)
 
@@ -104,6 +123,8 @@ class MainWindow(QMainWindow):
         self.filter_dock = QDockWidget(_("Window.Filters"), self)
         self.filter_dock.setObjectName("FilterDock")
         self.filter_dock.setWidget(self.filter_panel)
+        self.filter_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.filter_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.filter_dock)
 
@@ -378,8 +399,9 @@ class MainWindow(QMainWindow):
         if self._worker is None:
             return
         # 通知 worker 线程退出（run() 的 finally 块会关闭设备并 emit state_changed）
-        self._worker._running = False
-        self._worker._connected = False
+        with QMutexLocker(self._worker._mutex):
+            self._worker._running = False
+            self._worker._connected = False
         if hasattr(self, "_worker_thread") and self._worker_thread is not None:
             self._worker_thread.wait(500)
             self._worker_thread = None
@@ -394,7 +416,7 @@ class MainWindow(QMainWindow):
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
         self.connect_btn.setChecked(connected)
-        self.connect_btn.setText("断开" if connected else "连接")
+        self.connect_btn.setText(_("Left.Disconnect") if connected else _("Left.Connect"))
         self.bitrate_combo.setEnabled(not connected)
         self.bitrate_label.setText(f"{self.bitrate_combo.currentData():,} bps" if connected else "— bps")
 
@@ -697,6 +719,7 @@ class MainWindow(QMainWindow):
         self._set("filter_hdr", bytes(self.filter_panel.table.horizontalHeader().saveState().toHex()).decode())
         self._set("geometry", bytes(self.saveGeometry().toHex()).decode())
         self._set("state", bytes(self.saveState().toHex()).decode())
+        self._flush_settings()
         try:
             self.send_panel.to_csv(self.send_panel.csv_path())
         except Exception:

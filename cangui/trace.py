@@ -34,6 +34,7 @@ class TraceModel(QAbstractTableModel):
         self._header_labels = self._make_headers()
         self._rows: Deque[CANFrame] = deque(maxlen=max_rows)
         self._meta: Deque[dict]     = deque(maxlen=max_rows)
+        self._text: Deque[list]     = deque(maxlen=max_rows)
         self._counts: Dict[Tuple[int, bool], int] = {}
         self._last_ts: Dict[Tuple[int, bool], float] = {}
         self._period:  Dict[Tuple[int, bool], float] = {}
@@ -54,6 +55,45 @@ class TraceModel(QAbstractTableModel):
             return self._header_labels[section] if section < len(self._header_labels) else None
         return None
 
+    @staticmethod
+    def _format_row(frame: CANFrame, meta: dict) -> list:
+        t = frame.timestamp % 1000.0
+        ch = "ERR" if frame.is_error else ("TX" if frame.is_tx else "CAN1")
+        if frame.is_error:
+            cid = "ERROR"
+            typ = "ERR"
+            dlc = ""
+            data = frame._error_info
+            ascii = frame._error_info
+        else:
+            cid = f"{frame.can_id:08X}" if frame.extended else f"{frame.can_id:03X}"
+            if frame.rtr:
+                typ = "RTR"
+            elif frame.fd and frame.brs:
+                typ = "FD+BRS"
+            elif frame.fd:
+                typ = "FD"
+            elif frame.extended:
+                typ = "Ext"
+            else:
+                typ = "Std"
+            dlc = str(frame.dlc)
+            data = frame.data.hex(' ').upper()
+            ascii = ''.join(chr(b) if 32 <= b < 127 else '.' for b in frame.data)
+        return [
+            "",                         # COL_INDEX — set on insert
+            f"{t:12.6f}",
+            ch,
+            cid,
+            typ,
+            dlc,
+            data,
+            ascii,
+            f"{meta['dt']:.1f}" if meta['dt'] else "",
+            f"{meta['period']:.1f}" if meta['period'] else "",
+            str(meta['count']),
+        ]
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
@@ -61,68 +101,32 @@ class TraceModel(QAbstractTableModel):
         if row >= len(self._rows):
             return None
         f = self._rows[row]
-        m = self._meta[row]
         col = index.column()
 
-        if role == Qt.DisplayRole:
+        if role == Qt.DisplayRole and col < len(self._text[row]):
             if col == self.COL_INDEX:
                 return f"{row + 1}"
-            if col == self.COL_TIME:
-                t = f.timestamp % 1000.0
-                return f"{t:12.6f}"
-            if col == self.COL_CH:
-                return "ERR" if f.is_error else ("TX" if f.is_tx else "CAN1")
-            if col == self.COL_ID:
-                if f.is_error:
-                    return "ERROR"
-                return f"{f.can_id:08X}" if f.extended else f"{f.can_id:03X}"
-            if col == self.COL_TYPE:
-                if f.is_error:
-                    return "ERR"
-                if f.rtr:    return "RTR"
-                if f.fd and f.brs: return "FD+BRS"
-                if f.fd:     return "FD"
-                if f.extended: return "Ext"
-                return "Std"
-            if col == self.COL_DLC:
-                return "" if f.is_error else str(f.dlc)
-            if col == self.COL_DATA:
-                if f.is_error:
-                    return f._error_info
-                return f.data.hex(' ').upper()
-            if col == self.COL_ASCII:
-                if f.is_error:
-                    return f._error_info
-                return ''.join(chr(b) if 32 <= b < 127 else '.' for b in f.data)
-            if col == self.COL_DELTA:
-                return f"{m['dt']:.1f}" if m['dt'] else ""
-            if col == self.COL_PERIOD:
-                return f"{m['period']:.1f}" if m['period'] else ""
-            if col == self.COL_COUNT:
-                return str(m['count'])
+            return self._text[row][col]
 
-        elif role == Qt.BackgroundRole:
+        if role == Qt.BackgroundRole:
             if f.is_error:
                 return QBrush(QColor(255, 220, 220))
             if f.is_tx:
                 return QBrush(QColor("#D2F0E3"))
-        elif role == Qt.ForegroundRole:
+
+        if role == Qt.ForegroundRole:
             if f.is_tx:
                 return QBrush(QColor(FG_ACCENT))
             if f.rtr:
                 return QBrush(QColor(FG_DIM))
-            color = id_color(f.can_id, f.extended)
-            return QBrush(QColor(color))
+            if not f.is_error:
+                return QBrush(QColor(id_color(f.can_id, f.extended)))
 
-        elif role == Qt.ForegroundRole:
-            if f.rtr:
-                return QBrush(QColor(FG_DIM))
-
-        elif role == Qt.TextAlignmentRole:
+        if role == Qt.TextAlignmentRole:
             if col in (self.COL_DLC, self.COL_COUNT):
                 return Qt.AlignCenter
 
-        elif role == Qt.ToolTipRole:
+        if role == Qt.ToolTipRole:
             return f"ID: 0x{f.can_id:X}  DLC: {f.dlc}\nData: {f.data.hex(' ').upper()}"
 
         return None
@@ -142,12 +146,14 @@ class TraceModel(QAbstractTableModel):
         period = self._period.get(cid, 0.0)
         count = self._counts[cid]
         meta = {"dt": dt, "period": period, "count": count}
+        txt = self._format_row(frame, meta)
 
         if self._collapse:
             vis_idx = self._id_vis.get(cid)
             if vis_idx is not None and vis_idx < len(self._rows):
                 self._rows[vis_idx] = frame
                 self._meta[vis_idx] = meta
+                self._text[vis_idx] = txt
                 self.dataChanged.emit(
                     self.index(vis_idx, 0),
                     self.index(vis_idx, self.columnCount() - 1),
@@ -157,8 +163,10 @@ class TraceModel(QAbstractTableModel):
         # append new row
         if len(self._rows) == self._rows.maxlen:
             self.beginRemoveRows(QModelIndex(), 0, 0)
-            old = self._rows.popleft()
+            old = self._rows[0]
+            self._rows.popleft()
             self._meta.popleft()
+            self._text.popleft()
             old_cid = (old.can_id, old.extended)
             if old_cid in self._id_vis and self._id_vis[old_cid] == 0:
                 del self._id_vis[old_cid]
@@ -170,6 +178,7 @@ class TraceModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), pos, pos)
         self._rows.append(frame)
         self._meta.append(meta)
+        self._text.append(txt)
         self._id_vis[cid] = pos
         self.endInsertRows()
 
@@ -182,20 +191,24 @@ class TraceModel(QAbstractTableModel):
             self.beginResetModel()
             collapsed_rows = deque(maxlen=self._rows.maxlen)
             collapsed_meta = deque(maxlen=self._rows.maxlen)
+            collapsed_text = deque(maxlen=self._rows.maxlen)
             seen: Dict[Tuple[int, bool], int] = {}
             for i, f in enumerate(self._rows):
                 cid = (f.can_id, f.extended)
                 if cid in seen:
                     collapsed_rows[seen[cid]] = f
                     collapsed_meta[seen[cid]] = self._meta[i]
+                    collapsed_text[seen[cid]] = self._format_row(f, self._meta[i])
                 else:
                     idx = len(collapsed_rows)
                     seen[cid] = idx
                     self._id_vis[cid] = idx
                     collapsed_rows.append(f)
                     collapsed_meta.append(self._meta[i])
+                    collapsed_text.append(self._text[i])
             self._rows = collapsed_rows
             self._meta = collapsed_meta
+            self._text = collapsed_text
             self.endResetModel()
 
     @staticmethod
@@ -211,6 +224,7 @@ class TraceModel(QAbstractTableModel):
         self.beginResetModel()
         self._rows.clear()
         self._meta.clear()
+        self._text.clear()
         self._counts.clear()
         self._last_ts.clear()
         self._period.clear()
@@ -364,15 +378,14 @@ class TracePanel(QWidget):
         self._log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trace_log.csv")
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self._flush_log)
-        self._log_timer.start(1000)
+        self._log_timer.start(5000)
 
-    _log_max_rows = 1000
+    _log_max_rows = 1500
 
     def _flush_log(self):
         if len(self._log_buffer) == 0:
             return
         try:
-            # collect new frames since last write
             new_frames = []
             for fm in self._log_buffer:
                 if fm.is_error or fm.timestamp <= self._last_log_ts:
@@ -391,30 +404,29 @@ class TracePanel(QWidget):
                     self._last_log_ts = fm.timestamp
             if not new_frames:
                 return
-            # read existing rows
-            existing = []
-            need_header = True
+            need_header = not os.path.isfile(self._log_path) or os.path.getsize(self._log_path) == 0
+            with open(self._log_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if need_header:
+                    w.writerow(["timestamp", "ch", "can_id", "type", "dlc", "data_hex"])
+                for r in new_frames:
+                    w.writerow(r)
+            # trim to _log_max_rows when file gets large
             try:
                 with open(self._log_path, "r", newline="") as f:
-                    reader = csv.reader(f)
-                    header = next(reader, None)
-                    if header and header[0] == "timestamp":
-                        need_header = False
-                    existing = list(reader)
-            except (FileNotFoundError, StopIteration):
+                    all_rows = list(csv.reader(f))
+                if len(all_rows) > self._log_max_rows:
+                    with open(self._log_path, "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(all_rows[0])  # header
+                        for r in all_rows[-(self._log_max_rows - 1):]:
+                            w.writerow(r)
+            except Exception:
                 pass
-            # merge and cap at 1000
-            all_rows = existing + new_frames
-            if len(all_rows) > 1000:
-                all_rows = all_rows[-1000:]
-            # write back
-            with open(self._log_path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["timestamp", "ch", "can_id", "type", "dlc", "data_hex"])
-                for r in all_rows:
-                    w.writerow(r)
         except Exception:
             pass
+        finally:
+            self._log_buffer.clear()
 
     def _on_clear(self):
         self.view.clear()
@@ -453,8 +465,6 @@ class TracePanel(QWidget):
         self.view.add_frame(frame)
         self._frame_count += 1
         self._log_buffer.append(frame)
-        if self._frame_count % 10 == 0:
-            self._flush_log()
 
     def refresh_language(self):
         self.clear_btn.setText(_("Trace.Clear"))

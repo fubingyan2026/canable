@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from typing import List, Optional
 
 import usb.core
@@ -198,7 +199,8 @@ class CANWorker(QObject):
     @Slot()
     def run(self):
         window_s = 1.0
-        frame_times: List[float] = []
+        frame_times: deque = deque(maxlen=2000)
+        last_stats_emit = 0.0
 
         while self._running and self._bus is not None:
             try:
@@ -248,25 +250,26 @@ class CANWorker(QObject):
 
                 if frame.is_tx:
                     frame_times.append(now)
-                    frame_times = [t for t in frame_times if now - t <= window_s]
-                    fps = len(frame_times)
-                    load = self._calc_bus_load(now, frame, fps)
-                    self.bus_stats.emit(load, fps)
+                    while frame_times and frame_times[0] < now - window_s:
+                        frame_times.popleft()
                     continue
 
                 frame.timestamp = now
                 frame_times.append(now)
-                frame_times = [t for t in frame_times if now - t <= window_s]
+                while frame_times and frame_times[0] < now - window_s:
+                    frame_times.popleft()
                 logger.info("RX  %s", frame)
                 if self._pass(frame):
                     self.frame_received.emit(frame)
 
             fps = len(frame_times)
+            load = 0.0
             if frame is not None and fps > 0:
                 load = self._calc_bus_load(now, frame, fps)
-            else:
-                load = 0.0
-            self.bus_stats.emit(load, fps)
+
+            if now - last_stats_emit >= 0.1:
+                self.bus_stats.emit(load, fps)
+                last_stats_emit = now
 
         # cleanup: close bus from correct thread
         if self._bus is not None:

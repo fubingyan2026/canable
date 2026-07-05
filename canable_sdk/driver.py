@@ -425,12 +425,12 @@ class ZDTCanable:
             return None
 
         raw = bytes(data)
-        logger.info("USB IN %3d hex: %s", len(raw), raw[:32].hex())
+        logger.debug("USB IN %3d hex: %s", len(raw), raw[:32].hex())
         frames = self._parser.feed(raw)
         if frames:
-            logger.info("parsed %d frames", len(frames))
+            logger.debug("parsed %d frames", len(frames))
         else:
-            logger.info("no frame from %d bytes (string/busload)", len(raw))
+            logger.debug("no frame from %d bytes (string/busload)", len(raw))
 
         if frames:
             if len(frames) > 1:
