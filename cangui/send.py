@@ -15,9 +15,18 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QCheckBox, QLabel, QMessageBox)
 
 from canable_sdk import CANFrame
+from .i18n import _
 from .style import id_color, FG_DIM
 
-SEND_CSV = "send_list.csv"
+
+_SEND_DIR = None
+
+def _csv_dir():
+    global _SEND_DIR
+    if _SEND_DIR is None:
+        _SEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return _SEND_DIR
+
 
 
 # --------------------------------------------------------------------------- #
@@ -25,6 +34,7 @@ SEND_CSV = "send_list.csv"
 # --------------------------------------------------------------------------- #
 @dataclass
 class SendEntry:
+    name:      str   = ""
     can_id:    int   = 0x100
     extended:  bool  = False
     rtr:       bool  = False
@@ -53,16 +63,20 @@ class SendDialog(QDialog):
     def __init__(self, entry: SendEntry, parent=None, fd_mode: bool = False):
         super().__init__(parent)
         self._fd_mode = fd_mode
-        self.setWindowTitle("编辑发送报文")
+        self.setWindowTitle(_("Send.DialogTitle"))
         self.setMinimumWidth(360)
         form = QFormLayout(self)
 
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Name (optional)")
+        form.addRow(_("Send.DlgName"), self.name_edit)
+
         self.id_edit = QLineEdit()
-        form.addRow("CAN ID (hex):", self.id_edit)
+        form.addRow(_("Send.DlgID"), self.id_edit)
 
         type_bar = QHBoxLayout()
-        self.ext_chk = QCheckBox("扩展帧 (29-bit)")
-        self.rtr_chk = QCheckBox("RTR 远程帧")
+        self.ext_chk = QCheckBox(_("Send.DlgExt"))
+        self.rtr_chk = QCheckBox(_("Send.DlgRTR"))
         self.fd_chk = QCheckBox("CAN FD")
         self.brs_chk = QCheckBox("BRS")
         type_bar.addWidget(self.ext_chk)
@@ -70,28 +84,29 @@ class SendDialog(QDialog):
         type_bar.addWidget(self.fd_chk)
         type_bar.addWidget(self.brs_chk)
         type_bar.addStretch()
-        form.addRow("类型:", type_bar)
+        form.addRow(_("Send.DlgType"), type_bar)
 
         self.dlc_combo = QComboBox()
         for code, label in self.FD_DLC_CHOICES:
             self.dlc_combo.addItem(label, code)
-        form.addRow("DLC:", self.dlc_combo)
+        form.addRow(_("Send.DlgDLC"), self.dlc_combo)
 
         self.data_edit = QLineEdit()
-        self.data_edit.setPlaceholderText("十六进制，空格分隔，如: DE AD BE EF")
-        form.addRow("数据:", self.data_edit)
+        self.data_edit.setPlaceholderText(_("Send.FdDlcHEX"))
+        form.addRow(_("Send.DlgData"), self.data_edit)
 
         self.period_spin = QDoubleSpinBox()
         self.period_spin.setRange(0.0, 60000.0)
         self.period_spin.setSuffix(" ms")
         self.period_spin.setDecimals(1)
         self.period_spin.setSingleStep(10.0)
-        form.addRow("周期:", self.period_spin)
+        form.addRow(_("Send.DlgPeriod"), self.period_spin)
 
-        self.enable_chk = QCheckBox("启用周期发送")
+        self.enable_chk = QCheckBox(_("Send.DlgEnabled"))
         form.addRow("", self.enable_chk)
 
         # 绑定当前值
+        self.name_edit.setText(entry.name)
         self.id_edit.setText(f"{entry.can_id:X}")
         self.ext_chk.setChecked(entry.extended)
         self.rtr_chk.setChecked(entry.rtr)
@@ -147,6 +162,7 @@ class SendDialog(QDialog):
 
     def get_entry(self, base: Optional[SendEntry] = None) -> SendEntry:
         e = SendEntry() if base is None else base
+        e.name = self.name_edit.text().strip()
         try:
             e.can_id = int(self.id_edit.text(), 16)
         except ValueError:
@@ -174,7 +190,9 @@ class SendPanel(QWidget):
     request_send = Signal(object)   # CANFrame
     state_changed = Signal(str)     # 状态文本
 
-    HEADERS = ["#", "ID", "Type", "DLC", "Data", "Period", "Sent", "On"]
+    @staticmethod
+    def HEADERS():
+        return [_("Send.HdrName"), _("Send.HdrID"), _("Send.HdrType"), _("Send.HdrDLC"), _("Send.HdrData"), _("Send.HdrPeriod"), _("Send.HdrSent"), _("Send.HdrOn")]
 
     COL_INDEX, COL_ID, COL_TYPE, COL_DLC, COL_DATA, COL_PERIOD, COL_SENT, COL_ON = range(8)
 
@@ -191,17 +209,18 @@ class SendPanel(QWidget):
         layout.setSpacing(2)
 
         # 表
-        self.table = QTableWidget(0, len(self.HEADERS), self)
-        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table = QTableWidget(0, len(self.HEADERS()), self)
+        self.table.setHorizontalHeaderLabels(self.HEADERS())
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(20)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
         self.table.doubleClicked.connect(self._on_double_clicked)
         h = self.table.horizontalHeader()
-        widths = {self.COL_INDEX: 35, self.COL_ID: 110, self.COL_TYPE: 50,
+        widths = {self.COL_INDEX: 70, self.COL_ID: 110, self.COL_TYPE: 50,
                   self.COL_DLC: 40, self.COL_DATA: 200, self.COL_PERIOD: 70,
                   self.COL_SENT: 60, self.COL_ON: 35}
         for c, w in widths.items():
@@ -211,13 +230,14 @@ class SendPanel(QWidget):
 
         # 按钮
         bar = QHBoxLayout()
-        self.add_btn   = QPushButton("添加")
-        self.edit_btn  = QPushButton("编辑")
-        self.del_btn   = QPushButton("删除")
-        self.send_btn  = QPushButton("发送一次")
-        self.start_btn = QPushButton("启动全部")
-        self.stop_btn  = QPushButton("停止全部")
-        self.clear_btn = QPushButton("清空列表")
+        self.add_btn   = QPushButton(_("Send.Add"))
+        self.edit_btn  = QPushButton(_("Send.Edit"))
+        self.del_btn   = QPushButton(_("Send.Delete"))
+        self.send_btn  = QPushButton(_("Send.SendOnce"))
+        self.start_btn = QPushButton(_("Send.StartAll"))
+        self.stop_btn  = QPushButton(_("Send.StopAll"))
+        self.clear_btn = QPushButton(_("Send.ClearAll"))
+        self.send_btn.setObjectName("sendBtn")
         for b in (self.add_btn, self.edit_btn, self.del_btn, self.send_btn,
                   self.start_btn, self.stop_btn, self.clear_btn):
             bar.addWidget(b)
@@ -233,7 +253,7 @@ class SendPanel(QWidget):
         self.clear_btn.clicked.connect(self._on_clear)
 
         # 状态
-        self.status_label = QLabel("已就绪")
+        self.status_label = QLabel(_("Send.Ready"))
         self.status_label.setStyleSheet(f"color: {FG_DIM};")
         layout.addWidget(self.status_label)
 
@@ -253,7 +273,7 @@ class SendPanel(QWidget):
             return i
         align_center = Qt.AlignCenter
         items = [
-            it(f"{row+1}",    align_center),
+            it(e.name if e.name else f"#{row+1}", align_center),
             it(f"{e.can_id:08X}" if e.extended else f"{e.can_id:03X}"),
             it("RTR" if e.rtr else ("FD+BRS" if e.fd and e.brs else ("FD" if e.fd else ("Ext" if e.extended else "Std"))), align_center),
             it(str(e.dlc),    align_center),
@@ -375,13 +395,24 @@ class SendPanel(QWidget):
         # 双击 = 发送一次
         self._on_send_once()
 
+    def refresh_language(self):
+        self.add_btn.setText(_("Send.Add"))
+        self.edit_btn.setText(_("Send.Edit"))
+        self.del_btn.setText(_("Send.Delete"))
+        self.send_btn.setText(_("Send.SendOnce"))
+        self.start_btn.setText(_("Send.StartAll"))
+        self.stop_btn.setText(_("Send.StopAll"))
+        self.clear_btn.setText(_("Send.ClearAll"))
+        self.status_label.setText(_("Send.Ready"))
+        self.table.setHorizontalHeaderLabels(self.HEADERS())
+
     # ---- 序列化 ---- #
     def set_fd_mode(self, enabled: bool):
         self._fd_mode = enabled
 
     def to_dict_list(self):
         return [
-            {"can_id": e.can_id, "extended": e.extended, "rtr": e.rtr,
+            {"name": e.name, "can_id": e.can_id, "extended": e.extended, "rtr": e.rtr,
              "fd": e.fd, "brs": e.brs,
              "dlc": e.dlc, "data": e.data.hex(), "period_ms": e.period_ms,
              "enabled": e.enabled}
@@ -392,6 +423,7 @@ class SendPanel(QWidget):
         self.entries.clear()
         for d in data:
             e = SendEntry(
+                name=d.get("name", ""),
                 can_id=d["can_id"],
                 extended=d.get("extended", False),
                 rtr=d.get("rtr", False),
@@ -406,7 +438,7 @@ class SendPanel(QWidget):
         self._refresh_all()
         self._sync_timers()
 
-    CSV_HEADERS = ["can_id", "extended", "rtr", "fd", "brs", "dlc", "data", "period_ms", "enabled"]
+    CSV_HEADERS = ["name", "can_id", "extended", "rtr", "fd", "brs", "dlc", "data", "period_ms", "enabled"]
 
     def to_csv(self, path: str):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -414,6 +446,7 @@ class SendPanel(QWidget):
             w.writerow(self.CSV_HEADERS)
             for e in self.entries:
                 w.writerow([
+                    e.name,
                     f"0x{e.can_id:X}", e.extended, e.rtr, e.fd, e.brs,
                     e.dlc, e.data.hex(" ").upper(), e.period_ms, e.enabled,
                 ])
@@ -425,6 +458,7 @@ class SendPanel(QWidget):
             reader = csv.DictReader(f)
             for row in reader:
                 self.entries.append(SendEntry(
+                    name=row.get("name", ""),
                     can_id=int(row["can_id"], 16),
                     extended=row["extended"].strip() == "True",
                     rtr=row["rtr"].strip() == "True",
@@ -440,8 +474,8 @@ class SendPanel(QWidget):
 
     @staticmethod
     def csv_path():
-        return SEND_CSV
+        return os.path.join(_csv_dir(), "send_list.csv")
 
     @staticmethod
     def exists():
-        return os.path.exists(SEND_CSV)
+        return os.path.exists(SendPanel.csv_path())

@@ -11,7 +11,7 @@ Python SDK + Qt6 GUI for CANable 2.5 USB-CAN adapter (ElmueSoft firmware).
   - `constants.py` — USB IDs, protocol constants, flag enums
   - `bitrate.py` — Nominal/Data bit timing tables
   - `cli.py` — CLI entrypoints
-- `cangui/` — PySide6 GUI (cangaroo-style). Launch via `python cangui.py` or `python -m cangui`.
+- `cangui/` — PySide6 GUI (CANable 2.5). Launch via `python cangui.py` or `python -m cangui`.
 - `CANable-2.5-firmware-*/` — **separate C firmware project**, not Python code.
 
 ## Setup

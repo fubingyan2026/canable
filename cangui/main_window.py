@@ -1,14 +1,15 @@
-"""cangui 主窗口（cangaroo 风格布局）。"""
+"""CANable 2.5 主窗口。"""
 from __future__ import annotations
 
+import os
 import csv
 import json
 from threading import Thread
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QThread, Slot, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence
-from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtCore import Qt, QTimer, QThread, Slot, Signal
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QApplication,
                                 QLabel, QComboBox, QPushButton, QSplitter,
                                 QListWidget, QListWidgetItem, QTabWidget,
                                 QDockWidget, QStatusBar, QToolBar, QFileDialog,
@@ -16,27 +17,27 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                 QDoubleSpinBox, QCheckBox)
 
 from canable_sdk import ZDTCanable, CANFrame
-from .style import QSS, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR
+from .style import set_theme, get_qss, current_theme, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR
+from .i18n import _, language_changed, get_language, set_language
 from .worker import CANWorker
 from .trace import TracePanel
 from .send import SendPanel
-from .filters import FilterPanel, StatisticsPanel
-
+from .filters import FilterPanel
 
 # --------------------------------------------------------------------------- #
 #  主窗口
 # --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
-    APP_NAME = "cangui"
+    APP_NAME = "CANable2.5"
     ORG_NAME = "canable"
-    WINDOW_TITLE = "cangui — ZDT_CANable 2.0 PRO"
+    WINDOW_TITLE = "CANable 2.5"
 
     BITRATES = [10_000, 20_000, 50_000, 100_000, 125_000, 250_000,
                 333_000, 500_000, 800_000, 1_000_000]
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(self.WINDOW_TITLE)
+        self.setWindowTitle("CANable 2.5")
         self.resize(1400, 850)
 
         # 状态
@@ -45,25 +46,37 @@ class MainWindow(QMainWindow):
         self._frame_count = 0
         self._last_load = 0.0
         self._last_fps = 0
-        self._settings = QSettings(self.ORG_NAME, self.APP_NAME)
+        self._settings = {}
+        self.__init_ui()
 
+    def _settings_path(self):
+        return os.path.join(os.path.dirname(self.send_panel.csv_path()), "settings.json")
+
+    def _set(self, key, value):
+        self._settings[key] = value
+        try:
+            with open(self._settings_path(), "w") as f:
+                json.dump(self._settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _get(self, key, default=None):
+        return self._settings.get(key, default)
+
+    def __init_ui(self):
         self._build_ui()
         self._build_menubar()
-        self._build_toolbar()
         self._build_statusbar()
         self._wire_signals()
-
-        # 启动时按上次设置恢复
         self._restore_settings()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         # 中心：Tab
         self.trace_panel  = TracePanel(self)
-        self.stat_panel   = StatisticsPanel(self)
+        self.trace_panel.view.setAlternatingRowColors(True)
         center_tabs = QTabWidget()
         center_tabs.addTab(self.trace_panel, "Trace")
-        center_tabs.addTab(self.stat_panel, "Statistics")
         self._center_tabs = center_tabs
 
         # 左侧：设备 + 总线
@@ -80,7 +93,7 @@ class MainWindow(QMainWindow):
 
         # 底部 Send Dock
         self.send_panel = SendPanel(self)
-        self.send_dock = QDockWidget("Send Messages", self)
+        self.send_dock = QDockWidget(_("Window.SendMessages"), self)
         self.send_dock.setObjectName("SendDock")
         self.send_dock.setWidget(self.send_panel)
         self.send_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
@@ -88,7 +101,7 @@ class MainWindow(QMainWindow):
 
         # 右侧 Filter Dock
         self.filter_panel = FilterPanel(self)
-        self.filter_dock = QDockWidget("Filters", self)
+        self.filter_dock = QDockWidget(_("Window.Filters"), self)
         self.filter_dock.setObjectName("FilterDock")
         self.filter_dock.setWidget(self.filter_panel)
         self.filter_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
@@ -96,17 +109,19 @@ class MainWindow(QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
+        w.setObjectName("sidebar")
         layout = QVBoxLayout(w)
         layout.setContentsMargins(4, 4, 4, 4)
 
         # 总线配置
-        bus_box = QGroupBox("Bus")
-        bf = QFormLayout(bus_box)
+        self._bus_box = QGroupBox(_("Left.Bus"))
+        bf = QFormLayout(self._bus_box)
         self.bitrate_combo = QComboBox()
         for b in self.BITRATES:
             self.bitrate_combo.addItem(f"{b:,} bps", b)
         self.bitrate_combo.setCurrentText("500,000 bps")
-        bf.addRow("Bitrate:", self.bitrate_combo)
+        self._lbl_bitrate = QLabel(_("Left.Bitrate"))
+        bf.addRow(self._lbl_bitrate, self.bitrate_combo)
 
         # CAN FD 选项
         self.fd_chk = QCheckBox("CAN FD")
@@ -120,137 +135,158 @@ class MainWindow(QMainWindow):
         self.data_bitrate_combo.addItem("5,000,000 bps", 5_000_000)
         self.data_bitrate_combo.addItem("8,000,000 bps", 8_000_000)
         self.data_bitrate_combo.setEnabled(False)
-        bf.addRow("Data Bitrate:", self.data_bitrate_combo)
+        self._lbl_data_bitrate = QLabel(_("Left.DataBitrate"))
+        bf.addRow(self._lbl_data_bitrate, self.data_bitrate_combo)
 
         self.sample_combo = QComboBox()
         self.sample_combo.addItems(["87.5% (default)", "75.0%", "66.7%", "50.0%"])
-        bf.addRow("Sample Point:", self.sample_combo)
-        layout.addWidget(bus_box)
+        self._lbl_sample = QLabel(_("Left.SamplePoint"))
+        bf.addRow(self._lbl_sample, self.sample_combo)
+        layout.addWidget(self._bus_box)
 
         # 设备
-        dev_box = QGroupBox("Devices")
-        dv = QVBoxLayout(dev_box)
+        self._dev_box = QGroupBox(_("Left.Devices"))
+        dv = QVBoxLayout(self._dev_box)
         self.device_list = QListWidget()
         dv.addWidget(self.device_list)
-        scan_btn = QPushButton("扫描设备")
-        scan_btn.clicked.connect(self._scan_devices)
-        dv.addWidget(scan_btn)
-        layout.addWidget(dev_box, 1)
+        self.scan_btn = QPushButton(_("Left.Scan"))
+        self.scan_btn.clicked.connect(self._scan_devices)
+        dv.addWidget(self.scan_btn)
+        layout.addWidget(self._dev_box, 1)
 
+        # 设备状态卡片
         # 操作
-        act_box = QGroupBox("Quick Actions")
-        av = QVBoxLayout(act_box)
-        self.connect_btn = QPushButton("连接")
+        self._act_box = QGroupBox(_("Left.QuickActions"))
+        self._act_box.setObjectName("quickActions")
+        av = QVBoxLayout(self._act_box)
+        self.connect_btn = QPushButton(_("Left.Connect"))
         self.connect_btn.setObjectName("connectBtn")
         self.connect_btn.setCheckable(True)
         self.connect_btn.clicked.connect(self._on_connect_toggle)
         av.addWidget(self.connect_btn)
 
-        identify_btn = QPushButton("LED 闪烁识别")
-        identify_btn.clicked.connect(self._on_identify)
-        av.addWidget(identify_btn)
-        layout.addWidget(act_box)
+        layout.addWidget(self._act_box)
 
         return w
 
     def _build_menubar(self):
         mb = self.menuBar()
 
+        self._menu_actions = []
         # File
-        file_menu = mb.addMenu("&File")
-        act_open = QAction("&打开 Trace…", self)
+        self._menu_file = file_menu = mb.addMenu(_("Menu.File"))
+        act_open = QAction(_("File.OpenTrace"), self)
         act_open.setShortcut(QKeySequence.Open)
         act_open.triggered.connect(self._on_load_trace)
         file_menu.addAction(act_open)
-        act_save = QAction("&保存 Trace…", self)
+        act_save = QAction(_("File.SaveTrace"), self)
         act_save.setShortcut(QKeySequence.Save)
         act_save.triggered.connect(self._on_save_trace)
         file_menu.addAction(act_save)
         file_menu.addSeparator()
-        act_save_send = QAction("保存发送列表…", self)
+        act_save_send = QAction(_("File.SaveSendList"), self)
         act_save_send.triggered.connect(self._on_save_send_list)
         file_menu.addAction(act_save_send)
-        act_load_send = QAction("加载发送列表…", self)
+        act_load_send = QAction(_("File.LoadSendList"), self)
         act_load_send.triggered.connect(self._on_load_send_list)
         file_menu.addAction(act_load_send)
         file_menu.addSeparator()
-        act_quit = QAction("&退出", self)
+        act_quit = QAction(_("File.Exit"), self)
         act_quit.setShortcut(QKeySequence.Quit)
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
         # View
-        view_menu = mb.addMenu("&View")
-        view_menu.addAction(self.send_dock.toggleViewAction())
-        view_menu.addAction(self.filter_dock.toggleViewAction())
-        act_clear = QAction("清空 Trace", self)
-        act_clear.setShortcut("Ctrl+L")
-        act_clear.triggered.connect(self.trace_panel.clear_all)
-        view_menu.addAction(act_clear)
+        view_menu = mb.addMenu(_("Menu.Windows"))
+        self.act_toggle_send = self.send_dock.toggleViewAction()
+        self.act_toggle_send.setText(_("Window.SendMessages"))
+        self.act_toggle_filter = self.filter_dock.toggleViewAction()
+        self.act_toggle_filter.setText(_("Window.Filters"))
+        view_menu.addAction(self.act_toggle_send)
+        view_menu.addAction(self.act_toggle_filter)
 
         # Hardware
-        hw_menu = mb.addMenu("&Hardware")
-        act_scan = QAction("扫描设备", self)
+        hw_menu = mb.addMenu(_("Menu.Hardware"))
+        act_scan = QAction(_("HW.ScanDevices"), self)
         act_scan.triggered.connect(self._scan_devices)
         hw_menu.addAction(act_scan)
-        act_id = QAction("LED 闪烁", self)
-        act_id.triggered.connect(self._on_identify)
-        hw_menu.addAction(act_id)
         hw_menu.addSeparator()
         # ElmueSoft 协议 ListenOnly 模式：只听不发，不发送 ACK
         # 注意：想要"自己发自己收"必须接两个 CAN 节点。
-        self.act_silent = QAction("Silent 模式 (只听不发)", self)
+        self.act_silent = QAction(_("HW.SilentMode"), self)
         self.act_silent.setCheckable(True)
         self.act_silent.toggled.connect(self._on_silent_toggle)
         hw_menu.addAction(self.act_silent)
 
         # Tools
-        tools_menu = mb.addMenu("&Tools")
+        tools_menu = mb.addMenu(_("Menu.Tools"))
         act_send_once = QAction("发送单帧…", self)
         act_send_once.setShortcut("Ctrl+Return")
         act_send_once.triggered.connect(self._on_quick_send)
         tools_menu.addAction(act_send_once)
 
+        # Language submenu
+        theme_menu = tools_menu.addMenu(_("Menu.Theme"))
+        self.act_theme_light = QAction(_("Theme.Light"), self, checkable=True)
+        self.act_theme_dark = QAction(_("Theme.Dark"), self, checkable=True)
+        self.act_theme_light.setChecked(current_theme() == "light")
+        self.act_theme_dark.setChecked(current_theme() == "dark")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        theme_group.addAction(self.act_theme_light)
+        theme_group.addAction(self.act_theme_dark)
+        theme_menu.addAction(self.act_theme_light)
+        theme_menu.addAction(self.act_theme_dark)
+        theme_group.triggered.connect(self._on_theme_changed)
+
+        lang_menu = tools_menu.addMenu(_("Menu.Language"))
+        self.act_lang_zh = QAction("中文", self, checkable=True)
+        self.act_lang_en = QAction("English", self, checkable=True)
+        self.act_lang_zh.setChecked(get_language() == "zh")
+        self.act_lang_en.setChecked(get_language() != "zh")
+        lang_group = QActionGroup(self)
+        lang_group.setExclusive(True)
+        lang_group.addAction(self.act_lang_zh)
+        lang_group.addAction(self.act_lang_en)
+        lang_menu.addAction(self.act_lang_zh)
+        lang_menu.addAction(self.act_lang_en)
+        lang_group.triggered.connect(self._on_language_changed)
+
         # Help
-        help_menu = mb.addMenu("&Help")
-        act_about = QAction("关于", self)
+        help_menu = mb.addMenu(_("Menu.Help"))
+        act_about = QAction(_("Help.About"), self)
         act_about.triggered.connect(self._on_about)
         help_menu.addAction(act_about)
 
-    def _build_toolbar(self):
-        tb = QToolBar("Main")
-        tb.setObjectName("MainToolBar")
-        tb.setMovable(False)
-        tb.setIconSize(tb.iconSize())
-        self.addToolBar(tb)
 
-        # 连接/断开由左侧大按钮控制，工具栏不再重复
-        tb.addSeparator()
-        tb.addWidget(QLabel("  波特率: "))
-        self.tb_bitrate = QComboBox()
-        for b in self.BITRATES:
-            self.tb_bitrate.addItem(f"{b//1000}k", b)
-        self.tb_bitrate.setCurrentIndex(self.BITRATES.index(500_000))
-        self.tb_bitrate.currentIndexChanged.connect(self._on_bitrate_changed)
-        tb.addWidget(self.tb_bitrate)
 
-        tb.addSeparator()
-        self.tb_clear = QAction("清空 Trace", self)
-        self.tb_clear.triggered.connect(self.trace_panel.clear_all)
-        tb.addAction(self.tb_clear)
+        # register actions for language refresh
+        self._menu_actions = [
+            (theme_menu, "Menu.Theme"),
+            (lang_menu, "Menu.Language"),
+            (self._menu_file, "Menu.File"),
+            (view_menu, "Menu.Windows"),
+            (hw_menu, "Menu.Hardware"),
+            (tools_menu, "Menu.Tools"),
+            (help_menu, "Menu.Help"),
+            (act_open, "File.OpenTrace"),
+            (act_save, "File.SaveTrace"),
+            (act_save_send, "File.SaveSendList"),
+            (act_load_send, "File.LoadSendList"),
+            (act_quit, "File.Exit"),
+            (act_scan, "HW.ScanDevices"),
+            (act_send_once, "Tools.QuickSend"),
+            (act_about, "Help.About"),
+            (self.act_theme_light, "Theme.Light"),
+            (self.act_theme_dark, "Theme.Dark"),
+            (self.act_silent, "HW.SilentMode"),
+        ]
+        QShortcut(QKeySequence("Ctrl+L"), self, self.trace_panel.clear_all)
 
-        self.tb_pause = QAction("暂停", self)
-        self.tb_pause.setCheckable(True)
-        self.tb_pause.triggered.connect(lambda v: self.trace_panel._on_pause(v))
-        tb.addAction(self.tb_pause)
-
-        tb.addSeparator()
-        tb.addAction(self.send_dock.toggleViewAction())
-        tb.addAction(self.filter_dock.toggleViewAction())
 
     def _build_statusbar(self):
         sb: QStatusBar = self.statusBar()
-        self.status_label = QLabel("未连接")
+        self.status_label = QLabel(_("Status.Disconnected"))
         self.status_label.setObjectName("statusLabel")
         self.status_label.setProperty("connected", False)
         sb.addWidget(self.status_label)
@@ -260,16 +296,16 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.bitrate_label)
 
         sb.addPermanentWidget(QLabel("  |  "))
-        self.fps_label = QLabel("0 fps")
+        self.fps_label = QLabel(f"0 {_("Status.FPS")}")
         sb.addPermanentWidget(self.fps_label)
 
         sb.addPermanentWidget(QLabel("  |  "))
-        self.load_label = QLabel("负载 0%")
+        self.load_label = QLabel(f"{_("Status.Load")} 0%")
         self.load_label.setObjectName("busLoad")
         sb.addPermanentWidget(self.load_label)
 
         sb.addPermanentWidget(QLabel("  |  "))
-        self.count_label = QLabel("总帧数: 0")
+        self.count_label = QLabel(f"{_("Status.TotalFrames")}: 0")
         sb.addPermanentWidget(self.count_label)
 
     # ------------------------------------------------------------ 信号
@@ -288,7 +324,7 @@ class MainWindow(QMainWindow):
         try:
             devs = ZDTCanable.list_devices()
         except Exception as e:
-            QMessageBox.critical(self, "扫描失败", str(e))
+            QMessageBox.critical(self, _("Left.Scan"), f"{_('Scan.Failed')}: {e}")
             return
         if not devs:
             item = QListWidgetItem("未发现 candleLight 设备")
@@ -365,25 +401,9 @@ class MainWindow(QMainWindow):
         self.connect_btn.setChecked(connected)
         self.connect_btn.setText("断开" if connected else "连接")
         self.bitrate_combo.setEnabled(not connected)
-        self.tb_bitrate.setEnabled(not connected)
         self.bitrate_label.setText(f"{self.bitrate_combo.currentData():,} bps" if connected else "— bps")
 
     @Slot()
-    def _on_identify(self):
-        """让设备 LED 闪烁一下，便于多台设备时定位。"""
-        def _run():
-            try:
-                if self._worker is not None and self._worker._bus is not None:
-                    self._worker._bus.identify(1000)
-                else:
-                    with ZDTCanable() as b:
-                        b.identify(1000)
-                self.status_label.setText("LED 识别完成")
-            except Exception as e:
-                QMessageBox.warning(self, "LED 识别", f"失败: {e}")
-
-        Thread(target=_run, daemon=True).start()
-
     @Slot(bool)
     def _on_silent_toggle(self, enabled: bool):
         """Silent 模式开关 (M0/M1)。
@@ -403,7 +423,7 @@ class MainWindow(QMainWindow):
                 mode = "Silent (只听不发)" if enabled else "Normal (发到总线)"
                 self.status_label.setText(f"canable2 模式: {mode}")
             except Exception as e:
-                QMessageBox.warning(self, "Silent 模式", f"失败: {e}")
+                QMessageBox.warning(self, _("HW.SilentMode"), f"失败: {e}")
                 self.act_silent.blockSignals(True)
                 self.act_silent.setChecked(not enabled)
                 self.act_silent.blockSignals(False)
@@ -444,33 +464,13 @@ class MainWindow(QMainWindow):
             self.load_label.setProperty("level", "high")
         self.load_label.style().unpolish(self.load_label)
         self.load_label.style().polish(self.load_label)
-        self.count_label.setText(f"总帧数: {self._frame_count}")
-        # 统计面板
-        self.stat_panel.update_stats(
-            load, fps, self._frame_count, self.trace_panel.view.id_summary()
-        )
+        self.count_label.setText(f"{_("Status.TotalFrames")}: {self._frame_count}")
 
-    @Slot(int)
-    def _on_bitrate_changed(self, idx: int):
-        br = self.BITRATES[idx]
-        # 同步左侧 combo
-        i = self.bitrate_combo.findData(br)
-        if i >= 0:
-            self.bitrate_combo.blockSignals(True)
-            self.bitrate_combo.setCurrentIndex(i)
-            self.bitrate_combo.blockSignals(False)
-        if self._worker is not None:
-            self._worker.set_bitrate_slot(br)
 
-    @Slot(int)
+
     def _on_bitrate_combo_changed(self, idx: int):
         br = self.bitrate_combo.itemData(idx)
         if br is None: return
-        i = self.BITRATES.index(br) if br in self.BITRATES else -1
-        if i >= 0:
-            self.tb_bitrate.blockSignals(True)
-            self.tb_bitrate.setCurrentIndex(i)
-            self.tb_bitrate.blockSignals(False)
         if self._worker is not None:
             self._worker.set_bitrate_slot(br)
 
@@ -561,9 +561,9 @@ class MainWindow(QMainWindow):
                         )
                         self.trace_panel.append_frame(fr)
             else:
-                QMessageBox.information(self, "ASC", "ASC 文件请使用回放工具，暂不实现。")
+                QMessageBox.information(self, _("File.OpenTrace"), "ASC 文件请使用回放工具，暂不实现。")
         except Exception as e:
-            QMessageBox.critical(self, "加载失败", str(e))
+            QMessageBox.critical(self, _("File.LoadSendList"), f"{_('Load.Failed')}: {e}")
 
     def _on_save_send_list(self):
         self.send_panel.to_csv(self.send_panel.csv_path())
@@ -577,12 +577,12 @@ class MainWindow(QMainWindow):
             self.send_panel.from_csv(self.send_panel.csv_path())
             self.status_label.setText(f"发送列表已加载: {self.send_panel.csv_path()}")
         except Exception as e:
-            QMessageBox.critical(self, "加载失败", str(e))
+            QMessageBox.critical(self, _("File.LoadSendList"), f"{_('Load.Failed')}: {e}")
 
     # ------------------------------------------------------------ 快速发送
     def _on_quick_send(self):
         text, ok = QInputDialog.getText(
-            self, "快速发送",
+            self, _("Tools.QuickSend"),
             "格式: ID,HEX_DATA    例:  0x123,DE AD BE EF 0A",
         )
         if not ok or not text.strip():
@@ -596,41 +596,139 @@ class MainWindow(QMainWindow):
             self._on_send_frame(frame)
             self.status_label.setText(f"已发送: {frame}")
         except Exception as e:
-            QMessageBox.warning(self, "格式错误", str(e))
+            QMessageBox.warning(self, _("File.OpenTrace"), f"{_('Format.Error')}: {e}")
 
     # ------------------------------------------------------------ 关闭
     def _on_about(self):
-        QMessageBox.information(self, "关于 cangui",
-            "<b>cangui</b><br>"
-            "ZDT_CANable 2.0 PRO 上位机（cangaroo 风格）<br><br>"
-            "基于 PySide6 / Qt 6 + 自研 gs_usb 驱动")
+        QMessageBox.information(self, _("Help.About"),
+            "<b>CANable 2.5</b><br>" + _("About.Desc") + "<br><br>" + _("About.Tech"))
 
     def _restore_settings(self):
-        bitrate = self._settings.value("bitrate", 500_000, int)
+        try:
+            with open(self._settings_path()) as f:
+                self._settings = json.load(f)
+        except Exception:
+            self._settings = {}
+        s = self._settings
+        bitrate = s.get("bitrate", 500_000)
         if bitrate in self.BITRATES:
-            i = self.BITRATES.index(bitrate)
-            self.tb_bitrate.setCurrentIndex(i)
             self.bitrate_combo.setCurrentIndex(self.bitrate_combo.findData(bitrate))
-        geometry = self._settings.value("geometry")
+        self.fd_chk.setChecked(s.get("fd_mode", False))
+        data_br = s.get("data_bitrate", 1_000_000)
+        idx = self.data_bitrate_combo.findData(data_br)
+        if idx >= 0:
+            self.data_bitrate_combo.setCurrentIndex(idx)
+        self.trace_panel.autoscroll_chk.setChecked(s.get("autoscroll", True))
+        if s.get("collapse", False):
+            self.trace_panel.collapse_chk.setChecked(True)
+        lang = s.get("language", "zh")
+        theme = s.get("theme", "light")
+        set_theme(theme)
+        QApplication.instance().setStyleSheet(get_qss())
+        set_language(lang)
+        if hasattr(self, "act_lang_zh"):
+            self.act_lang_zh.setChecked(lang == "zh")
+            self.act_lang_en.setChecked(lang != "zh")
+        try:
+            self.filter_panel.from_dict_list(s.get("filters", []))
+        except Exception:
+            pass
+        splitter_hex = s.get("splitter")
+        if splitter_hex:
+            self.splitter.restoreState(bytes.fromhex(splitter_hex))
+        trace_hdr = s.get("trace_hdr")
+        if trace_hdr:
+            self.trace_panel.view.horizontalHeader().restoreState(bytes.fromhex(trace_hdr))
+        send_hdr = s.get("send_hdr")
+        if send_hdr:
+            self.send_panel.table.horizontalHeader().restoreState(bytes.fromhex(send_hdr))
+        filter_hdr = s.get("filter_hdr")
+        if filter_hdr:
+            self.filter_panel.table.horizontalHeader().restoreState(bytes.fromhex(filter_hdr))
+        geometry = s.get("geometry")
         if geometry:
-            self.restoreGeometry(geometry)
-        state = self._settings.value("state")
+            self.restoreGeometry(bytes.fromhex(geometry))
+        state = s.get("state")
         if state:
-            self.restoreState(state)
+            self.restoreState(bytes.fromhex(state))
         # 自动扫描一次
         QTimer.singleShot(100, self._scan_devices)
-        # 自动恢复发送列表
         if self.send_panel.exists():
             try:
                 self.send_panel.from_csv(self.send_panel.csv_path())
             except Exception:
                 pass
 
+
+    def _on_theme_changed(self, action):
+        name = "dark" if action == self.act_theme_dark else "light"
+        set_theme(name)
+        self._set("theme", name)
+        QApplication.instance().setStyleSheet(get_qss())
+
+    def _on_language_changed(self, action):
+        self._set("language", "zh" if action == self.act_lang_zh else "en")
+        set_language("zh" if action == self.act_lang_zh else "en")
+        self._refresh_language()
+
+    def _refresh_language(self):
+        self.setWindowTitle("CANable 2.5")
+        # menu actions
+        if hasattr(self, "_menu_actions"):
+            for item, key in self._menu_actions:
+                if type(item).__name__ == "QMenu":
+                    item.setTitle(_(key))
+                else:
+                    item.setText(_(key))
+        # group boxes
+        self._bus_box.setTitle(_("Left.Bus"))
+        self._dev_box.setTitle(_("Left.Devices"))
+        self._act_box.setTitle(_("Left.QuickActions"))
+        # buttons
+        self.scan_btn.setText(_("Left.Scan"))
+        self.connect_btn.setText(_("Left.Disconnect") if self._connected else _("Left.Connect"))
+        # form labels
+        self._lbl_bitrate.setText(_("Left.Bitrate"))
+        self._lbl_data_bitrate.setText(_("Left.DataBitrate"))
+        self._lbl_sample.setText(_("Left.SamplePoint"))
+        # status bar
+        if hasattr(self, "fps_label"):
+            self.fps_label.setText(f"{self._last_fps} {_('Status.FPS')}")
+            self.load_label.setText(f"{_('Status.Load')} {self._last_load:.0f}%")
+            self.count_label.setText(f"{_('Status.TotalFrames')}: {self._frame_count}")
+            self.status_label.setText(_("Status.Connected") if self._connected else _("Status.Disconnected"))
+        # docks
+        self.send_dock.setWindowTitle(_("Window.SendMessages"))
+        self.filter_dock.setWindowTitle(_("Window.Filters"))
+        if hasattr(self, "act_toggle_send"):
+            self.act_toggle_send.setText(_("Window.SendMessages"))
+            self.act_toggle_filter.setText(_("Window.Filters"))
+        # sub-panels
+        if hasattr(self, "trace_panel") and hasattr(self.trace_panel, "refresh_language"):
+            self.trace_panel.refresh_language()
+        if hasattr(self, "send_panel") and hasattr(self.send_panel, "refresh_language"):
+            self.send_panel.refresh_language()
+        if hasattr(self, "filter_panel") and hasattr(self.filter_panel, "refresh_language"):
+            self.filter_panel.refresh_language()
+
     def closeEvent(self, e):
-        self._settings.setValue("bitrate", self.bitrate_combo.currentData())
-        self._settings.setValue("geometry", self.saveGeometry())
-        self._settings.setValue("state", self.saveState())
-        # 自动保存发送列表
+        if not hasattr(self, 'bitrate_combo'):
+            e.accept()
+            return
+        self._set("bitrate", self.bitrate_combo.currentData())
+        self._set("fd_mode", self.fd_chk.isChecked())
+        self._set("data_bitrate", self.data_bitrate_combo.currentData())
+        self._set("autoscroll", self.trace_panel.autoscroll_chk.isChecked())
+        self._set("collapse", self.trace_panel.collapse_chk.isChecked())
+        self._set("theme", current_theme())
+        self._set("language", get_language())
+        self._set("filters", self.filter_panel.to_dict_list())
+        self._set("splitter", bytes(self.splitter.saveState().toHex()).decode())
+        self._set("trace_hdr", bytes(self.trace_panel.view.horizontalHeader().saveState().toHex()).decode())
+        self._set("send_hdr", bytes(self.send_panel.table.horizontalHeader().saveState().toHex()).decode())
+        self._set("filter_hdr", bytes(self.filter_panel.table.horizontalHeader().saveState().toHex()).decode())
+        self._set("geometry", bytes(self.saveGeometry().toHex()).decode())
+        self._set("state", bytes(self.saveState().toHex()).decode())
         try:
             self.send_panel.to_csv(self.send_panel.csv_path())
         except Exception:

@@ -1,8 +1,4 @@
-"""ElmueSoft variable-length protocol stream parser.
-
-Transforms USB raw byte streams into CANFrame objects.
-"""
-from __future__ import annotations
+"""ElmueSoft variable-length protocol stream parser."""
 
 import logging
 import struct
@@ -11,7 +7,9 @@ from typing import Optional
 
 from .constants import (
     MAX_ELMUE_MSG_SIZE, VALID_MSG_TYPES,
-    MSG_RxFrame, MSG_TxEcho, MSG_Error, MSG_String, MSG_Busload,
+    MSG_RxFrame, MSG_TxEcho, MSG_TxFrame, MSG_Error, MSG_String, MSG_Busload,
+    CAN_ID_29Bit, CAN_ID_RTR, CAN_MASK_11, CAN_MASK_29,
+    FRM_FDF, FRM_BRS, FRM_ESI,
     ERID_Bus_is_off, ERID_No_ACK_received, ERID_CRC_Error,
     ERID_Tx_Timeout, ERID_Arbitration_lost,
     BUS_StatusOff, BUS_StatusPassive, BUS_StatusWarning, ER1_Bus_is_back_active,
@@ -76,11 +74,13 @@ class _ElmueProtocol:
         return frames
 
     def _parse_message(self, msg: bytes, msg_type: int) -> Optional[CANFrame]:
-        logger.debug("parse: type=%d size=%d data=%s", msg_type, len(msg), msg.hex())
+        logger.debug("parse: type=%d size=%d", msg_type, len(msg))
         if msg_type == MSG_RxFrame:
             return CANFrame.from_elmue_rx(msg, self._has_timestamp)
         elif msg_type == MSG_TxEcho:
             return CANFrame.from_elmue_echo(msg, self._has_timestamp, self._tx_frames)
+        elif msg_type == MSG_TxFrame:
+            return self._parse_tx_frame(msg)
         elif msg_type == MSG_Error:
             return self._parse_error(msg)
         elif msg_type == MSG_String:
@@ -92,6 +92,23 @@ class _ElmueProtocol:
         else:
             logger.warning("unknown msg type: %d (size=%d)", msg_type, len(msg))
             return None
+
+    def _parse_tx_frame(self, msg: bytes) -> Optional[CANFrame]:
+        if len(msg) < 8:
+            return None
+        flags = msg[2]
+        can_id_raw = struct.unpack_from('<I', msg, 3)[0]
+        data = msg[8:]
+
+        extended = bool(can_id_raw & CAN_ID_29Bit)
+        rtr = bool(can_id_raw & CAN_ID_RTR)
+        can_id = can_id_raw & CAN_MASK_29 if extended else can_id_raw & CAN_MASK_11
+
+        return CANFrame(
+            can_id=can_id, data=bytes(data), extended=extended, rtr=rtr,
+            fd=bool(flags & FRM_FDF), brs=bool(flags & FRM_BRS),
+            esi=bool(flags & FRM_ESI), timestamp=time.time(), is_tx=True,
+        )
 
     def _parse_error(self, msg: bytes) -> CANFrame:
         if len(msg) < 6:
@@ -151,8 +168,9 @@ class _ElmueProtocol:
         )
 
     def _parse_string(self, msg: bytes):
-        text = msg[2:].decode('ascii', errors='ignore')
-        logger.info("device: %s", text)
+        text = msg[2:].decode('ascii', errors='replace')
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        logger.debug("device: %s", text.strip())
 
     def _parse_busload(self, msg: bytes):
         if len(msg) >= 3:

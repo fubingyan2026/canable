@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cangui 启动脚本。直接 python cangui.py 即可运行。
+"""CANable 2.5 启动脚本。运行 python cangui.py 即可。
 
 启动时会在终端输出 INFO 级别的日志，包含：
   - CAN 控制器状态（连接 / 启动 / 停止）

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QLabel, QGroupBox, QGridLayout)
 
 from .worker import CANFilter
+from .i18n import _
 from .style import id_color, FG_DIM, FG_ACCENT
 
 
@@ -20,19 +21,19 @@ from .style import id_color, FG_DIM, FG_ACCENT
 class FilterDialog(QDialog):
     def __init__(self, filt: CANFilter, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("编辑过滤规则")
+        self.setWindowTitle(_("Filter.DlgTitle"))
         form = QFormLayout(self)
 
         self.min_edit = QLineEdit(f"{filt.can_id_min:X}")
         self.max_edit = QLineEdit(f"{filt.can_id_max:X}")
-        form.addRow("CAN ID 起始 (hex):", self.min_edit)
-        form.addRow("CAN ID 结束 (hex):", self.max_edit)
+        form.addRow(_("Filter.DlgIDMin"), self.min_edit)
+        form.addRow(_("Filter.DlgIDMax"), self.max_edit)
 
-        self.ext_chk = QCheckBox("仅作用于扩展帧 (29-bit)")
+        self.ext_chk = QCheckBox(_("Filter.DlgExt"))
         self.ext_chk.setChecked(filt.extended)
         form.addRow("", self.ext_chk)
 
-        self.discard_chk = QCheckBox("丢弃区间内的帧（取消勾选则只放行区间内）")
+        self.discard_chk = QCheckBox(_("Filter.DlgDiscard"))
         self.discard_chk.setChecked(filt.pass_discard)
         form.addRow("", self.discard_chk)
 
@@ -64,7 +65,7 @@ class FilterDialog(QDialog):
 class FilterPanel(QWidget):
     filters_changed = Signal(list)  # List[CANFilter]
 
-    HEADERS = ["#", "ID 范围", "Type", "Action"]
+    HEADERS = [_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")]
     COL_IDX, COL_RANGE, COL_TYPE, COL_ACTION = range(4)
 
     def __init__(self, parent=None):
@@ -76,14 +77,13 @@ class FilterPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        info = QLabel("过滤器：未命中任何规则时默认放行。\n"
-                      "Action = 丢弃/放行。")
-        info.setStyleSheet(f"color: {FG_DIM};")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        self.info_label = QLabel(_("Filter.Info"))
+        self.info_label.setStyleSheet(f"color: {FG_DIM};")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
 
         self.table = QTableWidget(0, len(self.HEADERS), self)
-        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(20)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -97,10 +97,10 @@ class FilterPanel(QWidget):
         layout.addWidget(self.table, 1)
 
         bar = QHBoxLayout()
-        self.add_btn   = QPushButton("添加")
-        self.edit_btn  = QPushButton("编辑")
-        self.del_btn   = QPushButton("删除")
-        self.clear_btn = QPushButton("清空")
+        self.add_btn   = QPushButton(_("Filter.Add"))
+        self.edit_btn  = QPushButton(_("Filter.Edit"))
+        self.del_btn   = QPushButton(_("Filter.Delete"))
+        self.clear_btn = QPushButton(_("Filter.Clear"))
         for b in (self.add_btn, self.edit_btn, self.del_btn, self.clear_btn):
             bar.addWidget(b)
         bar.addStretch()
@@ -129,7 +129,7 @@ class FilterPanel(QWidget):
             self.table.setItem(i, self.COL_TYPE,
                 it("Ext" if f.extended else "Std", Qt.AlignCenter))
             self.table.setItem(i, self.COL_ACTION,
-                it("丢弃" if f.pass_discard else "放行", Qt.AlignCenter))
+                it(_("Filter.Drop") if f.pass_discard else _("Filter.Pass"), Qt.AlignCenter))
 
     def _selected_index(self):
         rows = self.table.selectionModel().selectedRows()
@@ -166,6 +166,14 @@ class FilterPanel(QWidget):
         self._refresh()
         self._emit()
 
+    def refresh_language(self):
+        self.add_btn.setText(_("Filter.Add"))
+        self.edit_btn.setText(_("Filter.Edit"))
+        self.del_btn.setText(_("Filter.Delete"))
+        self.clear_btn.setText(_("Filter.Clear"))
+        self.info_label.setText(_("Filter.Info"))
+        self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
+
     def to_dict_list(self):
         return [
             {"can_id_min": f.can_id_min, "can_id_max": f.can_id_max,
@@ -185,6 +193,9 @@ class FilterPanel(QWidget):
 class StatisticsPanel(QWidget):
     """按 CAN ID 显示：帧数、最新时间、周期、负载占比。"""
 
+    def refresh_language(self):
+        self.table.setHorizontalHeaderLabels([_("Stat.HdrID"), _("Stat.HdrType"), _("Stat.HdrCount"), _("Stat.HdrPeriod"), _("Stat.HdrLastDelta")])
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_summary = []
@@ -198,7 +209,7 @@ class StatisticsPanel(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
 
         # 顶部统计
-        top = QGroupBox("总线状态")
+        top = QGroupBox(_("Stat.BusStatus"))
         g = QGridLayout(top)
         self.lbl_total = QLabel("0")
         self.lbl_fps   = QLabel("0")
@@ -209,19 +220,19 @@ class StatisticsPanel(QWidget):
             lbl.setStyleSheet(f"color: {FG_ACCENT}; font-size: 18pt; font-weight: bold;")
         self.lbl_load.setStyleSheet(f"color: {FG_ACCENT}; font-size: 18pt; font-weight: bold;")
 
-        g.addWidget(QLabel("总帧数"), 0, 0); g.addWidget(self.lbl_total, 0, 1)
-        g.addWidget(QLabel("实时帧率"), 0, 2); g.addWidget(self.lbl_fps, 0, 3)
-        g.addWidget(QLabel("总线负载"), 1, 0); g.addWidget(self.lbl_load, 1, 1)
-        g.addWidget(QLabel("唯一 ID"), 1, 2); g.addWidget(self.lbl_unique, 1, 3)
+        g.addWidget(QLabel(_("Stat.TotalFrames")), 0, 0); g.addWidget(self.lbl_total, 0, 1)
+        g.addWidget(QLabel(_("Stat.FPS")), 0, 2); g.addWidget(self.lbl_fps, 0, 3)
+        g.addWidget(QLabel(_("Stat.BusLoad")), 1, 0); g.addWidget(self.lbl_load, 1, 1)
+        g.addWidget(QLabel(_("Stat.UniqueID")), 1, 2); g.addWidget(self.lbl_unique, 1, 3)
         layout.addWidget(top)
 
         # ID 详细统计
-        detail_label = QLabel("ID 详细")
+        detail_label = QLabel(_("Stat.IDDetail"))
         detail_label.setStyleSheet(f"color: {FG_ACCENT}; font-weight: bold; padding-top: 6px;")
         layout.addWidget(detail_label)
 
         self.table = QTableWidget(0, 5, self)
-        self.table.setHorizontalHeaderLabels(["ID", "Type", "Count", "Period (ms)", "Last Δt (ms)"])
+        self.table.setHorizontalHeaderLabels([_("Stat.HdrID"), _("Stat.HdrType"), _("Stat.HdrCount"), _("Stat.HdrPeriod"), _("Stat.HdrLastDelta")])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(20)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)

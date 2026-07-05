@@ -257,6 +257,7 @@ class ZDTCanable:
             self._parser.set_timestamp_mode(self._has_timestamp)
 
         self._running = True
+        time.sleep(0.05)  # allow transceiver/isolator to power up
         logger.info("CAN started (protocol=%s, FD=%s, loopback=%s, flags=0x%X, bitrate=%s, data_bitrate=%s)",
                     self._protocol, self._fd_mode, bool(flags & GS_DevFlagLoopback),
                     flags, self._bitrate, self._data_bitrate)
@@ -402,6 +403,8 @@ class ZDTCanable:
         if self._parser is not None:
             frames = self._parser.flush_frames()
             if frames:
+                if len(frames) > 1:
+                    self._parser._pending_frames = frames[1:]
                 return frames[0]
 
         try:
@@ -422,9 +425,12 @@ class ZDTCanable:
             return None
 
         raw = bytes(data)
-        logger.debug("USB IN %d bytes: %s", len(raw), raw[:32].hex())
+        logger.info("USB IN %3d hex: %s", len(raw), raw[:32].hex())
         frames = self._parser.feed(raw)
-        logger.debug("parsed %d frames", len(frames))
+        if frames:
+            logger.info("parsed %d frames", len(frames))
+        else:
+            logger.info("no frame from %d bytes (string/busload)", len(raw))
 
         if frames:
             if len(frames) > 1:

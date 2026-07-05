@@ -1,51 +1,56 @@
-# Fix: identify() LED blinking never stops
+# i18n: Chinese/English language toggle
 
-## Root cause
+## Architecture
 
-Firmware `led_blink_identify()` (`led.c:86-92`) has **no auto-timeout** — `led_identify` stays `true` permanently until host sends `GS_ReqIdentify(mode=0)`. Even `can_close()` doesn't clear it (`led_turn_TX()` is blocked by `if (led_identify) return;`).
+- `cangui/i18n.py` — global translation store + `tr()` function + `language_changed` Signal
+- All UI files replace string literals with `tr("key")` calls
+- `Tools > Language > 中文/English` toggles via `set_language()`
+- When language changes: all widgets react to `language_changed` Signal and refresh text
 
-Python `ZDTCanable.identify()` sends only `mode=1` and ignores `duration_ms`:
+## Implementation
 
-```python
-def identify(self, duration_ms: int = 1500):
-    self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 1))  # never sends mode=0
-```
-
-## Fix (2 changes in `canable_sdk/driver.py`)
-
-**1. `identify()` — add sleep + stop sequence:**
+### 1. Create `cangui/i18n.py`
 
 ```python
-def identify(self, duration_ms: int = 1500):
-    try:
-        self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 1))
-        time.sleep(duration_ms / 1000.0)
-        self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0))
-    except usb.core.USBError:
-        pass
+from PySide6.QtCore import QObject, Signal
+
+_TR = {}   # key -> {zh: text, en: text}
+_lang = "zh"
+_signal = QObject()
+language_changed = Signal(str)  # notifies widgets
+
+def tr(key: str) -> str:
+    entry = _TR.get(key, {})
+    return entry.get(_lang, key)
+
+def set_language(lang: str):
+    global _lang
+    _lang = lang
+    language_changed.emit(lang)
+
+# Translation data
+_TR.update({
+    # ---- Menus ----
+    "menu_file":       {"zh": "文件(&F)",        "en": "&File"},
+    "menu_windows":     {"zh": "窗口(&W)",        "en": "&Windows"},
+    "menu_hardware":   {"zh": "硬件(&H)",        "en": "&Hardware"},
+    "menu_tools":      {"zh": "工具(&T)",        "en": "&Tools"},
+    "menu_help":       {"zh": "帮助(&H)",        "en": "&Help"},
+    "menu_language":   {"zh": "语言",           "en": "Language"},
+    "lang_zh":         {"zh": "中文",           "en": "Chinese"},
+    "lang_en":         {"zh": "英文",           "en": "English"},
+    ...
+})
 ```
 
-**2. `close()` — send mode=0 before disposing device**, so blinking stops even if identify was interrupted early:
+### 2. Update each UI file
 
-```python
-def close(self):
-    if self._running:
-        try: self.stop()
-        except Exception: pass
-    try:
-        self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0))
-    except Exception:
-        pass
-    if self.dev is not None:
-        try: usb.util.dispose_resources(self.dev)
-        except Exception: pass
-        self.dev = None
-    self.ep_in = self.ep_out = None
-    self._running = False
-```
+Replace every visible string literal with `tr("key")`, connect to `language_changed` to refresh.
 
-## Validation
-
-1. Click "LED 闪烁识别" in GUI → LEDs blink for ~1.5s then stop
-2. Click "连接" then quickly "断开" during blinking → LEDs stop immediately
-3. No behavioral change for other methods
+### 3. Files to modify
+- `cangui/i18n.py` — NEW
+- `cangui/main_window.py` — all menus, buttons, labels, status bar
+- `cangui/trace.py` — toolbar, column headers, summary
+- `cangui/send.py` — buttons, table headers, dialog
+- `cangui/filters.py` — labels, buttons
+- `cangui/worker.py` — status messages
