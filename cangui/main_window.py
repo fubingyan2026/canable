@@ -213,10 +213,6 @@ class MainWindow(QMainWindow):
         hw_menu.addSeparator()
         # ElmueSoft 协议 ListenOnly 模式：只听不发，不发送 ACK
         # 注意：想要"自己发自己收"必须接两个 CAN 节点。
-        self.act_silent = QAction(_("HW.SilentMode"), self)
-        self.act_silent.setCheckable(True)
-        self.act_silent.toggled.connect(self._on_silent_toggle)
-        hw_menu.addAction(self.act_silent)
 
         # Tools
         tools_menu = mb.addMenu(_("Menu.Tools"))
@@ -279,7 +275,6 @@ class MainWindow(QMainWindow):
             (act_about, "Help.About"),
             (self.act_theme_light, "Theme.Light"),
             (self.act_theme_dark, "Theme.Dark"),
-            (self.act_silent, "HW.SilentMode"),
         ]
         QShortcut(QKeySequence("Ctrl+L"), self, self.trace_panel.clear_all)
 
@@ -402,33 +397,6 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("断开" if connected else "连接")
         self.bitrate_combo.setEnabled(not connected)
         self.bitrate_label.setText(f"{self.bitrate_combo.currentData():,} bps" if connected else "— bps")
-
-    @Slot()
-    @Slot(bool)
-    def _on_silent_toggle(self, enabled: bool):
-        """Silent 模式开关 (M0/M1)。
-
-        M1: 只听不发 (listen-only, TX 帧被硬件拒绝，word_led 不会闪)
-        M0: Normal (TX 帧发到物理总线)
-
-        注意：canable2 固件没有 loopback；silent 模式**不能**用来测试 TX。
-        """
-        def _run():
-            try:
-                if self._worker is not None and self._worker._bus is not None:
-                    self._worker._bus.set_silent(enabled)
-                else:
-                    with ZDTCanable() as b:
-                        b.set_silent(enabled)
-                mode = "Silent (只听不发)" if enabled else "Normal (发到总线)"
-                self.status_label.setText(f"canable2 模式: {mode}")
-            except Exception as e:
-                QMessageBox.warning(self, _("HW.SilentMode"), f"失败: {e}")
-                self.act_silent.blockSignals(True)
-                self.act_silent.setChecked(not enabled)
-                self.act_silent.blockSignals(False)
-
-        Thread(target=_run, daemon=True).start()
 
     @Slot(bool, str)
     def _on_state_changed(self, connected: bool, msg: str):
