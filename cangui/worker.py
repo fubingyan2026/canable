@@ -50,6 +50,7 @@ class CANWorker(QObject):
     state_changed = Signal(bool, str)      # connected, message
     error         = Signal(str)
     bus_stats     = Signal(float, int)     # load%, fps
+    noack_warning = Signal(str)            # NO-ACK 提示
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -242,6 +243,7 @@ class CANWorker(QObject):
                             time.sleep(0.2)
                     elif is_noack:
                         if now - self._last_error_notify >= 5.0:
+                            self.noack_warning.emit("NO-ACK")
                             logger.info("CAN NO-ACK (LEC 粘滞, 可能无设备应答)")
                             self._last_error_notify = now
                     else:

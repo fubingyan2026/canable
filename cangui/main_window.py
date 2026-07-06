@@ -54,6 +54,11 @@ class MainWindow(QMainWindow):
         self._frame_count = 0
         self._last_load = 0.0
         self._last_fps = 0
+        self._noack_warning = False
+        self._noack_timer = QTimer(self)
+        self._noack_timer.setSingleShot(True)
+        self._noack_timer.timeout.connect(self._clear_noack)
+        self._connected_msg = ""
         self._settings = {}
         self.__init_ui()
 
@@ -72,7 +77,7 @@ class MainWindow(QMainWindow):
         self._settings_dirty = False
         self._settings_timer.stop()
         try:
-            with open(self._settings_path(), "w") as f:
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(self._settings, f, indent=2)
         except Exception:
             pass
@@ -382,6 +387,7 @@ class MainWindow(QMainWindow):
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.error.connect(self._on_error)
         self._worker.bus_stats.connect(self._on_bus_stats)
+        self._worker.noack_warning.connect(self._on_noack_warning)
         # 同步过滤器
         self._worker.set_filters(self.filter_panel.filters)
         # 在独立线程跑 worker 的 connect() + run() 循环
@@ -410,6 +416,8 @@ class MainWindow(QMainWindow):
 
     def _update_connect_ui(self, connected: bool, msg: str):
         self._connected = connected
+        if connected:
+            self._connected_msg = msg
         self.status_label.setText(msg)
         self.status_label.setProperty("connected", connected)
         # 重新应用属性样式
@@ -434,6 +442,19 @@ class MainWindow(QMainWindow):
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
         self.count_label.setText(f"⚠ {err[:60]}")
+
+    @Slot(str)
+    def _on_noack_warning(self, msg: str):
+        self._noack_warning = True
+        self.status_label.setText(f"⚠ {_('Status.NoAck')}")
+        self.status_label.setProperty("connected", False)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        self._noack_timer.start(1000)
+
+    def _clear_noack(self):
+        self._noack_warning = False
+        self._update_connect_ui(self._connected, self._connected_msg)
 
     @Slot(object)
     def _on_frame_received(self, frame: CANFrame):
@@ -595,7 +616,7 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self):
         try:
-            with open(self._settings_path()) as f:
+            with open(self._settings_path(), encoding="utf-8") as f:
                 self._settings = json.load(f)
         except Exception:
             self._settings = {}

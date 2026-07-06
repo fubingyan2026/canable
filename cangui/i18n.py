@@ -155,6 +155,7 @@ _TR.update({
     "Status.FPS":            {"zh": "帧/秒",           "en": "fps"},
     "Status.Load":           {"zh": "负载",            "en": "Load"},
     "Status.TotalFrames":    {"zh": "总帧数",          "en": "Total frames"},
+    "Status.NoAck":          {"zh": "NO-ACK — 无设备应答", "en": "NO-ACK — no responding nodes"},
 
     # Error messages
     "Trace.Frames":        {"zh": "帧",           "en": "frames"},

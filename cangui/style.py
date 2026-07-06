@@ -70,7 +70,7 @@ def _make_qss(p: dict) -> str:
 QWidget {{
     background-color: {p['BG_MAIN']};
     color: {p['FG_TEXT']};
-    font-family: "Segoe UI", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-family: "Segoe UI", "Noto Sans CJK SC", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", "Noto Sans", sans-serif;
     font-size: 9.5pt;
 }}
 

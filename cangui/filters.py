@@ -173,6 +173,7 @@ class FilterPanel(QWidget):
         self.clear_btn.setText(_("Filter.Clear"))
         self.info_label.setText(_("Filter.Info"))
         self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
+        self._refresh()
 
     def to_dict_list(self):
         return [

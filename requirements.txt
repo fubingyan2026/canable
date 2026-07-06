@@ -1,2 +1,8 @@
 pyusb>=1.2.1
 PySide6>=6.5
+# Windows: pyusb requires libusb-1.0.dll. Install via:
+#   pip install libusb  (bundles the DLL)
+# Or manually download from https://libusb.info and place libusb-1.0.dll in PATH.
+# Linux: libusb is typically pre-installed (apt install libusb-1.0-0).
+# Device driver: Windows needs WinUSB via Zadig (https://zadig.akeo.ie);
+# Linux needs udev rules (run install_udev.sh).

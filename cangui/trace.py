@@ -254,6 +254,7 @@ class TraceView(QTableView):
         self.setSortingEnabled(False)
 
         font = QFont("Consolas", 9)
+        font.setFamilies(["Consolas", "Noto Sans Mono CJK SC", "Liberation Mono", "Courier New", "monospace"])
         font.setStyleHint(QFont.Monospace)
         self.setFont(font)
 
@@ -405,7 +406,7 @@ class TracePanel(QWidget):
             if not new_frames:
                 return
             need_header = not os.path.isfile(self._log_path) or os.path.getsize(self._log_path) == 0
-            with open(self._log_path, "a", newline="") as f:
+            with open(self._log_path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if need_header:
                     w.writerow(["timestamp", "ch", "can_id", "type", "dlc", "data_hex"])
@@ -413,10 +414,10 @@ class TracePanel(QWidget):
                     w.writerow(r)
             # trim to _log_max_rows when file gets large
             try:
-                with open(self._log_path, "r", newline="") as f:
+                with open(self._log_path, "r", newline="", encoding="utf-8") as f:
                     all_rows = list(csv.reader(f))
                 if len(all_rows) > self._log_max_rows:
-                    with open(self._log_path, "w", newline="") as f:
+                    with open(self._log_path, "w", newline="", encoding="utf-8") as f:
                         w = csv.writer(f)
                         w.writerow(all_rows[0])  # header
                         for r in all_rows[-(self._log_max_rows - 1):]:

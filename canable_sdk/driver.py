@@ -143,7 +143,10 @@ class ZDTCanable:
         except (usb.core.USBError, NotImplementedError):
             pass
 
-        self.dev.set_configuration()
+        try:
+            self.dev.set_configuration()
+        except usb.core.USBError:
+            pass
         cfg = self.dev.get_active_configuration()
         intf = cfg[(0, 0)]
 
@@ -372,7 +375,7 @@ class ZDTCanable:
                 if len(raw) > 0 and len(raw) % MAX_PACKET_SIZE == 0:
                     self.ep_out.write(b'', timeout=timeout)
         except usb.core.USBError as e:
-            if getattr(e, 'errno', None) == 32 or 'pipe' in str(e).lower():
+            if getattr(e, 'errno', None) in (32, 232) or 'pipe' in str(e).lower():
                 logger.warning("USB pipe error, clearing STALL")
                 try:
                     usb.util.clear_stall(self.ep_out)
@@ -410,9 +413,10 @@ class ZDTCanable:
         try:
             data = self.ep_in.read(256, timeout=int(timeout * 1000))
         except usb.core.USBError as e:
-            if getattr(e, "errno", None) == 110 or "timeout" in str(e).lower():
+            errno = getattr(e, "errno", None)
+            if errno in (110, 10060) or "timeout" in str(e).lower():
                 return None
-            if getattr(e, "errno", None) == 75 or "overflow" in str(e).lower():
+            if errno in (75, 121) or "overflow" in str(e).lower():
                 logger.debug("USB overflow, flushing endpoint buffer")
                 try:
                     self.ep_in.read(256, timeout=10)
@@ -442,9 +446,10 @@ class ZDTCanable:
         try:
             data = self.ep_in.read(LEGACY_FRAME_SIZE, timeout=int(timeout * 1000))
         except usb.core.USBError as e:
-            if getattr(e, "errno", None) == 110 or "timeout" in str(e).lower():
+            errno = getattr(e, "errno", None)
+            if errno in (110, 10060) or "timeout" in str(e).lower():
                 return None
-            if getattr(e, "errno", None) == 75 or "overflow" in str(e).lower():
+            if errno in (75, 121) or "overflow" in str(e).lower():
                 try:
                     self.ep_in.read(LEGACY_FRAME_SIZE, timeout=10)
                 except Exception:
