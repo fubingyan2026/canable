@@ -18,7 +18,7 @@ from PySide6.QtGui import QIcon
 from cangui.main_window import MainWindow
 from cangui.style import get_qss
 
-LOGO_PATH = os.path.join(_HERE, "logo.png")
+LOGO_PATH = os.path.join(_HERE, "logo.jpg")
 
 
 def main():

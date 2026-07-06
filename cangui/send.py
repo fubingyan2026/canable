@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -24,7 +25,10 @@ _SEND_DIR = None
 def _csv_dir():
     global _SEND_DIR
     if _SEND_DIR is None:
-        _SEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if getattr(sys, 'frozen', False):
+            _SEND_DIR = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            _SEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return _SEND_DIR
 
 
