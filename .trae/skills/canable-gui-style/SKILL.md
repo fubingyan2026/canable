@@ -1,11 +1,13 @@
 ---
 name: "canable-gui-style-optimized"
-description: "Design style, performance, and JSON-i18n guide for CANable 2.5 PyQt6 GUI. Focuses on professional macaron aesthetics, fluid multi-threading, High-DPI details, and externalized localization."
+description: "Design style, performance, and i18n guide for CANable 2.5 PySide6 GUI. Focuses on professional macaron aesthetics, thread-safe high-throughput rendering, High-DPI details, and dict-based localization."
 ---
 
 # CANable 2.5 上位机外观、性能与国际化设计指南
 
-本指南定义了 CANable 2.5 上位机的商业级视觉美学体系、高频数据流渲染规范以及外置 JSON 国际化架构，旨在指导 AI 构建兼具“低开销、高流畅度”与“精致工业感”的分析界面。
+本指南定义 CANable 2.5 上位机（PySide6 / Qt6）的视觉美学体系、高频数据流渲染规范以及内置字典国际化架构，反映 `cangui/` 与 `canable_sdk/` 的当前实现。
+
+> 实际代码即权威：本文件描述的规范均已在代码中落地，修改代码时请同步更新本文件。
 
 ---
 
@@ -13,241 +15,382 @@ description: "Design style, performance, and JSON-i18n guide for CANable 2.5 PyQ
 
 ### 1.1 马卡龙色系主题（Light / Dark）
 
+主题由 [cangui/style.py](file:///home/fubingyan/桌面/canable/cangui/style.py) 的 `_LIGHT` / `_DARK` 字典定义，运行时通过 `set_theme(name)` 切换并 `_update_globals()` 同步导出符号。
+
 **浅色主题（Light）**：
-| 变量      | 值      | 用途                    |
+
+| 变量 | 值 | 用途 |
 | --------- | ------- | ----------------------- |
-| BG_MAIN   | #F5F0E8 | 窗口主背景（温暖柔和）  |
-| BG_CARD   | #FFFFFF | 卡片/卡套底色           |
-| BG_INPUT  | #FDFCFA | 输入框背景              |
-| BG_HEADER | #EDE6DA | 表头/边侧工具栏         |
-| BG_HOVER  | #D2F0E3 | 鼠标悬停色（薄荷淡绿）  |
-| BG_SELECT | #BAE6D3 | 选中项背景              |
-| BG_ACCENT | #7EC8A0 | 强调色/连接成功色       |
-| FG_TEXT   | #3A3A3A | 主文字                  |
-| FG_DIM    | #9E9E9E | 次要/占位文本           |
-| FG_WARN   | #D4A24C | 警告状态/数据更新高亮色 |
-| FG_ERROR  | #D4655C | 错误/断开状态           |
-| BORDER    | #E4DED4 | 细边框                  |
+| BG_MAIN | #F5F0E8 | 窗口主背景（温暖柔和） |
+| BG_CARD | #FFFFFF | 卡片/面板底色 |
+| BG_INPUT | #FDFCFA | 输入框背景 |
+| BG_HEADER | #EDE6DA | 表头/边侧工具栏 |
+| BG_HOVER | #D2F0E3 | 鼠标悬停色（薄荷淡绿） |
+| BG_SELECT | #BAE6D3 | 选中项背景 |
+| BG_ACCENT | #7EC8A0 | 强调色 / 连接成功色 |
+| BG_CORAL | #F2A999 | 珊瑚强调色（发送按钮） |
+| BG_CORAL_H | #ED9481 | 珊瑚悬停色 |
+| BG_SIDEBAR | #F8F4EC | 侧栏背景 |
+| BG_STATUS | #D8F0E2 | 状态栏成功背景 |
+| BG_TX | #D2F0E3 | 本机发送（TX）行背景 |
+| BG_ERROR | #FFDCDC | 错误帧行背景 |
+| FG_TEXT | #3A3A3A | 主文字 |
+| FG_DIM | #9E9E9E | 次要/占位/禁用文本 |
+| FG_ACCENT | #4C9B73 | 强调文字色（TX、选中态） |
+| FG_CORAL | #D4745C | 珊瑚文字色 |
+| FG_WARN | #D4A24C | 警告状态 / 数据更新高亮色 |
+| FG_ERROR | #D4655C | 错误/断开状态 |
+| FG_LINK | #5B9BD5 | 链接色 |
+| BORDER | #E4DED4 | 细边框 |
+| LOAD_LOW | #4C9B73 | 总线负载低（<40%） |
+| LOAD_MID | #D4A24C | 总线负载中（40-75%） |
+| LOAD_HIGH | #D4655C | 总线负载高（≥75%） |
 
 **深色主题（Dark）**：
-| 变量      | 值      | 用途          |
+
+| 变量 | 值 | 用途 |
 | --------- | ------- | ------------- |
-| BG_MAIN   | #222222 | 窗口主背景    |
-| BG_CARD   | #2B2B2B | 卡片/面板底色 |
-| BG_INPUT  | #1E1E1E | 输入框背景    |
-| BG_HEADER | #2F2F2F | 表头背景      |
-| BG_HOVER  | #2A4035 | 悬停背景      |
-| BG_SELECT | #244C3A | 选中背景      |
-| FG_TEXT   | #DDDDDD | 主文字        |
-| FG_DIM    | #777777 | 次要文本      |
-| FG_ACCENT | #6ED8A0 | 强调色        |
-| FG_WARN   | #D4A24C | 警告色        |
-| FG_ERROR  | #D4655C | 错误色        |
-| BORDER    | #333333 | 细边框        |
+| BG_MAIN | #2B2B2B | 窗口主背景 |
+| BG_CARD | #333333 | 卡片/面板底色 |
+| BG_INPUT | #252525 | 输入框背景 |
+| BG_HEADER | #3A3A3A | 表头背景 |
+| BG_HOVER | #2A4035 | 悬停背景 |
+| BG_SELECT | #2A4A3A | 选中背景 |
+| BG_ACCENT | #7EC8A0 | 强调色 |
+| BG_CORAL | #F2A999 | 珊瑚强调色 |
+| BG_CORAL_H | #ED9481 | 珊瑚悬停色 |
+| BG_SIDEBAR | #2E2E2E | 侧栏背景 |
+| BG_STATUS | #253530 | 状态栏成功背景 |
+| BG_TX | #2A4035 | TX 行背景 |
+| BG_ERROR | #3A2020 | 错误帧行背景 |
+| FG_TEXT | #DDDDDD | 主文字 |
+| FG_DIM | #888888 | 次要文本 |
+| FG_ACCENT | #6ED8A0 | 强调色 |
+| FG_CORAL | #D4745C | 珊瑚文字色 |
+| FG_WARN | #D4A24C | 警告色 |
+| FG_ERROR | #D4655C | 错误色 |
+| FG_LINK | #5B9BD5 | 链接色 |
+| BORDER | #444444 | 细边框 |
+| LOAD_LOW | #6ED8A0 | 负载低 |
+| LOAD_MID | #D4A24C | 负载中 |
+| LOAD_HIGH | #D4655C | 负载高 |
+
+### 1.2 CAN ID 着色
+
+按 ID 哈希生成 HSL 色，让同 ID 帧颜色一致、不同 ID 视觉可分：
+
+```python
+def id_color(can_id: int, extended: bool = False) -> str:
+    if extended:
+        hue = ((can_id >> 16) ^ (can_id & 0xFFFF)) % 360
+    else:
+        hue = (can_id * 7) % 360
+    return f"hsl({hue}, 50%, 60%)"
+```
+
+在 [trace.py data()](file:///home/fubingyan/桌面/canable/cangui/trace.py) 的 `ForegroundRole` 中按 `id_color(frame.can_id, frame.extended)` 着色。
 
 ---
 
-### 1.2 高分屏与精细化交互规范
+### 1.3 高分屏与精细化交互规范
 
-1. **High-DPI 与矢量化适配**：
-   * 应用程序初始化时必须执行以下适配策略，防止高分屏下布局错位：
-     ```python
-     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-     ```
-   * 界面所有图标、指示灯按钮等元素**必须采用 SVG 格式**，严禁使用 PNG 等像素格式。
-2. **QDockWidget 弹性布局**：
-   * 将控制区、发送区、统计区等封装为 `QDockWidget`，允许用户拖动、浮动和拼合，提供多显示器自适应体验。
-3. **呼吸灯与动态微动效**：
-   * 连接状态指示器（LED）需应用 `QGraphicsDropShadowEffect`，连接成功时展示微弱的绿色发光（Glow）效果。
-   * 按钮 Hover 态采用 `QVariantAnimation` 渐变切换，避免视觉上的生硬跳变。
+1. **High-DPI 适配**：在 [cangui/__main__.py:25-27](file:///home/fubingyan/桌面/canable/cangui/__main__.py#L25-L27) 中于 `QApplication` 构造前调用：
+   ```python
+   QApplication.setHighDpiScaleFactorRoundingPolicy(
+       Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+   )
+   ```
+2. **图标必须使用 SVG**：`logo.svg`（窗口图标）、`check.svg`（QCheckBox 选中态，通过 QSS `image: url(...)` 引入）。严禁 PNG。
+3. **QDockWidget 弹性布局**：发送面板、过滤面板均封装为 `QDockWidget`，支持拖动、浮动、关闭，并允许在底部/右侧停靠区切换。
+4. **状态联动**：连接状态通过 `QLabel#statusLabel[connected="true|false"]` 动态属性切换颜色；总线负载通过 `QLabel#busLoad[level="low|mid|high"]` 三档变色。
 
 ---
 
 ## 二、 极限性能渲染规范
 
-在高频总线负载下，界面必须维持在流畅帧率（如 30fps~60fps），严禁卡死和丢帧。
+目标：在 CAN FD 5Mbps 数据相满载（~6000-8000 fps）下维持 UI 流畅，不卡死、不丢帧（5000 fps 以内）。
 
 ### 2.1 生产者-消费者解耦架构
 
-* **原则**：严禁“一收报文就发 Qt 信号并刷新 TableView”的驱动模式。
-* **实现**：
-  1. **后台线程（只收数据）**：从硬件通道拉取原始数据，压入线程安全的双端队列 `collections.deque(maxlen=10000)`。
-  2. **UI 线程（批量更新）**：启动一个 $30\text{ms}$ 的 `QTimer`。定时器触发时，单次从队列中批量提取积累的所有报文，在 `QAbstractTableModel` 中执行一轮集中更新并仅触发一次 `layoutChanged.emit()`。
+**严禁**“一收报文就 emit Qt 信号刷新 TableView”。
 
-### 2.2 `QAbstractTableModel` 优化
+**实际实现**（[cangui/worker.py](file:///home/fubingyan/桌面/canable/cangui/worker.py) + [cangui/main_window.py](file:///home/fubingyan/桌面/canable/cangui/main_window.py)）：
+
+1. **后台 worker 线程（`CANWorker.run()`）**：
+   - `bus.receive(timeout=0.01)` 阻塞 10ms 拉取一帧
+   - 命中 `_pass()` 过滤后，加锁压入 `deque(maxlen=10000)`（`_frame_buffer`）
+   - `_process_send_queue()` 同步处理主线程投递的发送请求（线程安全发送队列，非直接跨线程调用 `bus.send`）
+2. **主线程批量定时器 `_batch_timer`**：
+   - 间隔 **100ms**（稳定性优先，见 [main_window.py:67-70](file:///home/fubingyan/桌面/canable/cangui/main_window.py#L67-L70)）
+   - 触发 `_on_batch_frames()` → `worker.take_batch()` 一次性取出全部
+   - 单批上限 `MAX_BATCH=1000`，超出部分丢弃最新（避免 UI 单次刷新耗时过长）
+3. **批量日志写入**：trace 面板的 `_log_buffer` 同样走 `deque(maxlen=1000)`，5 秒定时落盘 + 5MB 轮转，避免高频写盘。
+
+### 2.2 QAbstractTableModel 优化
+
+实现见 [cangui/trace.py TraceModel](file:///home/fubingyan/桌面/canable/cangui/trace.py)：
+
+- **预格式化**：`add_frame()` 在入队前调用 `_format_row()` 生成 11 列纯字符串列表存入 `_text` deque，`data()` 仅做 `self._text[row][col]` 返回，零运行时格式化。
+- **ASCII 列优化**：使用模块级 `_ASCII_TRANSLATION = bytes.maketrans(...)` 预生成 256 字节查找表，`frame.data.translate(_ASCII_TRANSLATION)` 一次转换，避免逐字节 `chr()` 调用。
+- **role 短路**：`data()` 仅响应 `DisplayRole`/`BackgroundRole`/`ForegroundRole`/`TextAlignmentRole`/`ToolTipRole`，其他立即返回 `None`。
+- **行高统一**：`setUniformRowHeights(True)`。
+- **网格隐藏**：`setShowGrid(False)` + QSS `gridline-color: transparent`。
+- **最大行数**：`DEFAULT_MAX_ROWS = 1000`（[trace.py:22](file:///home/fubingyan/桌面/canable/cangui/trace.py#L22)），超出时 popleft 旧帧。
+- **collapse 模式**：按 `(can_id, extended)` 折叠，重复 ID 只 `dataChanged` 更新，不新增行，CPU 降 50%。
+
+### 2.3 字典清理（避免无限增长）
+
+`_counts` / `_last_ts` / `_period` / `_id_vis` 在 deque evict 旧帧时同步清理（[trace.py:177-192](file:///home/fubingyan/桌面/canable/cangui/trace.py#L177-L192)）：
 
 ```python
-# 数据预处理：在插入 Model 缓存之前，后台线程提前完成数据格式化，data() 仅做极速返回。
-class CanMsgModel(QAbstractTableModel):
-    def data(self, index, role):
-        if not index.isValid():
-            return None
-        # 仅响应高频渲染的核心 Role，其他不关心的 Role 立即返回 None
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._cache[index.row()][index.column()] # 预转换后的纯 String
-        elif role == Qt.ItemDataRole.TextAlignmentRole:
-            return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        # 用于实现数据突变高亮
-        elif role == Qt.ItemDataRole.BackgroundRole:
-            return self._get_aging_color(index.row())
-        return None
+old_cid = (old.can_id, old.extended)
+self._id_vis[old_cid] = self._id_vis.get(old_cid, 0) - 1
+if self._id_vis.get(old_cid, 0) <= 0:
+    self._id_vis.pop(old_cid, None)
+    self._counts.pop(old_cid, None)
+    self._last_ts.pop(old_cid, None)
+    self._period.pop(old_cid, None)
+for k in list(self._id_vis.keys()):
+    self._id_vis[k] -= 1
+    if self._id_vis[k] < 0:
+        self._id_vis.pop(k, None)
 ```
 
-### 2.3 视图渲染减负
+### 2.4 信号节流
 
-1. 对于大容量表格，启用统一行高，大幅降低高度重算开销：
-   ```python
-   table_view.setUniformRowHeights(True)
-   ```
-2. 禁用单元格虚线网格以提升重绘效率：
-   ```python
-   table_view.setShowGrid(False)
-   ```
-3. 动态限制 Table 视窗的最大行数（如保留最新 2000 行），将更早的数据静默释放，避免内存无限制增长。
+- `bus_stats` 信号：仅在有帧或负载非零时 emit，100ms 节流（[worker.py:308-312](file:///home/fubingyan/桌面/canable/cangui/worker.py#L308-L312)）
+- `noack_warning`：5 秒节流，避免 LEC 粘滞刷屏
+- `error`（BUS-OFF）：2 秒节流；连续 10 次触发自动 `recover()`
+
+### 2.5 极限吞吐量参考
+
+详见 [PERFORMANCE_ANALYSIS.md](file:///home/fubingyan/桌面/canable/PERFORMANCE_ANALYSIS.md)。
+
+| 场景 | 吞吐 | 评价 |
+|------|------|------|
+| 车载 CAN 总线 | <3000 fps | 完全够用 |
+| 工业自动化 | 1000-5000 fps | 完全够用 |
+| 实验室压力测试 | 5000-8000 fps | 临界可用 |
+| 极限 FD 满载 | >8000 fps | 有丢帧 |
 
 ---
 
-## 三、 QSS 与视觉反馈（细节）
+## 三、 QSS 与视觉反馈
 
 ### 3.1 扁平化无嵌套选择器
 
-为了避免 Qt 样式引擎在频繁重绘时遍历对象树带来的开销，QSS 样式应避免深度嵌套：
+QSS 全部由 [style.py `_make_qss()`](file:///home/fubingyan/桌面/canable/cangui/style.py) 动态生成，使用 `f-string` 注入调色板。规则：
+
+- **直接类名或 `#objectName` 选择器**，避免深度嵌套
+- 唯一允许的嵌套：`QGroupBox QLabel` / `QGroupBox QCheckBox`（强制透明背景，避免突兀色块）
+- 滚动条扁平化，hover 加宽、变色：
 
 ```css
-/* 推荐：直接类名或 ID 选择器 */
-QPushButton#actionBtn {
-    background-color: #F2A999;
-    color: #FFFFFF;
-    border-radius: 6px;
-    font-weight: bold;
-}
-QPushButton#actionBtn:hover {
-    background-color: #E29989;
-}
-
-/* 扁平化的 QScrollBar 滚动条，hover 时加宽，不占表格区域 */
 QScrollBar:vertical {
-    background: transparent;
-    width: 8px;
+    background-color: transparent;
+    width: 10px;
     margin: 0px;
 }
 QScrollBar::handle:vertical {
-    background: #E4DED4;
-    border-radius: 4px;
-    min-height: 20px;
+    background-color: #E4DED4;
+    border-radius: 5px;
+    min-height: 24px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #7EC8A0;
+    background-color: #9E9E9E;
 }
 ```
 
-### 3.2 数据老化闪烁效果（Data Aging）
+### 3.2 关键控件样式约定
 
-在“覆盖模式（Overwrite）”下，当某行 ID 的数据发生变动时，需要短暂高亮。
-* **QSS 配合动态属性**：
-  ```css
-  QTableView::item[state="updated"] {
-      background-color: rgba(242, 169, 153, 0.4); /* 淡粉橙色提示变动 */
-      transition: background-color 0.3s;
-  }
-  ```
-* **逻辑控制**：改变属性后，调用 `widget.style().unpolish(widget)` 及 `polish()` 进行快速重绘，并在 300ms 后清除该更新状态恢复默认。
+- **`#connectBtn`**：`checked` 时 `BG_ACCENT` 绿底白字，未选中时普通卡片色
+- **`#sendBtn`**：`BG_ACCENT` 绿底白字加粗，无 hover 颜色跳变
+- **`QCheckBox::indicator:checked`**：`FG_ACCENT` 绿底 + `check.svg` 白色对勾
+- **禁用态**：`QComboBox:disabled`/`QLineEdit:disabled` 等使用 `BG_HEADER` 背景 + `FG_DIM` 文字，视觉上明确不可用
+- **错误/TX 行背景**：`BG_ERROR`（淡红）/`BG_TX`（淡绿），通过 `BackgroundRole` 返回
 
----
+### 3.3 数据突变高亮
 
-## 四、 外置 JSON 国际化（i18n）架构
-
-为了实现语言文本与业务逻辑的彻底解耦，必须将翻译文本外置于 JSON 文件中，并通过单例管理器加载。
-
-### 4.1 JSON 语言包规范
-语言文件集中存放于 `locales/` 目录下，命名为 `{lang_code}.json`（例如 `zh_CN.json`、`en_US.json`）。
-
-```json
-/* locales/zh_CN.json */
-{
-  "metadata": { "language": "zh_CN", "name": "简体中文" },
-  "MainWindow": {
-    "title": "CANable 2.5 分析仪",
-    "menu_file": "文件(&F)",
-    "menu_connect": "连接总线"
-  },
-  "TransmitPanel": {
-    "send_btn": "发送",
-    "period_ms": "周期(ms)"
-  }
-}
-```
-
-### 4.2 语言管理器（I18nManager）
-
-通过全局单例管理器读取并提供翻译检索，避免重复的磁盘 I/O。
-
-```python
-import os
-import json
-from PyQt6.QtCore import QObject, pyqtSignal
-
-class I18nManager(QObject):
-    language_changed = pyqtSignal()  # 语言切换信号
-    _instance = None
-
-    @classmethod
-    def instance(cls):
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def __init__(self):
-        super().__init__()
-        self.translations = {}
-        self.current_lang = "zh_CN"
-        self.load_language(self.current_lang)
-
-    def load_language(self, lang_code: str):
-        file_path = f"locales/{lang_code}.json"
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    self.translations = json.load(f)
-                self.current_lang = lang_code
-                self.language_changed.emit()  # 通知所有界面重绘文本
-            except Exception as e:
-                print(f"Error loading translation: {e}")
-
-    def tr(self, section: str, key: str, default: str = "") -> str:
-        """多层级检索翻译文本，例如: tr('MainWindow', 'title')"""
-        return self.translations.get(section, {}).get(key, default or f"[{key}]")
-```
-
-### 4.3 界面更新机制
-每个 UI 组件/面板必须实现 `retranslate_ui()` 方法。当检测到 `language_changed` 信号时，统一触发刷新。
-
-```python
-class TransmitPanel(QDockWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setup_ui()
-        # 绑定语言变动事件
-        I18nManager.instance().language_changed.connect(self.retranslate_ui)
-        self.retranslate_ui()
-
-    def retranslate_ui(self):
-        m = I18nManager.instance()
-        self.setWindowTitle(m.tr("TransmitPanel", "panel_title", "发送控制"))
-        self.sendBtn.setText(m.tr("TransmitPanel", "send_btn", "发送"))
-        self.periodLabel.setText(m.tr("TransmitPanel", "period_ms", "周期(ms)"))
-```
+> 当前实现以 `id_color()` 着色 + TX 行绿色背景区分，尚未实现 300ms 老化闪烁。
+> 如需新增：在 `add_frame()` 中对 collapse 模式覆盖更新时设置 `state="updated"` 动态属性，300ms 后清除。
 
 ---
 
-## 五、 最佳实践指引
+## 四、 内置字典国际化（i18n）架构
+
+实际实现位于 [cangui/i18n.py](file:///home/fubingyan/桌面/canable/cangui/i18n.py)。**不使用外部 JSON 文件**，翻译表内置在 Python 模块中，避免运行时磁盘 I/O。
+
+### 4.1 翻译表结构
+
+```python
+_lang = "zh"  # 默认中文
+_TR: dict[str, dict[str, str]] = {}
+
+_TR.update({
+    "Menu.File":      {"zh": "文件(&F)",  "en": "&File"},
+    "Left.BPS":        {"zh": "bps",       "en": "bps"},
+    "Trace.Clear":     {"zh": "清空",      "en": "Clear"},
+    # ...
+})
+```
+
+**键命名规范**：`模块.含义`，如 `Left.BPS`、`Trace.Clear`、`Error.NotConnected`、`File.SaveTraceTitle`。
+
+### 4.2 翻译函数
+
+```python
+def _(key: str) -> str:
+    entry = _TR.get(key)
+    return entry.get(_lang, key) if entry else key
+```
+
+- 未命中返回 key 本身（便于发现遗漏）
+- 支持中英双语：`zh` / `en`
+
+### 4.3 语言切换信号
+
+```python
+class _Signal(QObject):
+    lang_changed = Signal(str)
+
+_signal = _Signal()
+language_changed = _signal.lang_changed  # 模块级导出
+
+def set_language(lang: str):
+    global _lang
+    _lang = lang
+    language_changed.emit(lang)  # 通知所有界面刷新
+```
+
+### 4.4 界面刷新机制
+
+每个 UI 面板必须实现 `refresh_language()`，监听 `language_changed` 信号统一刷新：
+
+```python
+# main_window.py
+language_changed.connect(self._refresh_language)
+
+def _refresh_language(self):
+    self.setWindowTitle(_("App.Title"))
+    self.connect_btn.setText(_("Left.ConnectDevice"))
+    # 重建 combo 时必须 blockSignals，避免误触 currentIndexChanged
+    self.bitrate_combo.blockSignals(True)
+    self.bitrate_combo.clear()
+    for b in self.BITRATES:
+        self.bitrate_combo.addItem(f"{b:,} {_('Left.BPS')}", b)
+    self.bitrate_combo.blockSignals(False)
+    # 子面板
+    self.trace_panel.refresh_language()
+    self.send_panel.refresh_language()
+    self.filter_panel.refresh_language()
+```
+
+**关键约束**：
+- 所有用户可见字符串必须通过 `_("key")` 获取，严禁硬编码
+- 重建 `QComboBox` 时必须 `blockSignals(True/False)`，避免误触发 `currentIndexChanged`
+- 新增控件时同步在 `refresh_language()` 中更新
+
+详见 [CANGUI_I18N_SPEC.md](file:///home/fubingyan/桌面/canable/CANGUI_I18N_SPEC.md)。
+
+---
+
+## 五、 线程安全与稳定性
+
+### 5.1 跨线程发送
+
+**严禁**主线程直接调用 `worker._bus.send()`（与子线程 `receive()` 竞争）。
+
+实际实现（[worker.py:193-229](file:///home/fubingyan/桌面/canable/cangui/worker.py#L193-L229)）：
+
+```python
+@Slot(object)
+def send(self, frame: CANFrame):
+    """主线程调用：仅入队"""
+    with QMutexLocker(self._send_mutex):
+        self._send_queue.append(frame)
+
+def _process_send_queue(self):
+    """子线程 run() 中调用：实际发送"""
+    with QMutexLocker(self._send_mutex):
+        pending = list(self._send_queue)
+        self._send_queue.clear()
+    for frame in pending:
+        self._bus.send(frame)
+```
+
+### 5.2 线程退出保障
+
+`_disconnect()` 必须等待 worker 线程真正退出，避免僵尸线程（[main_window.py:421-439](file:///home/fubingyan/桌面/canable/cangui/main_window.py#L421-L439)）：
+
+```python
+with QMutexLocker(worker._mutex):
+    worker._running = False
+    worker._connected = False
+thread.wait(2000)
+if thread.isRunning():
+    logger.warning("worker 线程未在 2s 内退出，强制终止")
+    thread.terminate()
+    thread.wait(1000)
+```
+
+### 5.3 USB 错误自愈
+
+- pipe 错误（overflow）：清空 endpoint buffer，调用 `on_overflow` 回调
+- BUS-OFF：连续 10 次自动 `recover()`
+- NO-ACK：5 秒节流提示，不自动恢复（单设备无应答属正常）
+
+### 5.4 日志与配置路径
+
+打包后（PyInstaller）需用 `sys.frozen` 判断，避免写到临时解压目录：
+
+```python
+def _log_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+```
+
+- trace 日志：`<可执行目录>/trace_log.csv`，5MB 轮转
+- 发送列表：`<可执行目录>/send_list.csv`
+- 设置：`<可执行目录>/settings.json`
+- 对话框几何：`QSettings` 存到系统标准位置（`~/.config/canable/CANable2.5.conf`）
+
+---
+
+## 六、 最佳实践指引
 
 1. **外观交互**：
-   * 必须为 TableView 等提供右键上下文菜单（右键复制、右键添加到发送列表等），且菜单项文本需同步注册在 `locales` 的 JSON 中。
-   * 采用 `QDockWidget` 管理功能区域，利用 `saveState()` 在程序退出时记住用户的自定义停靠布局 [2.3]。
-2. **性能与解耦基准**：
-   * 严禁在 `retranslate_ui()` 之外硬编码任何带有语言属性的界面字符串。
-   * 切换语言引发的界面文本变更应全部限制在 UI 线程的 `retranslate_ui()` 函数中同步执行，不允许干扰后台的数据接收缓冲。
+   - TableView 右键菜单（复制、添加到发送列表）需通过 `customContextMenuRequested` 信号实现
+   - `QDockWidget` 布局通过 `saveState()`/`restoreState()` 持久化
+2. **性能基准**：
+   - 严禁在 `refresh_language()` 之外硬编码任何带语言属性的界面字符串
+   - 严禁主线程直接访问 `worker._bus`
+   - 严禁“一收报文就发 Qt 信号并刷新 TableView”
+   - 所有缓冲区必须有 `maxlen`，所有计数字典必须有 evict 清理
+3. **代码质量**：
+   - 解包变量严禁用 `_`（会遮蔽 i18n 翻译函数），用 `_selected_filter` 等
+   - `import` 必须在文件顶部，禁止在异常分支内 `import`
+   - 布尔解析用宽松函数 `_parse_bool()`，兼容 `true/1/yes`
+
+---
+
+## 七、 关键文件索引
+
+| 文件 | 作用 |
+|------|------|
+| [cangui.py](file:///home/fubingyan/桌面/canable/cangui.py) | 启动脚本，配置 logging |
+| [cangui/__main__.py](file:///home/fubingyan/桌面/canable/cangui/__main__.py) | QApplication 入口，High-DPI 设置 |
+| [cangui/main_window.py](file:///home/fubingyan/桌面/canable/cangui/main_window.py) | 主窗口，UI 布局 + 信号槽 + 批量刷新 |
+| [cangui/worker.py](file:///home/fubingyan/桌面/canable/cangui/worker.py) | CAN I/O 工作线程，收发 + 过滤 + 负载统计 |
+| [cangui/trace.py](file:///home/fubingyan/桌面/canable/cangui/trace.py) | Trace 面板，QAbstractTableModel + CSV 日志 |
+| [cangui/send.py](file:///home/fubingyan/桌面/canable/cangui/send.py) | 发送面板，周期发送 + CSV 持久化 |
+| [cangui/filters.py](file:///home/fubingyan/桌面/canable/cangui/filters.py) | 过滤器面板，ID 范围过滤 |
+| [cangui/style.py](file:///home/fubingyan/桌面/canable/cangui/style.py) | 主题调色板 + QSS 生成 |
+| [cangui/i18n.py](file:///home/fubingyan/桌面/canable/cangui/i18n.py) | 内置字典翻译表 + 语言切换信号 |
+| [canable_sdk/](file:///home/fubingyan/桌面/canable/canable_sdk/) | USB-CAN 驱动 SDK |
+| [PERFORMANCE_ANALYSIS.md](file:///home/fubingyan/桌面/canable/PERFORMANCE_ANALYSIS.md) | 极限吞吐量性能分析报告 |
+| [CANGUI_I18N_SPEC.md](file:///home/fubingyan/桌面/canable/CANGUI_I18N_SPEC.md) | 国际化规范（键命名、刷新机制） |
+| [CANABLE_PROTOCOL_SPEC.md](file:///home/fubingyan/桌面/canable/CANABLE_PROTOCOL_SPEC.md) | USB-CAN 协议规范（表格形式） |
 
 ---
 ### --- END OF FILE SKILL.md ---
