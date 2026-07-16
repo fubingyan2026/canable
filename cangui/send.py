@@ -221,7 +221,7 @@ class SendPanel(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setShowGrid(False)
-        self.table.setAlternatingRowColors(True)
+        self.table.setAlternatingRowColors(False)
         self.table.doubleClicked.connect(self._on_double_clicked)
         h = self.table.horizontalHeader()
         widths = {self.COL_INDEX: 70, self.COL_ID: 110, self.COL_TYPE: 50,
@@ -337,7 +337,7 @@ class SendPanel(QWidget):
     def _on_edit(self):
         idx = self._selected_index()
         if idx is None:
-            self.status_label.setText("请先选中一行"); return
+            self.status_label.setText(_("Send.SelectRow")); return
         base = self.entries[idx]
         # 暂停 timer 编辑期间不发
         if base.timer and base.timer.isActive():
@@ -351,7 +351,7 @@ class SendPanel(QWidget):
     def _on_delete(self):
         idx = self._selected_index()
         if idx is None:
-            self.status_label.setText("请先选中一行"); return
+            self.status_label.setText(_("Send.SelectRow")); return
         e = self.entries.pop(idx)
         if e.timer:
             e.timer.stop()
@@ -362,7 +362,7 @@ class SendPanel(QWidget):
     def _on_send_once(self):
         idx = self._selected_index()
         if idx is None:
-            self.status_label.setText("请先选中一行"); return
+            self.status_label.setText(_("Send.SelectRow")); return
         e = self.entries[idx]
         frame = CANFrame(e.can_id, e.data, extended=e.extended, rtr=e.rtr,
                          fd=e.fd, brs=e.brs)
@@ -375,17 +375,17 @@ class SendPanel(QWidget):
             e.enabled = True
         self._sync_timers()
         self._refresh_all()
-        self.status_label.setText("已启动全部周期发送")
+        self.status_label.setText(_("Send.StartAll"))
 
     def _on_stop_all(self):
         self.stop_all_timers()
         self._refresh_all()
-        self.status_label.setText("已停止全部周期发送")
+        self.status_label.setText(_("Send.StopAll"))
 
     def _on_clear(self):
         if self.entries and QMessageBox.question(
-                self, "清空",
-                f"确定要清空 {len(self.entries)} 条发送项？") != QMessageBox.Yes:
+                self, _("Send.Clear"),
+                f"{_('Send.Clear')} {len(self.entries)} {_('Send.Items')}?") != QMessageBox.Yes:
             return
         for e in self.entries:
             if e.timer:
@@ -393,7 +393,7 @@ class SendPanel(QWidget):
                 e.timer.deleteLater()
         self.entries.clear()
         self._refresh_all()
-        self.status_label.setText("已清空")
+        self.status_label.setText(_("Send.Cleared"))
 
     def _on_double_clicked(self, _index):
         # 双击 = 发送一次

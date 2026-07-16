@@ -60,6 +60,12 @@ class MainWindow(QMainWindow):
         self._noack_timer.timeout.connect(self._clear_noack)
         self._connected_msg = ""
         self._settings = {}
+
+        # 批量帧刷新定时器（主线程）
+        self._batch_timer = QTimer(self)
+        self._batch_timer.timeout.connect(self._on_batch_frames)
+        self._batch_timer.start(30)
+
         self.__init_ui()
 
     def _settings_path(self):
@@ -143,29 +149,37 @@ class MainWindow(QMainWindow):
         self._bus_box = QGroupBox(_("Left.Bus"))
         bf = QFormLayout(self._bus_box)
         self.bitrate_combo = QComboBox()
+        bps = _("Left.BPS")
         for b in self.BITRATES:
-            self.bitrate_combo.addItem(f"{b:,} bps", b)
-        self.bitrate_combo.setCurrentText("500,000 bps")
+            self.bitrate_combo.addItem(f"{b:,} {bps}", b)
+        self.bitrate_combo.setCurrentText(f"500,000 {bps}")
         self._lbl_bitrate = QLabel(_("Left.Bitrate"))
         bf.addRow(self._lbl_bitrate, self.bitrate_combo)
 
         # CAN FD 选项
-        self.fd_chk = QCheckBox("CAN FD")
+        self._lbl_canmode = QLabel(_("Left.CANMode"))
+        self.fd_chk = QCheckBox(_("Left.CANFD"))
         self.fd_chk.toggled.connect(self._on_fd_toggle)
-        bf.addRow("", self.fd_chk)
+        bf.addRow(self._lbl_canmode, self.fd_chk)
 
         self.data_bitrate_combo = QComboBox()
-        self.data_bitrate_combo.addItem("1,000,000 bps", 1_000_000)
-        self.data_bitrate_combo.addItem("2,000,000 bps", 2_000_000)
-        self.data_bitrate_combo.addItem("4,000,000 bps", 4_000_000)
-        self.data_bitrate_combo.addItem("5,000,000 bps", 5_000_000)
-        self.data_bitrate_combo.addItem("8,000,000 bps", 8_000_000)
+        bps = _("Left.BPS")
+        self.data_bitrate_combo.addItem(f"1,000,000 {bps}", 1_000_000)
+        self.data_bitrate_combo.addItem(f"2,000,000 {bps}", 2_000_000)
+        self.data_bitrate_combo.addItem(f"4,000,000 {bps}", 4_000_000)
+        self.data_bitrate_combo.addItem(f"5,000,000 {bps}", 5_000_000)
+        self.data_bitrate_combo.addItem(f"8,000,000 {bps}", 8_000_000)
         self.data_bitrate_combo.setEnabled(False)
         self._lbl_data_bitrate = QLabel(_("Left.DataBitrate"))
         bf.addRow(self._lbl_data_bitrate, self.data_bitrate_combo)
 
         self.sample_combo = QComboBox()
-        self.sample_combo.addItems(["87.5% (default)", "75.0%", "66.7%", "50.0%"])
+        self.sample_combo.addItems([
+            _("Left.Sample87"),
+            _("Left.Sample75"),
+            _("Left.Sample67"),
+            _("Left.Sample50"),
+        ])
         self._lbl_sample = QLabel(_("Left.SamplePoint"))
         bf.addRow(self._lbl_sample, self.sample_combo)
         layout.addWidget(self._bus_box)
@@ -242,7 +256,7 @@ class MainWindow(QMainWindow):
 
         # Tools
         tools_menu = mb.addMenu(_("Menu.Tools"))
-        act_send_once = QAction("发送单帧…", self)
+        act_send_once = QAction(_("Tools.QuickSend"), self)
         act_send_once.setShortcut("Ctrl+Return")
         act_send_once.triggered.connect(self._on_quick_send)
         tools_menu.addAction(act_send_once)
@@ -262,8 +276,8 @@ class MainWindow(QMainWindow):
         theme_group.triggered.connect(self._on_theme_changed)
 
         lang_menu = tools_menu.addMenu(_("Menu.Language"))
-        self.act_lang_zh = QAction("中文", self, checkable=True)
-        self.act_lang_en = QAction("English", self, checkable=True)
+        self.act_lang_zh = QAction(_("Lang.Chinese"), self, checkable=True)
+        self.act_lang_en = QAction(_("Lang.English"), self, checkable=True)
         self.act_lang_zh.setChecked(get_language() == "zh")
         self.act_lang_en.setChecked(get_language() != "zh")
         lang_group = QActionGroup(self)
@@ -301,6 +315,8 @@ class MainWindow(QMainWindow):
             (act_about, "Help.About"),
             (self.act_theme_light, "Theme.Light"),
             (self.act_theme_dark, "Theme.Dark"),
+            (self.act_lang_zh, "Lang.Chinese"),
+            (self.act_lang_en, "Lang.English"),
         ]
         QShortcut(QKeySequence("Ctrl+L"), self, self.trace_panel.clear_all)
 
@@ -348,7 +364,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, _("Left.Scan"), f"{_('Scan.Failed')}: {e}")
             return
         if not devs:
-            item = QListWidgetItem("未发现 candleLight 设备")
+            item = QListWidgetItem(_("Left.NoDevice"))
             item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.device_list.addItem(item)
             return
@@ -412,7 +428,7 @@ class MainWindow(QMainWindow):
             self._worker_thread.wait(500)
             self._worker_thread = None
         self._worker = None
-        self._update_connect_ui(False, "已断开")
+        self._update_connect_ui(False, _("Status.Disconnected"))
 
     def _update_connect_ui(self, connected: bool, msg: str):
         self._connected = connected
@@ -460,6 +476,14 @@ class MainWindow(QMainWindow):
     def _on_frame_received(self, frame: CANFrame):
         self._frame_count += 1
         self.trace_panel.append_frame(frame)
+
+    def _on_batch_frames(self):
+        if self._worker is None:
+            return
+        batch = self._worker.take_batch()
+        for frame in batch:
+            self._frame_count += 1
+            self.trace_panel.append_frame(frame)
 
     @Slot(float, int)
     def _on_bus_stats(self, load: float, fps: int):
@@ -582,7 +606,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_send_list(self):
         if not self.send_panel.exists():
-            self.status_label.setText("无历史记录")
+            self.status_label.setText(_("Scan.NoHistory"))
             return
         try:
             self.send_panel.from_csv(self.send_panel.csv_path())
@@ -640,6 +664,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "act_lang_zh"):
             self.act_lang_zh.setChecked(lang == "zh")
             self.act_lang_en.setChecked(lang != "zh")
+        if hasattr(self, "act_theme_light"):
+            self.act_theme_light.setChecked(theme == "light")
+            self.act_theme_dark.setChecked(theme == "dark")
         try:
             self.filter_panel.from_dict_list(s.get("filters", []))
         except Exception:
@@ -669,6 +696,7 @@ class MainWindow(QMainWindow):
                 self.send_panel.from_csv(self.send_panel.csv_path())
             except Exception:
                 pass
+        self._refresh_language()
 
 
     def _on_theme_changed(self, action):
@@ -702,6 +730,8 @@ class MainWindow(QMainWindow):
         self._lbl_bitrate.setText(_("Left.Bitrate"))
         self._lbl_data_bitrate.setText(_("Left.DataBitrate"))
         self._lbl_sample.setText(_("Left.SamplePoint"))
+        self._lbl_canmode.setText(_("Left.CANMode"))
+        self.fd_chk.setText(_("Left.CANFD"))
         # status bar
         if hasattr(self, "fps_label"):
             self.fps_label.setText(f"{self._last_fps} {_('Status.FPS')}")
@@ -721,6 +751,46 @@ class MainWindow(QMainWindow):
             self.send_panel.refresh_language()
         if hasattr(self, "filter_panel") and hasattr(self.filter_panel, "refresh_language"):
             self.filter_panel.refresh_language()
+        # refresh device list text
+        if hasattr(self, "device_list"):
+            if self.device_list.count() == 1:
+                item = self.device_list.item(0)
+                if item and not (item.flags() & Qt.ItemIsEnabled):
+                    item.setText(_("Left.NoDevice"))
+            elif self.device_list.count() == 0:
+                item = QListWidgetItem(_("Left.NoDevice"))
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                self.device_list.addItem(item)
+        # refresh combo items
+        if hasattr(self, "bitrate_combo"):
+            bps = _("Left.BPS")
+            current_data = self.bitrate_combo.currentData()
+            self.bitrate_combo.clear()
+            for b in self.BITRATES:
+                self.bitrate_combo.addItem(f"{b:,} {bps}", b)
+            if current_data:
+                self.bitrate_combo.setCurrentIndex(self.bitrate_combo.findData(current_data))
+        if hasattr(self, "data_bitrate_combo"):
+            bps = _("Left.BPS")
+            current_data = self.data_bitrate_combo.currentData()
+            self.data_bitrate_combo.clear()
+            for b in [1_000_000, 2_000_000, 4_000_000, 5_000_000, 8_000_000]:
+                self.data_bitrate_combo.addItem(f"{b:,} {bps}", b)
+            if current_data:
+                self.data_bitrate_combo.setCurrentIndex(self.data_bitrate_combo.findData(current_data))
+        # refresh sample combo
+        if hasattr(self, "sample_combo"):
+            current_text = self.sample_combo.currentText()
+            self.sample_combo.clear()
+            self.sample_combo.addItems([
+                _("Left.Sample87"),
+                _("Left.Sample75"),
+                _("Left.Sample67"),
+                _("Left.Sample50"),
+            ])
+            idx = self.sample_combo.findText(current_text)
+            if idx >= 0:
+                self.sample_combo.setCurrentIndex(idx)
 
     def closeEvent(self, e):
         if not hasattr(self, 'bitrate_combo'):

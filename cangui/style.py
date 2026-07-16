@@ -66,6 +66,7 @@ def id_color(can_id: int, extended: bool = False) -> str:
 
 
 def _make_qss(p: dict) -> str:
+    _check_svg = os.path.join(_HERE, "check.svg")
     return f"""
 QWidget {{
     background-color: {p['BG_MAIN']};
@@ -271,6 +272,11 @@ QTableView::item:alternate, QTableWidget::item:alternate {{
     background-color: {p['BG_INPUT']};
 }}
 
+QTableView::item:alternate:selected, QTableWidget::item:alternate:selected {{
+    background-color: {p['BG_SELECT']};
+    color: {p['FG_TEXT']};
+}}
+
 QTreeView, QListWidget {{
     background-color: {p['BG_CARD']};
     color: {p['FG_TEXT']};
@@ -333,6 +339,29 @@ QGroupBox::title {{
 QCheckBox {{
     spacing: 6px;
     color: {p['FG_TEXT']};
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 2px solid {p['BORDER']};
+    border-radius: 3px;
+    background-color: {p['BG_INPUT']};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {p['FG_ACCENT']};
+    border-color: {p['FG_ACCENT']};
+    image: url("{_check_svg}");
+}}
+QCheckBox::indicator:hover {{
+    border-color: {p['FG_ACCENT']};
+}}
+
+QGroupBox QLabel {{
+    background-color: transparent;
+}}
+
+QGroupBox QCheckBox {{
+    background-color: transparent;
 }}
 
 QSplitter::handle {{

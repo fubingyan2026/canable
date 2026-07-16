@@ -13,6 +13,8 @@ from typing import List, Optional
 import usb.core
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker, QObject, Slot
 
+from .i18n import _
+
 from canable_sdk import ZDTCanable, CANFrame
 
 logger = logging.getLogger("cangui.worker")
@@ -64,7 +66,9 @@ class CANWorker(QObject):
         self.data_bitrate: Optional[int] = None
         self._last_error_notify = 0.0    # 上次错误帧通知时间
         self._error_count = 0            # 连续错误帧计数
-        self._last_error_time = 0.0     # 上次错误帧时间
+        self._last_error_time = 0.0      # 上次错误帧时间
+        self._frame_buffer = deque(maxlen=10000)
+        self._buffer_mutex = QMutex()
 
     # ---------- 过滤 ---------- #
     def set_filters(self, filters: List[CANFilter]):
@@ -131,17 +135,23 @@ class CANWorker(QObject):
                             "检查 CANH/CANL 接线、120Ω 终端电阻、GND 共地)")
             except Exception:
                 pass
-            self.state_changed.emit(True, f"已连接 @ {self.bitrate:,} bps")
+            self.state_changed.emit(True, f"{_('Status.Connected')} @ {self.bitrate:,} bps")
         except Exception as e:
             self._bus = None
             self._connected = False
-            self.error.emit(f"连接失败: {e}")
-            self.state_changed.emit(False, "未连接")
+            self.error.emit(f"{_('Error.ConnectFailed')}: {e}")
+            self.state_changed.emit(False, _("Status.Disconnected"))
 
     @Slot()
     def disconnect(self):
         self._running = False
         self._connected = False
+
+    def take_batch(self):
+        with QMutexLocker(self._buffer_mutex):
+            batch = list(self._frame_buffer)
+            self._frame_buffer.clear()
+        return batch
 
     @Slot(int)
     def set_bitrate_slot(self, bitrate: int):
@@ -262,7 +272,8 @@ class CANWorker(QObject):
                     frame_times.popleft()
                 logger.info("RX  %s", frame)
                 if self._pass(frame):
-                    self.frame_received.emit(frame)
+                    with QMutexLocker(self._buffer_mutex):
+                        self._frame_buffer.append(frame)
 
             fps = len(frame_times)
             load = 0.0
@@ -280,6 +291,6 @@ class CANWorker(QObject):
             except Exception:
                 pass
             self._bus = None
-        self.state_changed.emit(False, "已断开")
+        self.state_changed.emit(False, _("Status.Disconnected"))
 
 

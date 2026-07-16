@@ -3,7 +3,7 @@
 
 启动时会在终端输出 INFO 级别的日志，包含：
   - CAN 控制器状态（连接 / 启动 / 停止）
-  - 每次 TX / RX 帧内容（标准帧 [123 SFF] DE AD BE EF）
+  - 每次 TX / RX 帧内容（标准帧 [123 SFF] DE AD BE EF)
   - 错误与警告
 """
 import sys
