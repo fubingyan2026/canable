@@ -6,6 +6,7 @@ from typing import Deque, Dict, Tuple, Optional
 
 import csv
 import os
+import sys
 from datetime import datetime
 from PySide6.QtCore import (Qt, QAbstractTableModel, QModelIndex, Signal,
                             QTimer)
@@ -16,10 +17,23 @@ from PySide6.QtWidgets import (QTableView, QHeaderView, QAbstractItemView,
 
 from canable_sdk import CANFrame
 from .i18n import _, language_changed
-from .style import id_color, FG_DIM, FG_ACCENT
+from .style import id_color, FG_DIM, FG_ACCENT, BG_TX, BG_ERROR
 
 
 DEFAULT_MAX_ROWS = 1_000
+
+
+def _log_dir() -> str:
+    """获取日志文件目录（兼容打包后环境）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 预生成 ASCII 转换表：可打印字符保留，其余替换为 '.'
+_ASCII_TRANSLATION = bytes.maketrans(
+    bytes(range(256)),
+    bytes(b if 32 <= b < 127 else ord('.') for b in range(256)),
+)
 
 
 class TraceModel(QAbstractTableModel):
@@ -79,7 +93,7 @@ class TraceModel(QAbstractTableModel):
                 typ = "Std"
             dlc = str(frame.dlc)
             data = frame.data.hex(' ').upper()
-            ascii = ''.join(chr(b) if 32 <= b < 127 else '.' for b in frame.data)
+            ascii = frame.data.translate(_ASCII_TRANSLATION)
         return [
             "",                         # COL_INDEX — set on insert
             f"{t:12.6f}",
@@ -110,9 +124,9 @@ class TraceModel(QAbstractTableModel):
 
         if role == Qt.BackgroundRole:
             if f.is_error:
-                return QBrush(QColor(255, 220, 220))
+                return QBrush(QColor(BG_ERROR))
             if f.is_tx:
-                return QBrush(QColor("#D2F0E3"))
+                return QBrush(QColor(BG_TX))
 
         if role == Qt.ForegroundRole:
             if f.is_tx:
@@ -168,10 +182,18 @@ class TraceModel(QAbstractTableModel):
             self._meta.popleft()
             self._text.popleft()
             old_cid = (old.can_id, old.extended)
-            if old_cid in self._id_vis and self._id_vis[old_cid] == 0:
-                del self._id_vis[old_cid]
+            # 递减旧帧 ID 的可见计数
+            self._id_vis[old_cid] = self._id_vis.get(old_cid, 0) - 1
+            # 若该 ID 已无可见行，清理相关字典避免无限增长
+            if self._id_vis.get(old_cid, 0) <= 0:
+                self._id_vis.pop(old_cid, None)
+                self._counts.pop(old_cid, None)
+                self._last_ts.pop(old_cid, None)
+                self._period.pop(old_cid, None)
             for k in list(self._id_vis.keys()):
                 self._id_vis[k] -= 1
+                if self._id_vis[k] < 0:
+                    self._id_vis.pop(k, None)
             self.endRemoveRows()
 
         pos = len(self._rows)
@@ -352,7 +374,7 @@ class TracePanel(QWidget):
         bar.addWidget(self.autoscroll_chk)
 
         self.collapse_chk = QCheckBox(_("Trace.Collapse"))
-        self.collapse_chk.setToolTip("Show only latest frame per CAN ID")
+        self.collapse_chk.setToolTip(_("Trace.CollapseTooltip"))
         
         self.collapse_chk.toggled.connect(self._on_collapse)
         bar.addWidget(self.collapse_chk)
@@ -376,12 +398,12 @@ class TracePanel(QWidget):
         self._summary_timer.timeout.connect(self._update_summary)
         self._summary_timer.start(500)
 
-        self._log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trace_log.csv")
+        self._log_path = os.path.join(_log_dir(), "trace_log.csv")
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self._flush_log)
         self._log_timer.start(5000)
 
-    _log_max_rows = 1500
+    _log_max_bytes = 5 * 1024 * 1024  # 5 MB
 
     def _flush_log(self):
         if len(self._log_buffer) == 0:
@@ -412,16 +434,13 @@ class TracePanel(QWidget):
                     w.writerow(["timestamp", "ch", "can_id", "type", "dlc", "data_hex"])
                 for r in new_frames:
                     w.writerow(r)
-            # trim to _log_max_rows when file gets large
+            # rotate: if file exceeds size limit, rename to .1 and start fresh
             try:
-                with open(self._log_path, "r", newline="", encoding="utf-8") as f:
-                    all_rows = list(csv.reader(f))
-                if len(all_rows) > self._log_max_rows:
-                    with open(self._log_path, "w", newline="", encoding="utf-8") as f:
-                        w = csv.writer(f)
-                        w.writerow(all_rows[0])  # header
-                        for r in all_rows[-(self._log_max_rows - 1):]:
-                            w.writerow(r)
+                if os.path.getsize(self._log_path) > self._log_max_bytes:
+                    rotated = self._log_path + ".1"
+                    if os.path.isfile(rotated):
+                        os.remove(rotated)
+                    os.rename(self._log_path, rotated)
             except Exception:
                 pass
         except Exception:
@@ -434,7 +453,7 @@ class TracePanel(QWidget):
         self._frame_count = 0
         self._log_buffer.clear()
         self._last_log_ts = 0.0
-        self.summary_label.setText("Received: 0 frames")
+        self.summary_label.setText(f"{_('Trace.Received')} 0 {_('Trace.Frames')}")
         self.cleared.emit()
 
     def _on_pause(self, checked):
@@ -461,11 +480,12 @@ class TracePanel(QWidget):
         )
 
     def append_frame(self, frame: CANFrame):
+        # 暂停时仍记录日志，仅跳过 UI 更新
+        self._log_buffer.append(frame)
         if self._paused:
             return
         self.view.add_frame(frame)
         self._frame_count += 1
-        self._log_buffer.append(frame)
 
     def refresh_language(self):
         self.clear_btn.setText(_("Trace.Clear"))

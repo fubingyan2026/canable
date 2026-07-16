@@ -21,18 +21,22 @@ from .constants import (
     GS_ReqIdentify, GS_ReqSetBitTimingFD, GS_ReqGetCapabilitiesFD,
     GS_ReqSetTermination, GS_ReqGetTermination,
     ELM_ReqGetBoardInfo, ELM_ReqSetFilter, ELM_ReqGetLastError,
-    ELM_ReqSetBusLoadReport,
+    ELM_ReqSetBusLoadReport, ELM_ReqSetPinStatus, ELM_ReqGetPinStatus,
     GS_DevFlagListenOnly, GS_DevFlagLoopback, GS_DevFlagOneShot,
     GS_DevFlagTimestamp, GS_DevFlagIdentify, GS_DevFlagCAN_FD,
     GS_DevFlagBitTimingFD, GS_DevFlagTermination,
     ELM_DevFlagProtocolElmue, ELM_DevFlagDisableTxEcho,
+    GS_ModeStart, GS_TerminationON, GS_TerminationOFF,
+    FIL_ClearAll, FIL_AcceptMask11bit, FIL_AcceptMask29bit,
+    PINOP_Reset, PINOP_Set, PINOP_Tristate, PINOP_PullDown,
+    PINOP_PullUp, PINOP_Disable, PINOP_Enable,
+    PINID_BOOT0, PINST_High, PINST_Enabled,
+    FEEDBACK_NAMES,
     logger,
 )
 from .bitrate import NOMINAL_BITTIMING, DATA_BITTIMING
 from .frame import CANFrame
 from .protocol import _ElmueProtocol
-
-logger = logging.getLogger("canable_sdk")
 
 
 class ZDTCanable:
@@ -222,22 +226,25 @@ class ZDTCanable:
 
     def _ctrl_out_checked(self, req, value=0, index=0, data=None, timeout=1000):
         self._ctrl_out(req, value, index, data, timeout)
-        self._check_last_error()
+        return self._check_last_error()
 
-    def _check_last_error(self):
+    def _check_last_error(self) -> Optional[int]:
         try:
             result = self._ctrl_in(ELM_ReqGetLastError, length=1)
             if result and len(result) >= 1:
                 feedback = result[0]
                 if feedback != 0 and feedback != 2:
-                    logger.warning("control request failed: eFeedback=%d", feedback)
+                    name = FEEDBACK_NAMES.get(feedback, f"unknown({feedback})")
+                    logger.warning("control request failed: eFeedback=%d (%s)", feedback, name)
+                    return feedback
         except usb.core.USBError:
             pass
+        return None
 
     # ================================================================
     #  CAN controller lifecycle
     # ================================================================
-    def start(self, loopback: bool = False):
+    def start(self, loopback: bool = False, disable_echo: bool = False, one_shot: bool = False):
         flags = 0
         if self._protocol == "elmue":
             flags |= ELM_DevFlagProtocolElmue
@@ -248,11 +255,16 @@ class ZDTCanable:
         if loopback or self._loopback:
             flags |= GS_DevFlagLoopback
 
+        if one_shot:
+            flags |= GS_DevFlagOneShot
+
+        if disable_echo:
+            flags |= ELM_DevFlagDisableTxEcho
+
         if self._fd_mode:
             flags |= GS_DevFlagCAN_FD
 
-        mode = 1  # GS_ModeStart
-        payload = struct.pack('<II', mode, flags)
+        payload = struct.pack('<II', GS_ModeStart, flags)
         self._ctrl_out_checked(GS_ReqSetDeviceMode, data=payload)
 
         self._has_timestamp = bool(flags & GS_DevFlagTimestamp)
@@ -318,7 +330,7 @@ class ZDTCanable:
 
     def set_data_bitrate(self, data_bitrate: int):
         if data_bitrate not in DATA_BITTIMING:
-            brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate)
+            brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate, data_phase=True)
         else:
             brp, seg1, seg2, sjw = DATA_BITTIMING[data_bitrate]
 
@@ -328,12 +340,16 @@ class ZDTCanable:
         self._data_bitrate = data_bitrate
         logger.info("data bitrate set: %d bps", data_bitrate)
 
-    def _calc_bitrate_params(self, bitrate: int):
+    def _calc_bitrate_params(self, bitrate: int, data_phase: bool = False):
+        # STM32G4 FDCAN 数据相限制：TSEG1≤15, TSEG2≤15, SJW≤15
+        # 标称相限制较宽：TSEG1≤32, TSEG2≤16
+        seg1_max = 15 if data_phase else 32
+        seg2_max = 15 if data_phase else 16
         clock = 160_000_000
         best_err = float('inf')
         best = None
-        for seg1 in range(1, 33):
-            for seg2 in range(1, min(seg1 + 1, 17)):
+        for seg1 in range(1, seg1_max + 1):
+            for seg2 in range(1, min(seg1 + 1, seg2_max + 1)):
                 total = 1 + seg1 + seg2
                 for brp in range(1, 513):
                     calc = clock / brp / total
@@ -406,9 +422,7 @@ class ZDTCanable:
         if self._parser is not None:
             frames = self._parser.flush_frames()
             if frames:
-                if len(frames) > 1:
-                    self._parser._pending_frames = frames[1:]
-                return frames[0]
+                return self._take_first_frame(frames)
 
         try:
             data = self.ep_in.read(256, timeout=int(timeout * 1000))
@@ -422,6 +436,11 @@ class ZDTCanable:
                     self.ep_in.read(256, timeout=10)
                 except Exception:
                     pass
+                if self._overflow_cb:
+                    try:
+                        self._overflow_cb()
+                    except Exception:
+                        logger.exception("overflow callback failed")
                 return None
             raise
 
@@ -436,11 +455,15 @@ class ZDTCanable:
         else:
             logger.debug("no frame from %d bytes (string/busload)", len(raw))
 
-        if frames:
-            if len(frames) > 1:
-                self._parser._pending_frames = frames[1:]
-            return frames[0]
-        return None
+        return self._take_first_frame(frames)
+
+    def _take_first_frame(self, frames: list) -> Optional[CANFrame]:
+        """Return first frame, push the rest to pending buffer."""
+        if not frames:
+            return None
+        if len(frames) > 1:
+            self._parser.push_pending(frames[1:])
+        return frames[0]
 
     def _recv_legacy(self, timeout: float = 1.0) -> Optional[CANFrame]:
         try:
@@ -481,11 +504,17 @@ class ZDTCanable:
         return supported
 
     def get_version(self) -> Optional[str]:
+        """Return firmware version as human-readable string (e.g. '25.10.23')."""
         try:
             ver = self._ctrl_in(GS_ReqGetDeviceVersion, length=16)
             if ver and len(ver) >= 12:
                 sw = struct.unpack_from('<I', bytes(ver), 4)[0]
-                return f"0x{sw:08X}"
+                hw = struct.unpack_from('<I', bytes(ver), 8)[0]
+                # BCD format: 0x251023 → "25.10.23"
+                major = (sw >> 16) & 0xFF
+                minor = (sw >> 8) & 0xFF
+                patch = sw & 0xFF
+                return f"{major}.{minor:02d}.{patch:02d} (fw=0x{sw:08X}, hw=0x{hw:08X})"
         except usb.core.USBError:
             pass
         return None
@@ -515,9 +544,20 @@ class ZDTCanable:
     #  Extended features
     # ================================================================
     def set_filter(self, operation: int = 0, can_id: int = 0, mask: int = 0):
+        """Set hardware acceptance filter.
+
+        Args:
+            operation: FIL_ClearAll (0), FIL_AcceptMask11bit (1), or FIL_AcceptMask29bit (2).
+            can_id: Filter value (e.g. 0x7E0). Ignored for FIL_ClearAll.
+            mask: Mask value (e.g. 0x7FF). Ignored for FIL_ClearAll.
+        """
         payload = struct.pack('<BIIII', operation, can_id, mask, 0, 0)
         self._ctrl_out_checked(ELM_ReqSetFilter, data=payload)
         logger.info("filter set: op=%d id=0x%X mask=0x%X", operation, can_id, mask)
+
+    def clear_filters(self):
+        """Remove all hardware acceptance filters."""
+        self.set_filter(FIL_ClearAll)
 
     def get_termination(self) -> Optional[bool]:
         try:
@@ -534,8 +574,70 @@ class ZDTCanable:
         logger.info("termination: %s", "ON" if enabled else "OFF")
 
     def set_bus_load_report(self, interval: int = 0):
+        """Enable periodic bus load report.
+
+        Args:
+            interval: Report interval in 0=off, 1..255=interval unit.
+        """
         payload = struct.pack('<B', interval)
         self._ctrl_out_checked(ELM_ReqSetBusLoadReport, data=payload)
+
+    def get_board_info(self) -> Optional[dict]:
+        """Return board information (MCU name, board name, device ID)."""
+        try:
+            result = self._ctrl_in(ELM_ReqGetBoardInfo, length=55)
+            if result and len(result) >= 6:
+                raw = bytes(result)
+                mcu_id = struct.unpack_from('<H', raw, 0)[0]
+                # Two 25-char null-terminated strings at offset 2 and 27
+                mcu_name = raw[2:27].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+                board_name = raw[27:52].split(b'\x00', 1)[0].decode('ascii', errors='replace')
+                return {
+                    "mcu_device_id": f"0x{mcu_id:03X}",
+                    "mcu_name": mcu_name,
+                    "board_name": board_name,
+                }
+        except usb.core.USBError:
+            pass
+        return None
+
+    def get_timestamp(self) -> Optional[int]:
+        """Return firmware 1μs precision timestamp (rolls over after ~1 hour)."""
+        try:
+            result = self._ctrl_in(GS_ReqGetTimestamp, length=4)
+            if result and len(result) >= 4:
+                return struct.unpack_from('<I', bytes(result), 0)[0]
+        except usb.core.USBError:
+            pass
+        return None
+
+    def set_pin_status(self, pin_id: int, operation: int):
+        """Control a processor pin.
+
+        Args:
+            pin_id: ePinID constant (e.g. PINID_BOOT0=1).
+            operation: ePinOperation constant (PINOP_Reset/Set/Tristate/etc.).
+        """
+        payload = struct.pack('<HHII', operation, pin_id, 0, 0)
+        self._ctrl_out_checked(ELM_ReqSetPinStatus, data=payload)
+        logger.info("pin %d: operation=%d", pin_id, operation)
+
+    def get_pin_status(self, pin_id: int) -> Optional[int]:
+        """Read a processor pin status.
+
+        Args:
+            pin_id: ePinID constant (e.g. PINID_BOOT0=1).
+
+        Returns:
+            Bit flags: PINST_High (0x01), PINST_Enabled (0x02), or None on error.
+        """
+        try:
+            result = self._ctrl_in(ELM_ReqGetPinStatus, value=pin_id, length=2)
+            if result and len(result) >= 2:
+                return struct.unpack_from('<H', bytes(result), 0)[0]
+        except usb.core.USBError:
+            pass
+        return None
 
     # ================================================================
     #  Callbacks & listening

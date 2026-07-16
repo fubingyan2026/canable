@@ -10,6 +10,7 @@ _LIGHT = {
     "BG_HEADER": "#EDE6DA", "BG_HOVER": "#D2F0E3", "BG_SELECT": "#BAE6D3",
     "BG_ACCENT": "#7EC8A0", "BG_CORAL": "#F2A999", "BG_CORAL_H": "#ED9481",
     "BG_SIDEBAR": "#F8F4EC", "BG_STATUS": "#D8F0E2",
+    "BG_TX": "#D2F0E3", "BG_ERROR": "#FFDCDC",
     "FG_TEXT": "#3A3A3A", "FG_DIM": "#9E9E9E", "FG_ACCENT": "#4C9B73",
     "FG_CORAL": "#D4745C", "FG_WARN": "#D4A24C", "FG_ERROR": "#D4655C",
     "FG_LINK": "#5B9BD5",
@@ -22,6 +23,7 @@ _DARK = {
     "BG_HEADER": "#3A3A3A", "BG_HOVER": "#2A4035", "BG_SELECT": "#2A4A3A",
     "BG_ACCENT": "#7EC8A0", "BG_CORAL": "#F2A999", "BG_CORAL_H": "#ED9481",
     "BG_SIDEBAR": "#2E2E2E", "BG_STATUS": "#253530",
+    "BG_TX": "#2A4035", "BG_ERROR": "#3A2020",
     "FG_TEXT": "#DDDDDD", "FG_DIM": "#888888", "FG_ACCENT": "#6ED8A0",
     "FG_CORAL": "#D4745C", "FG_WARN": "#D4A24C", "FG_ERROR": "#D4655C",
     "FG_LINK": "#5B9BD5",
@@ -44,6 +46,8 @@ BG_CORAL = _p["BG_CORAL"]
 BG_CORAL_H = _p["BG_CORAL_H"]
 BG_SIDEBAR = _p["BG_SIDEBAR"]
 BG_STATUS = _p["BG_STATUS"]
+BG_TX = _p["BG_TX"]
+BG_ERROR = _p["BG_ERROR"]
 FG_TEXT = _p["FG_TEXT"]
 FG_DIM = _p["FG_DIM"]
 FG_ACCENT = _p["FG_ACCENT"]
@@ -170,7 +174,6 @@ QPushButton:disabled {{
 }}
 
 QPushButton#connectBtn {{
-    font-weight: bold;
     font-size: 10pt;
     padding: 6px 20px;
     border-radius: 8px;
@@ -195,19 +198,6 @@ QPushButton#sendBtn:hover {{
     background-color: {p['FG_ACCENT']};
 }}
 
-QPushButton#actionBtn {{
-    background-color: {p['BG_CORAL']};
-    color: white;
-    font-weight: bold;
-    border: none;
-    border-radius: 6px;
-    padding: 5px 14px;
-}}
-
-QPushButton#actionBtn:hover {{
-    background-color: {p['BG_CORAL_H']};
-}}
-
 QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
     background-color: {p['BG_INPUT']};
     color: {p['FG_TEXT']};
@@ -219,6 +209,12 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
 
 QComboBox:hover, QLineEdit:hover {{
     border-color: {p['BG_ACCENT']};
+}}
+
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    background-color: {p['BG_HEADER']};
+    color: {p['FG_DIM']};
+    border-color: {p['BORDER']};
 }}
 
 QComboBox::drop-down {{
@@ -364,6 +360,10 @@ QGroupBox QCheckBox {{
     background-color: transparent;
 }}
 
+QLabel:disabled {{
+    color: {p['FG_DIM']};
+}}
+
 QSplitter::handle {{
     background-color: {p['BORDER']};
 }}
@@ -395,20 +395,6 @@ QFrame#sidebar {{
     border-right: 1px solid {p['BORDER']};
 }}
 
-QFrame#statusCard {{
-    background-color: {p['BG_STATUS']};
-    border: 1px solid {p['BG_ACCENT']};
-    border-radius: 10px;
-    padding: 10px;
-}}
-
-QFrame#quickActions {{
-    background-color: {p['BG_CARD']};
-    border: 1px solid {p['BORDER']};
-    border-radius: 10px;
-    padding: 8px;
-}}
-
 QToolTip {{
     background-color: {p['BG_CARD']};
     color: {p['FG_TEXT']};
@@ -422,7 +408,7 @@ QToolTip {{
 
 def _update_globals(pal: dict):
     global BG_MAIN, BG_CARD, BG_INPUT, BG_HEADER, BG_HOVER, BG_SELECT, BG_ACCENT
-    global BG_CORAL, BG_CORAL_H, BG_SIDEBAR, BG_STATUS
+    global BG_CORAL, BG_CORAL_H, BG_SIDEBAR, BG_STATUS, BG_TX, BG_ERROR
     global FG_TEXT, FG_DIM, FG_ACCENT, FG_CORAL, FG_WARN, FG_ERROR, FG_LINK, BORDER
     global LOAD_LOW, LOAD_MID, LOAD_HIGH
     global _p

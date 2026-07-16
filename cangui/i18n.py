@@ -35,7 +35,6 @@ _TR.update({
     # Menus
     "Menu.File":             {"zh": "文件(&F)",  "en": "&File"},
     "Menu.Windows":          {"zh": "窗口(&W)",  "en": "&Windows"},
-    "Menu.Hardware":         {"zh": "硬件(&H)",  "en": "&Hardware"},
     "Menu.Tools":            {"zh": "工具(&T)",  "en": "&Tools"},
     "Menu.Help":             {"zh": "帮助(&H)",  "en": "&Help"},
     "Menu.Language":         {"zh": "语言",      "en": "Language"},
@@ -51,11 +50,6 @@ _TR.update({
     # View / Windows menu items
     "Window.SendMessages":   {"zh": "发送消息", "en": "Send Messages"},
     "Window.Filters":        {"zh": "过滤器",  "en": "Filters"},
-
-    # Hardware menu items
-    "HW.ScanDevices":        {"zh": "扫描设备",     "en": "Scan Devices"},
-    "HW.LEDIdentify":        {"zh": "LED 闪烁识别", "en": "LED Identify"},
-    "HW.SilentMode":         {"zh": "Silent 模式 (只听不发)", "en": "Silent Mode (Listen Only)"},
 
     # Tools menu items
     "Tools.QuickSend":       {"zh": "快速发送…", "en": "Quick Send…"},
@@ -97,8 +91,10 @@ _TR.update({
     "Send.Edit":             {"zh": "编辑",        "en": "Edit"},
     "Send.Delete":           {"zh": "删除",        "en": "Delete"},
     "Send.SendOnce":         {"zh": "发送一次",    "en": "Send once"},
-    "Send.StartAll":         {"zh": "启动全部",    "en": "Start all"},
-    "Send.StopAll":          {"zh": "停止全部",    "en": "Stop all"},
+    "Send.Start":            {"zh": "启动",        "en": "Start"},
+    "Send.Stop":             {"zh": "停止",        "en": "Stop"},
+    "Send.StartAll":         {"zh": "已启动周期发送", "en": "Periodic send started"},
+    "Send.StopAll":          {"zh": "已停止周期发送", "en": "Periodic send stopped"},
     "Send.ClearAll":         {"zh": "清空列表",    "en": "Clear list"},
     "Send.DialogTitle":      {"zh": "编辑发送报文", "en": "Edit Send Message"},
     "Send.Ready":            {"zh": "就绪",        "en": "Ready"},
@@ -125,15 +121,13 @@ _TR.update({
     "Send.DlgDLC":           {"zh": "DLC:",            "en": "DLC:"},
     "Send.DlgData":          {"zh": "数据:",            "en": "Data:"},
     "Send.DlgPeriod":        {"zh": "周期(ms):",       "en": "Period (ms):"},
-    "Send.DlgEnabled":       {"zh": "启用周期发送",    "en": "Enable Periodic"},
     "Send.FdDlcHEX":         {"zh": "十六进制，空格分隔", "en": "Hex, space separated"},
 
     # Filter panel
-    "Filter.Title":          {"zh": "过滤器",       "en": "Filters"},
-    "Filter.Add":            {"zh": "添加过滤",     "en": "Add filter"},
-    "Filter.Delete":         {"zh": "删除过滤",     "en": "Delete filter"},
-    "Filter.IDType":         {"zh": "ID 类型:",    "en": "ID type:"},
-    "Filter.Action":         {"zh": "动作:",        "en": "Action:"},
+    "Filter.Add":            {"zh": "添加",        "en": "Add"},
+    "Filter.Edit":           {"zh": "编辑",        "en": "Edit"},
+    "Filter.Delete":         {"zh": "删除",        "en": "Delete"},
+    "Filter.Clear":          {"zh": "清空",        "en": "Clear"},
 
     # Left panel
     "Left.Bus":              {"zh": "总线",            "en": "Bus"},
@@ -149,12 +143,9 @@ _TR.update({
     "Left.Sample50":         {"zh": "50.0%",          "en": "50.0%"},
     "Left.Devices":          {"zh": "设备",            "en": "Devices"},
     "Left.Scan":             {"zh": "扫描设备",        "en": "Scan"},
-    "Left.QuickActions":     {"zh": "快速操作",        "en": "Quick Actions"},
-    "Left.Connect":          {"zh": "连接",            "en": "Connect"},
+    "Left.ConnectDevice":    {"zh": "连接设备",        "en": "Connect Device"},
     "Left.Disconnect":       {"zh": "断开",            "en": "Disconnect"},
-    "Left.LEDIdentify":      {"zh": "LED 闪烁识别",    "en": "LED Identify"},
-    "Left.StatusCardTitle":  {"zh": "CAN 总线状态",    "en": "CAN Bus Status"},
-    "Left.NotConnected":     {"zh": "未连接",          "en": "Not Connected"},
+    "Left.NoDeviceSelected": {"zh": "请先选择一个设备", "en": "Please select a device first"},
     "Left.NoDevice":         {"zh": "未发现 candleLight 设备", "en": "No candleLight device found"},
 
     # Status bar
@@ -169,22 +160,13 @@ _TR.update({
     "Trace.Frames":        {"zh": "帧",           "en": "frames"},
     "Trace.ModeAll":       {"zh": "全部",         "en": "all"},
     "Trace.ModeCollapsed": {"zh": "折叠",         "en": "collapsed"},
-    "Error.CONotFound":      {"zh": "未找到 CANable 设备",  "en": "CANable device not found"},
     "Error.ConnectFailed":   {"zh": "连接失败",          "en": "Connection failed"},
-    "Error.ConfigSave":      {"zh": "配置保存失败",          "en": "Failed to save settings"},
-    "About.Title":          {"zh": "关于 CANable 2.5", "en": "About CANable 2.5"},
     "About.Desc":           {"zh": "CANable 2.5 USB-CAN 适配器 上位机", "en": "CANable 2.5 USB-CAN Adapter GUI"},
     "About.Tech":           {"zh": "基于 PySide6 / Qt 6 + canable_sdk 驱动", "en": "Built with PySide6 / Qt 6 + canable_sdk driver"},
-    "Error.ConfigLoad":      {"zh": "配置加载失败",          "en": "Failed to load settings"},
     # Filter panel
     "Filter.Info":          {"zh": "过滤器：未命中任何规则时默认放行。", "en": "Filters: unmatched frames pass by default."},
-    "Filter.ActionDesc":    {"zh": "丢弃/放行",   "en": "Drop/Pass"},
     "Filter.Drop":          {"zh": "丢弃",        "en": "Drop"},
     "Filter.Pass":          {"zh": "放行",        "en": "Pass"},
-    "Filter.Add":           {"zh": "添加",        "en": "Add"},
-    "Filter.Edit":          {"zh": "编辑",        "en": "Edit"},
-    "Filter.Delete":        {"zh": "删除",        "en": "Delete"},
-    "Filter.Clear":         {"zh": "清空",        "en": "Clear"},
     "Filter.HdrIndex":      {"zh": "#",          "en": "#"},
     "Filter.HdrRange":      {"zh": "ID 范围",    "en": "ID Range"},
     "Filter.HdrType":       {"zh": "类型",       "en": "Type"},
@@ -210,14 +192,43 @@ _TR.update({
     "Scan.Failed":          {"zh": "扫描失败",    "en": "Scan failed"},
     "Scan.NoHistory":       {"zh": "无历史记录",  "en": "No history"},
     "Send.SelectRow":       {"zh": "请先选中一行", "en": "Please select a row first"},
-    "Send.StartAll":        {"zh": "已启动全部周期发送", "en": "All periodic sends started"},
-    "Send.StopAll":         {"zh": "已停止全部周期发送", "en": "All periodic sends stopped"},
     "Send.Clear":           {"zh": "清空",        "en": "Clear"},
     "Send.Cleared":         {"zh": "已清空",      "en": "Cleared"},
     "Send.Items":           {"zh": "条发送项",    "en": "send items"},
-    "LED.Identify.Fail":    {"zh": "LED 识别失败","en": "LED Identify failed"},
-    "SilentMode.Fail":      {"zh": "Silent 模式切换失败", "en": "Silent mode toggle failed"},
     "Load.Failed":          {"zh": "加载失败",    "en": "Load failed"},
     "Format.Error":         {"zh": "格式错误",    "en": "Format error"},
+
+    # Worker errors
+    "Error.FDNotSupported":     {"zh": "固件不支持 CAN FD，已回退到经典 CAN 模式，请取消勾选 CAN FD 选项", "en": "Firmware does not support CAN FD, reverted to Classic CAN. Uncheck CAN FD option"},
+    "Error.CANErrorReg":        {"zh": "CAN 错误寄存器", "en": "CAN error register"},
+    "Error.CANErrorRegHint":    {"zh": "非零表示物理层问题：检查 CANH/CANL 接线、120Ω 终端电阻、GND 共地", "en": "Non-zero means physical layer issue: check CANH/CANL wiring, 120Ω termination, GND"},
+    "Status.ConnectedAt":       {"zh": "已连接 @", "en": "Connected @"},
+    "Error.BitrateFailed":      {"zh": "设置波特率失败", "en": "Failed to set bitrate"},
+    "Error.NotConnected":       {"zh": "未连接，无法发送", "en": "Not connected, cannot send"},
+    "Error.ControllerNotRunning": {"zh": "控制器未启动，无法发送", "en": "Controller not running, cannot send"},
+    "Error.SendFailedRecover":  {"zh": "发送失败: 控制器已自动恢复，请重试", "en": "Send failed: controller auto-recovered, please retry"},
+    "Error.SendFailed":         {"zh": "发送失败", "en": "Send failed"},
+    "Error.ReceiveError":       {"zh": "接收错误", "en": "Receive error"},
+    "Error.BusOffRecover":      {"zh": "BUS-OFF, 已自动恢复控制器", "en": "BUS-OFF, controller auto-recovered"},
+    "Status.Connecting":        {"zh": "正在连接…", "en": "Connecting…"},
+
+    # File dialog titles
+    "File.SaveTraceTitle":      {"zh": "保存 Trace", "en": "Save Trace"},
+    "File.OpenTraceTitle":      {"zh": "加载 Trace", "en": "Open Trace"},
+    "File.TraceSaved":          {"zh": "Trace 已保存到", "en": "Trace saved to"},
+    "File.ASCNotSupported":     {"zh": "ASC 文件请使用回放工具，暂不实现", "en": "ASC files require a replay tool, not yet supported"},
+    "File.SendListSaved":       {"zh": "发送列表已保存", "en": "Send list saved"},
+    "File.SendListLoaded":      {"zh": "发送列表已加载", "en": "Send list loaded"},
+
+    # Quick send
+    "Tools.QuickSendHint":      {"zh": "格式: ID,HEX_DATA    例:  0x123,DE AD BE EF 0A", "en": "Format: ID,HEX_DATA    e.g.  0x123,DE AD BE EF 0A"},
+    "Tools.Sent":               {"zh": "已发送", "en": "Sent"},
+
+    # Trace misc
+    "Trace.CollapseTooltip":    {"zh": "每个 CAN ID 仅显示最新帧", "en": "Show only latest frame per CAN ID"},
+    "Trace.TabLabel":           {"zh": "跟踪", "en": "Trace"},
+
+    # Send dialog
+    "Send.NamePlaceholder":     {"zh": "名称 (可选)", "en": "Name (optional)"},
 
 })

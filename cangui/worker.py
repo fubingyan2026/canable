@@ -48,7 +48,6 @@ class CANWorker(QObject):
     """运行在子线程内的 CAN 控制器。"""
 
     # ---- 信号 ---- #
-    frame_received = Signal(object)        # CANFrame
     state_changed = Signal(bool, str)      # connected, message
     error         = Signal(str)
     bus_stats     = Signal(float, int)     # load%, fps
@@ -69,6 +68,9 @@ class CANWorker(QObject):
         self._last_error_time = 0.0      # 上次错误帧时间
         self._frame_buffer = deque(maxlen=10000)
         self._buffer_mutex = QMutex()
+        # 发送队列：主线程放入，子线程在 run() 中取出执行
+        self._send_queue: deque = deque()
+        self._send_mutex = QMutex()
 
     # ---------- 过滤 ---------- #
     def set_filters(self, filters: List[CANFilter]):
@@ -110,8 +112,7 @@ class CANWorker(QObject):
                 fd_ok = self._bus.check_fd_support()
                 if not fd_ok:
                     self.error.emit(
-                        "⚠️ 固件不支持 CAN FD，已回退到经典 CAN 模式。"
-                        "请取消勾选 CAN FD 选项。"
+                        f"⚠️ {_('Error.FDNotSupported')}"
                     )
                     # 固件不支持 FD，不启用 FD 模式
                     self.fd_mode = False
@@ -131,11 +132,11 @@ class CANWorker(QObject):
                     logger.info("CAN 错误寄存器: %s (0=正常, 非0=物理层问题)", err)
                     if str(err) != "0":
                         self.error.emit(
-                            f"⚠️ CAN 错误寄存器={err} (非零表示物理层问题："
-                            "检查 CANH/CANL 接线、120Ω 终端电阻、GND 共地)")
+                            f"⚠️ {_('Error.CANErrorReg')}={err} ({_('Error.CANErrorRegHint')})"
+                        )
             except Exception:
                 pass
-            self.state_changed.emit(True, f"{_('Status.Connected')} @ {self.bitrate:,} bps")
+            self.state_changed.emit(True, f"{_('Status.ConnectedAt')} {self.bitrate:,} bps")
         except Exception as e:
             self._bus = None
             self._connected = False
@@ -161,50 +162,71 @@ class CANWorker(QObject):
                 self._bus.set_bitrate(bitrate)
                 self.bitrate = bitrate
                 if was_running:
-                    self.state_changed.emit(True, f"已连接 @ {bitrate:,} bps")
+                    self.state_changed.emit(True, f"{_('Status.ConnectedAt')} {bitrate:,} bps")
             except Exception as e:
-                self.error.emit(f"设置波特率失败: {e}")
+                self.error.emit(f"{_('Error.BitrateFailed')}: {e}")
         else:
             self.bitrate = bitrate
 
     def _calc_bus_load(self, now: float, frame: CANFrame, fps: int) -> float:
         if fps == 0 or not self.bitrate:
             return 0.0
+        # 按帧实际位长度估算（含 SOF/控制/CRC/ACK/EOF/IFS 的固定开销）
+        # Classic CAN: ~47 固定 + 8*N_data + stuff bits (~19%)
+        # CAN FD:     ~67 固定 + 8*N_data + stuff bits
+        data_len = len(frame.data)
         if frame.fd:
-            arb_bits = 128
-            data_bits = len(frame.data) * 10
+            fixed_bits = 67
+            data_bits = data_len * 8
             if frame.brs and self.data_bitrate and self.data_bitrate > 0:
-                effective_bits = arb_bits + data_bits * (self.bitrate / self.data_bitrate)
+                # 数据相用数据波特率传输
+                effective_bits = fixed_bits + data_bits * (self.bitrate / self.data_bitrate)
             else:
-                effective_bits = arb_bits + data_bits
+                effective_bits = fixed_bits + data_bits
         else:
-            effective_bits = 128
+            # Classic: 固定开销 ~47 bits (SOF+Arbitration+Control+CRC+ACK+EOF+IFS)
+            effective_bits = 47 + data_len * 8
+        # 粗略加上 stuff bits (约 19% 冗余)
+        effective_bits *= 1.19
         return min(100.0, fps * effective_bits * 100.0 / self.bitrate)
 
     @Slot(object)
     def send(self, frame: CANFrame):
-        if self._bus is None or not self._connected:
-            self.error.emit("未连接，无法发送")
+        """主线程调用：将帧放入发送队列，由 run() 循环在子线程实际发送。
+
+        这样避免了跨线程直接访问 _bus（与 receive() 循环竞争）。
+        """
+        if not self._connected:
+            self.error.emit(_("Error.NotConnected"))
             return
-        if not self._bus.running:
-            self.error.emit("控制器未启动，无法发送")
+        with QMutexLocker(self._send_mutex):
+            self._send_queue.append(frame)
+
+    def _process_send_queue(self):
+        """在 run() 循环中调用，从队列取出帧并实际发送（子线程上下文）。"""
+        if not self._send_queue:
             return
-        # 标记为本机发送，让 trace 面板用绿色区分
-        frame.is_tx = True
-        frame.timestamp = time.time()
-        try:
-            self._bus.send(frame)
-            logger.info("TX  %s", frame)
-            # 同步进 trace 列表（不等回环），让用户立即看到发送成功
-            self.frame_received.emit(frame)
-        except usb.core.USBError as e:
-            # Pipe error: canable_sdk 已在 send() 内部完成 recover + TX 节流
-            # 此处仅通知 UI, 不重复恢复
-            logger.warning("TX  USB 错误 (已自动恢复): %s", e)
-            self.error.emit("发送失败: 控制器已自动恢复，请重试")
-        except Exception as e:
-            self.error.emit(f"发送失败: {e}")
-            logger.warning("TX  失败 %s : %s", frame, e)
+        # 批量取出，减少锁竞争
+        with QMutexLocker(self._send_mutex):
+            pending = list(self._send_queue)
+            self._send_queue.clear()
+        for frame in pending:
+            if not self._running or self._bus is None:
+                break
+            frame.is_tx = True
+            frame.timestamp = time.time()
+            try:
+                self._bus.send(frame)
+                logger.debug("TX  %s", frame)
+                with QMutexLocker(self._buffer_mutex):
+                    self._frame_buffer.append(frame)
+            except Exception as e:
+                if isinstance(e, usb.core.USBError):
+                    logger.warning("TX  USB 错误 (已自动恢复): %s", e)
+                    self.error.emit(_("Error.SendFailedRecover"))
+                else:
+                    self.error.emit(f"{_('Error.SendFailed')}: {e}")
+                    logger.warning("TX  失败 %s : %s", frame, e)
 
     # ---------- 主循环 ---------- #
     @Slot()
@@ -214,11 +236,14 @@ class CANWorker(QObject):
         last_stats_emit = 0.0
 
         while self._running and self._bus is not None:
+            # 处理主线程投递的发送请求
+            self._process_send_queue()
+
             try:
                 frame = self._bus.receive(timeout=0.01)
             except Exception as e:
                 if self._running:
-                    self.error.emit(f"接收错误: {e}")
+                    self.error.emit(f"{_('Error.ReceiveError')}: {e}")
                     logger.warning("RX  失败: %s", e)
                 time.sleep(0.1)
                 continue
@@ -246,7 +271,7 @@ class CANWorker(QObject):
                             logger.warning("BUS-OFF 持续, 自动恢复控制器")
                             try:
                                 self._bus.recover()
-                                self.error.emit("BUS-OFF, 已自动恢复控制器")
+                                self.error.emit(f"{_('Error.BusOffRecover')}")
                             except Exception as e:
                                 logger.warning("自动恢复失败: %s", e)
                             self._error_count = 0
@@ -270,7 +295,7 @@ class CANWorker(QObject):
                 frame_times.append(now)
                 while frame_times and frame_times[0] < now - window_s:
                     frame_times.popleft()
-                logger.info("RX  %s", frame)
+                logger.debug("RX  %s", frame)
                 if self._pass(frame):
                     with QMutexLocker(self._buffer_mutex):
                         self._frame_buffer.append(frame)
@@ -280,9 +305,11 @@ class CANWorker(QObject):
             if frame is not None and fps > 0:
                 load = self._calc_bus_load(now, frame, fps)
 
-            if now - last_stats_emit >= 0.1:
-                self.bus_stats.emit(load, fps)
-                last_stats_emit = now
+            # 仅在帧到来或负载非零时 emit，空闲时不打扰 UI
+            if frame is not None or load > 0.0 or last_stats_emit == 0.0:
+                if now - last_stats_emit >= 0.1:
+                    self.bus_stats.emit(load, fps)
+                    last_stats_emit = now
 
         # cleanup: close bus from correct thread
         if self._bus is not None:

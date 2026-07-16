@@ -12,10 +12,13 @@ from typing import Optional
 from .constants import (
     CAN_FD_DLC_MAP, DLC_BOUNDARIES,
     MSG_TxFrame,
-    CAN_ID_29Bit, CAN_ID_RTR, CAN_MASK_11, CAN_MASK_29,
+    CAN_ID_Error, CAN_ID_29Bit, CAN_ID_RTR, CAN_MASK_11, CAN_MASK_29,
+    ECHO_RxData,
     FRM_FDF, FRM_BRS, FRM_ESI,
     ERID_Bus_is_off, ERID_No_ACK_received, ERID_CRC_Error,
     ERID_Tx_Timeout, ERID_Arbitration_lost,
+    ERID_Controller_problem, ERID_Protocol_violation, ERID_Transceiver_error,
+    ERID_Bus_error, ERID_Controller_restarted,
     BUS_StatusOff, BUS_StatusPassive, BUS_StatusWarning, ER1_Bus_is_back_active,
     APP_CanTxOverflow, APP_CanTxTimeout, APP_CanRxFail, APP_CanTxFail, APP_UsbInOverflow,
 )
@@ -30,11 +33,15 @@ def _pad_to_dlc(data_len: int) -> int:
     return 64
 
 
+# Pre-computed sorted FD DLC entries (dlc > 8 only)
+_FD_DLC_SORTED = sorted((dlc, length) for dlc, length in CAN_FD_DLC_MAP.items() if dlc > 8)
+
+
 def _data_len_to_dlc(data_len: int) -> int:
     if data_len <= 8:
         return data_len
-    for dlc, length in sorted(CAN_FD_DLC_MAP.items()):
-        if dlc > 8 and length >= data_len:
+    for dlc, length in _FD_DLC_SORTED:
+        if length >= data_len:
             return dlc
     return 15
 
@@ -109,12 +116,11 @@ class CANFrame:
         if self.esi:
             flags |= FRM_ESI
 
+        # ElmueSoft 是变长协议：数据长度由 header.size 携带，不应填充。
+        # 仅 Classic CAN 限制为最多 8 字节（截断，不填充）。
         raw_data = bytes(self.data)
-        if self.fd:
-            padded_len = _pad_to_dlc(len(raw_data))
-            raw_data = raw_data.ljust(padded_len, b'\x00')
-        else:
-            raw_data = raw_data.ljust(min(len(raw_data), 8), b'\x00')[:8] if raw_data else b''
+        if not self.fd:
+            raw_data = raw_data[:8]
 
         size = 8 + len(raw_data)
         header = struct.pack('<BB', size, MSG_TxFrame)
@@ -202,10 +208,24 @@ class CANFrame:
         is_error = bool(can_id_full & CAN_ID_Error)
         if is_error:
             parts = []
-            if can_id_full & ERID_Bus_is_off:
-                parts.append("BUS-OFF")
+            if can_id_full & ERID_Tx_Timeout:
+                parts.append("TX-TIMEOUT")
+            if can_id_full & ERID_Arbitration_lost:
+                parts.append("ARB-LOST")
+            if can_id_full & ERID_Controller_problem:
+                parts.append("CTRL-PROBLEM")
+            if can_id_full & ERID_Protocol_violation:
+                parts.append("PROTO-VIOLATION")
+            if can_id_full & ERID_Transceiver_error:
+                parts.append("XCVR-ERR")
             if can_id_full & ERID_No_ACK_received:
                 parts.append("NO-ACK")
+            if can_id_full & ERID_Bus_is_off:
+                parts.append("BUS-OFF")
+            if can_id_full & ERID_Bus_error:
+                parts.append("BUS-ERR")
+            if can_id_full & ERID_Controller_restarted:
+                parts.append("CTRL-RESTARTED")
             if can_id_full & ERID_CRC_Error:
                 parts.append("CRC-ERR")
             if not parts:
@@ -216,7 +236,7 @@ class CANFrame:
                 _error_info=" ".join(parts),
             )
 
-        is_tx = (echo_id != 0xFFFFFFFF)
+        is_tx = (echo_id != ECHO_RxData)
         return cls(
             can_id=can_id, data=bytes(data), extended=extended, rtr=rtr,
             fd=is_fd, brs=bool(flags & FRM_BRS), esi=bool(flags & FRM_ESI),

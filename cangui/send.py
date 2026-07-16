@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QSettings
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QTableWidget, QTableWidgetItem, QHeaderView,
@@ -32,6 +32,14 @@ def _csv_dir():
     return _SEND_DIR
 
 
+def _parse_bool(val) -> bool:
+    """宽松解析 CSV 中的布尔字段，兼容 True/true/1/yes 等。"""
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    return s in ("true", "1", "yes", "y", "t")
+
+
 
 # --------------------------------------------------------------------------- #
 #  数据结构
@@ -47,7 +55,7 @@ class SendEntry:
     dlc:       int   = 8
     data:      bytes = b'\x00' * 8
     period_ms: float = 100.0
-    enabled:   bool  = True
+    enabled:   bool  = False
     sent:      int   = 0
     timer:     Optional[QTimer] = field(default=None, repr=False, compare=False)
 
@@ -72,7 +80,7 @@ class SendDialog(QDialog):
         form = QFormLayout(self)
 
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("Name (optional)")
+        self.name_edit.setPlaceholderText(_("Send.NamePlaceholder"))
         form.addRow(_("Send.DlgName"), self.name_edit)
 
         self.id_edit = QLineEdit()
@@ -81,8 +89,8 @@ class SendDialog(QDialog):
         type_bar = QHBoxLayout()
         self.ext_chk = QCheckBox(_("Send.DlgExt"))
         self.rtr_chk = QCheckBox(_("Send.DlgRTR"))
-        self.fd_chk = QCheckBox("CAN FD")
-        self.brs_chk = QCheckBox("BRS")
+        self.fd_chk = QCheckBox(_("Send.DlgFD"))
+        self.brs_chk = QCheckBox(_("Send.DlgBRS"))
         type_bar.addWidget(self.ext_chk)
         type_bar.addWidget(self.rtr_chk)
         type_bar.addWidget(self.fd_chk)
@@ -106,9 +114,6 @@ class SendDialog(QDialog):
         self.period_spin.setSingleStep(10.0)
         form.addRow(_("Send.DlgPeriod"), self.period_spin)
 
-        self.enable_chk = QCheckBox(_("Send.DlgEnabled"))
-        form.addRow("", self.enable_chk)
-
         # 绑定当前值
         self.name_edit.setText(entry.name)
         self.id_edit.setText(f"{entry.can_id:X}")
@@ -122,7 +127,6 @@ class SendDialog(QDialog):
             self.dlc_combo.setCurrentIndex(idx)
         self.data_edit.setText(entry.data.hex(' ').upper())
         self.period_spin.setValue(entry.period_ms)
-        self.enable_chk.setChecked(entry.enabled)
 
         # FD 模式限制
         if not fd_mode:
@@ -146,6 +150,16 @@ class SendDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         form.addRow(btns)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        geo = QSettings("canable", "CANable2.5").value("send_dlg_geo")
+        if geo:
+            self.restoreGeometry(geo)
+
+    def hideEvent(self, e):
+        QSettings("canable", "CANable2.5").setValue("send_dlg_geo", self.saveGeometry())
+        super().hideEvent(e)
 
     def _on_fd_toggled(self, checked: bool):
         self.brs_chk.setEnabled(checked)
@@ -183,7 +197,9 @@ class SendDialog(QDialog):
         except ValueError:
             e.data = b'\x00' * (CANFrame.dlc_to_len(e.dlc) if e.fd else min(e.dlc, 8))
         e.period_ms = self.period_spin.value()
-        e.enabled   = self.enable_chk.isChecked()
+        # enabled 由面板底部按钮控制，不在对话框中设置
+        if base is None:
+            e.enabled = False
         return e
 
 
@@ -238,8 +254,8 @@ class SendPanel(QWidget):
         self.edit_btn  = QPushButton(_("Send.Edit"))
         self.del_btn   = QPushButton(_("Send.Delete"))
         self.send_btn  = QPushButton(_("Send.SendOnce"))
-        self.start_btn = QPushButton(_("Send.StartAll"))
-        self.stop_btn  = QPushButton(_("Send.StopAll"))
+        self.start_btn = QPushButton(_("Send.Start"))
+        self.stop_btn  = QPushButton(_("Send.Stop"))
         self.clear_btn = QPushButton(_("Send.ClearAll"))
         self.send_btn.setObjectName("sendBtn")
         for b in (self.add_btn, self.edit_btn, self.del_btn, self.send_btn,
@@ -371,16 +387,24 @@ class SendPanel(QWidget):
         self._refresh_row(idx, e)
 
     def _on_start_all(self):
-        for e in self.entries:
-            e.enabled = True
+        idx = self._selected_index()
+        if idx is None:
+            self.status_label.setText(_("Send.SelectRow")); return
+        self.entries[idx].enabled = True
         self._sync_timers()
-        self._refresh_all()
-        self.status_label.setText(_("Send.StartAll"))
+        self._refresh_row(idx, self.entries[idx])
+        self.status_label.setText(_("Send.Started"))
 
     def _on_stop_all(self):
-        self.stop_all_timers()
-        self._refresh_all()
-        self.status_label.setText(_("Send.StopAll"))
+        idx = self._selected_index()
+        if idx is None:
+            self.status_label.setText(_("Send.SelectRow")); return
+        e = self.entries[idx]
+        e.enabled = False
+        if e.timer and e.timer.isActive():
+            e.timer.stop()
+        self._refresh_row(idx, e)
+        self.status_label.setText(_("Send.Stopped"))
 
     def _on_clear(self):
         if self.entries and QMessageBox.question(
@@ -404,8 +428,8 @@ class SendPanel(QWidget):
         self.edit_btn.setText(_("Send.Edit"))
         self.del_btn.setText(_("Send.Delete"))
         self.send_btn.setText(_("Send.SendOnce"))
-        self.start_btn.setText(_("Send.StartAll"))
-        self.stop_btn.setText(_("Send.StopAll"))
+        self.start_btn.setText(_("Send.Start"))
+        self.stop_btn.setText(_("Send.Stop"))
         self.clear_btn.setText(_("Send.ClearAll"))
         self.status_label.setText(_("Send.Ready"))
         self.table.setHorizontalHeaderLabels(self.HEADERS())
@@ -464,16 +488,16 @@ class SendPanel(QWidget):
                 self.entries.append(SendEntry(
                     name=row.get("name", ""),
                     can_id=int(row["can_id"], 16),
-                    extended=row["extended"].strip() == "True",
-                    rtr=row["rtr"].strip() == "True",
-                    fd=row["fd"].strip() == "True",
-                    brs=row["brs"].strip() == "True",
+                    extended=_parse_bool(row["extended"]),
+                    rtr=_parse_bool(row["rtr"]),
+                    fd=_parse_bool(row["fd"]),
+                    brs=_parse_bool(row["brs"]),
                     dlc=int(row["dlc"]),
                     data=bytes.fromhex(row["data"].replace(" ", "")),
                     period_ms=float(row["period_ms"]),
-                    enabled=row["enabled"].strip() == "True",
+                    enabled=_parse_bool(row["enabled"]),
                 ))
-        self._refresh_all()
+            self._refresh_all()
         self._sync_timers()
 
     @staticmethod

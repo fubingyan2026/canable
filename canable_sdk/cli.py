@@ -42,24 +42,5 @@ def _cli():
             pass
 
 
-def _cli_fd_demo():
-    logging.basicConfig(level=logging.INFO)
-
-    with ZDTCanable() as bus:
-        bus.fd_mode = True
-        bus.set_bitrate(500_000)
-        bus.set_data_bitrate(2_000_000)
-        bus.start()
-
-        print("CAN FD receive demo (Ctrl+C to exit)")
-        try:
-            while True:
-                frame = bus.receive(timeout=1.0)
-                if frame is not None:
-                    print(frame)
-        except KeyboardInterrupt:
-            pass
-
-
 if __name__ == "__main__":
     _cli()

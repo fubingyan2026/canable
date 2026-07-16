@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import List
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QTableWidget, QTableWidgetItem, QHeaderView,
                                 QAbstractItemView, QDialog, QDialogButtonBox,
@@ -13,6 +14,17 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from .worker import CANFilter
 from .i18n import _
 from .style import id_color, FG_DIM, FG_ACCENT
+
+
+def _make_item(text, align=None, color=None):
+    """创建不可编辑的 QTableWidgetItem，可选对齐和背景色。"""
+    x = QTableWidgetItem(text)
+    if align is not None:
+        x.setTextAlignment(align)
+    if color is not None:
+        x.setBackground(QBrush(QColor(color)))
+    x.setFlags(x.flags() & ~Qt.ItemIsEditable)
+    return x
 
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +53,16 @@ class FilterDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         form.addRow(btns)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        geo = QSettings("canable", "CANable2.5").value("filter_dlg_geo")
+        if geo:
+            self.restoreGeometry(geo)
+
+    def hideEvent(self, e):
+        QSettings("canable", "CANable2.5").setValue("filter_dlg_geo", self.saveGeometry())
+        super().hideEvent(e)
 
     def get_filter(self) -> CANFilter:
         try:
@@ -114,22 +136,13 @@ class FilterPanel(QWidget):
     def _refresh(self):
         self.table.setRowCount(len(self.filters))
         for i, f in enumerate(self.filters):
-            def it(text, align=None, color=None):
-                x = QTableWidgetItem(text)
-                if align is not None:
-                    x.setTextAlignment(align)
-                if color is not None:
-                    from PySide6.QtGui import QBrush, QColor
-                    x.setBackground(QBrush(QColor(color)))
-                x.setFlags(x.flags() & ~Qt.ItemIsEditable)
-                return x
-            self.table.setItem(i, self.COL_IDX, it(f"{i+1}", Qt.AlignCenter))
+            self.table.setItem(i, self.COL_IDX, _make_item(f"{i+1}", Qt.AlignCenter))
             self.table.setItem(i, self.COL_RANGE,
-                it(f"0x{f.can_id_min:X} - 0x{f.can_id_max:X}"))
+                _make_item(f"0x{f.can_id_min:X} - 0x{f.can_id_max:X}"))
             self.table.setItem(i, self.COL_TYPE,
-                it("Ext" if f.extended else "Std", Qt.AlignCenter))
+                _make_item("Ext" if f.extended else "Std", Qt.AlignCenter))
             self.table.setItem(i, self.COL_ACTION,
-                it(_("Filter.Drop") if f.pass_discard else _("Filter.Pass"), Qt.AlignCenter))
+                _make_item(_("Filter.Drop") if f.pass_discard else _("Filter.Pass"), Qt.AlignCenter))
 
     def _selected_index(self):
         rows = self.table.selectionModel().selectedRows()
@@ -182,10 +195,17 @@ class FilterPanel(QWidget):
             for f in self.filters
         ]
 
-    def from_dict_list(self, lst):
+    def from_dict_list(self, lst, emit: bool = True):
+        """从字典列表加载过滤器。
+
+        Args:
+            emit: 是否在加载后 emit filters_changed 信号。
+                  启动时从 settings 恢复应传 emit=False，避免 worker 未就绪时触发。
+        """
         self.filters = [CANFilter(**d) for d in lst]
         self._refresh()
-        self._emit()
+        if emit:
+            self._emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -263,20 +283,11 @@ class StatisticsPanel(QWidget):
 
         # 表格
         self.table.setRowCount(len(summary))
-        from PySide6.QtGui import QBrush, QColor
         for i, (can_id, ext, count, period) in enumerate(summary):
-            def it(text, align=None, color=None):
-                x = QTableWidgetItem(text)
-                if align is not None:
-                    x.setTextAlignment(align)
-                if color is not None:
-                    x.setBackground(QBrush(QColor(color)))
-                x.setFlags(x.flags() & ~Qt.ItemIsEditable)
-                return x
-            self.table.setItem(i, 0, it(f"{can_id:08X}" if ext else f"{can_id:03X}",
+            self.table.setItem(i, 0, _make_item(f"{can_id:08X}" if ext else f"{can_id:03X}",
                                          color=id_color(can_id, ext)))
-            self.table.setItem(i, 1, it("Ext" if ext else "Std", Qt.AlignCenter))
-            self.table.setItem(i, 2, it(str(count), Qt.AlignCenter))
-            self.table.setItem(i, 3, it(f"{period:.1f}" if period else "-",
+            self.table.setItem(i, 1, _make_item("Ext" if ext else "Std", Qt.AlignCenter))
+            self.table.setItem(i, 2, _make_item(str(count), Qt.AlignCenter))
+            self.table.setItem(i, 3, _make_item(f"{period:.1f}" if period else "-",
                                          Qt.AlignCenter))
-            self.table.setItem(i, 4, it(""))
+            self.table.setItem(i, 4, _make_item(""))
