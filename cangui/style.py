@@ -70,7 +70,7 @@ def id_color(can_id: int, extended: bool = False) -> str:
 
 
 def _make_qss(p: dict) -> str:
-    _check_svg = os.path.join(_HERE, "check.svg")
+    _check_svg = os.path.join(_HERE, "check.svg").replace("\\", "/")
     return f"""
 QWidget {{
     background-color: {p['BG_MAIN']};
@@ -265,7 +265,7 @@ QTableView::item:selected, QTableWidget::item:selected {{
 }}
 
 QTableView::item:alternate, QTableWidget::item:alternate {{
-    background-color: {p['BG_INPUT']};
+    background-color: transparent;
 }}
 
 QTableView::item:alternate:selected, QTableWidget::item:alternate:selected {{

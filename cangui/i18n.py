@@ -211,6 +211,7 @@ _TR.update({
     "Error.ReceiveError":       {"zh": "接收错误", "en": "Receive error"},
     "Error.BusOffRecover":      {"zh": "BUS-OFF, 已自动恢复控制器", "en": "BUS-OFF, controller auto-recovered"},
     "Status.Connecting":        {"zh": "正在连接…", "en": "Connecting…"},
+    "Status.Disconnecting":     {"zh": "正在断开，请稍候…", "en": "Disconnecting, please wait…"},
 
     # File dialog titles
     "File.SaveTraceTitle":      {"zh": "保存 Trace", "en": "Save Trace"},

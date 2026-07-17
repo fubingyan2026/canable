@@ -91,7 +91,12 @@ class TraceModel(QAbstractTableModel):
                 typ = "Ext"
             else:
                 typ = "Std"
-            dlc = str(frame.dlc)
+            dlc_code = frame.dlc
+            data_len = CANFrame.dlc_to_len(dlc_code)
+            if dlc_code == data_len:
+                dlc = str(dlc_code)
+            else:
+                dlc = f"{dlc_code} ({data_len})"
             data = frame.data.hex(' ').upper()
             ascii = frame.data.translate(_ASCII_TRANSLATION)
         return [

@@ -127,8 +127,9 @@ class ZDTCanable:
                 self.stop()
             except Exception:
                 pass
+        # 关闭 LED 识别（非关键操作，短超时避免阻塞断开）
         try:
-            self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0))
+            self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0), timeout=100)
         except Exception:
             pass
         if self.dev is not None:

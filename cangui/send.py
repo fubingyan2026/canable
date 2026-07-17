@@ -40,6 +40,13 @@ def _parse_bool(val) -> bool:
     return s in ("true", "1", "yes", "y", "t")
 
 
+def _dlc_label(dlc_code: int) -> str:
+    """DLC 显示：同时展示 DLC 码和实际字节长度（CAN FD 时不同）。"""
+    data_len = CANFrame.dlc_to_len(dlc_code)
+    if dlc_code == data_len:
+        return str(dlc_code)
+    return f"{dlc_code} ({data_len})"
+
 
 # --------------------------------------------------------------------------- #
 #  数据结构
@@ -296,7 +303,7 @@ class SendPanel(QWidget):
             it(e.name if e.name else f"#{row+1}", align_center),
             it(f"{e.can_id:08X}" if e.extended else f"{e.can_id:03X}"),
             it("RTR" if e.rtr else ("FD+BRS" if e.fd and e.brs else ("FD" if e.fd else ("Ext" if e.extended else "Std"))), align_center),
-            it(str(e.dlc),    align_center),
+            it(_dlc_label(e.dlc), align_center),
             it(e.data.hex(' ').upper()),
             it(f"{e.period_ms:g} ms", align_center),
             it(str(e.sent),   align_center),

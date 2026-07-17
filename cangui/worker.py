@@ -147,6 +147,12 @@ class CANWorker(QObject):
     def disconnect(self):
         self._running = False
         self._connected = False
+        # 立即停止 CAN 控制器（短超时，不阻塞）
+        if self._bus is not None:
+            try:
+                self._bus.stop()
+            except Exception:
+                pass
 
     def take_batch(self):
         with QMutexLocker(self._buffer_mutex):
@@ -311,13 +317,15 @@ class CANWorker(QObject):
                     self.bus_stats.emit(load, fps)
                     last_stats_emit = now
 
-        # cleanup: close bus from correct thread
+        # cleanup: 停止 CAN 控制器并释放 USB 资源
         if self._bus is not None:
+            logger.debug("cleaning up USB bus...")
             try:
                 self._bus.close()
             except Exception:
                 pass
             self._bus = None
+            logger.debug("USB bus closed")
         self.state_changed.emit(False, _("Status.Disconnected"))
 
 

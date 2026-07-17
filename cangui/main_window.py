@@ -52,7 +52,9 @@ class MainWindow(QMainWindow):
 
         # 状态
         self._connected = False
+        self._disconnecting = False  # 异步断开进行中，阻止重连
         self._worker: Optional[CANWorker] = None
+        self._worker_thread: Optional[QThread] = None
         self._frame_count = 0
         self._last_load = 0.0
         self._last_fps = 0
@@ -105,7 +107,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         # 中心：Tab
         self.trace_panel  = TracePanel(self)
-        self.trace_panel.view.setAlternatingRowColors(True)
+        self.trace_panel.view.setAlternatingRowColors(False)
         center_tabs = QTabWidget()
         center_tabs.addTab(self.trace_panel, _("Trace.TabLabel"))
         self._center_tabs = center_tabs
@@ -395,13 +397,22 @@ class MainWindow(QMainWindow):
     def _connect(self):
         if self._worker is not None:
             return
+        if self._disconnecting:
+            self.statusBar().showMessage(_("Status.Disconnecting"), 2000)
+            return
+        # 清理上次残留的线程引用
+        if self._worker_thread is not None:
+            if self._worker_thread.isRunning():
+                self._worker_thread.quit()
+                self._worker_thread.wait(500)
+            self._worker_thread = None
         # 注意：worker 不能有 parent，否则 moveToThread 会被拒绝
         self._worker = CANWorker()
         self._worker.bitrate = self.bitrate_combo.currentData()
         self._worker.fd_mode = self.fd_chk.isChecked()
         if self.fd_chk.isChecked():
             self._worker.data_bitrate = self.data_bitrate_combo.currentData()
-        # 使用 _batch_timer 30ms 批量刷新，不连接逐帧 frame_received 信号
+        # 使用 _batch_timer 100ms 批量刷新，不连接逐帧 frame_received 信号
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.error.connect(self._on_error)
         self._worker.bus_stats.connect(self._on_bus_stats)
@@ -409,38 +420,47 @@ class MainWindow(QMainWindow):
         # 同步过滤器
         self._worker.set_filters(self.filter_panel.filters)
         # 在独立线程跑 worker 的 connect() + run() 循环
-        # 注意：worker 线程不设 parent，避免重复连接时旧线程未释放
         self._worker_thread = QThread()
         self._worker.moveToThread(self._worker_thread)
         # connect() 先执行（阻塞打开设备），成功后 run() 执行（阻塞循环）
         # 若 connect() 失败，_bus 为 None，run() 的 while 条件直接不满足
         self._worker_thread.started.connect(self._worker.connect)
         self._worker_thread.started.connect(self._worker.run)
-        # 线程结束时清理 worker
-        self._worker_thread.finished.connect(self._worker.deleteLater)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        # run() 返回后必须 quit() 让 QThread::exec() 退出，否则 finished 永远不会发出
+        self._worker_thread.started.connect(self._worker_thread.quit)
+        # 线程结束时清理
+        self._worker_thread.finished.connect(self._on_worker_thread_finished)
         self._worker_thread.start()
         self._update_connect_ui(True, _("Status.Connecting"))
 
     def _disconnect(self):
         if self._worker is None:
             return
+        self._disconnecting = True
         worker = self._worker
-        thread = getattr(self, "_worker_thread", None)
-        # 通知 worker 线程退出（run() 的 while 循环会在下次检查时退出，最多 10ms）
+        # 断开所有信号，防止后台清理时的回调干扰 UI
+        try:
+            worker.state_changed.disconnect()
+            worker.error.disconnect()
+            worker.bus_stats.disconnect()
+            worker.noack_warning.disconnect()
+        except Exception:
+            pass
+        self._worker = None
+        # 通知 worker 线程退出（run() 循环在下一次 receive() 返回后退出，最多 10ms）
         with QMutexLocker(worker._mutex):
             worker._running = False
             worker._connected = False
-        # 等待线程真正退出（最多 2 秒），避免僵尸线程
-        if thread is not None:
-            thread.wait(2000)
-            # 若 wait 超时（线程卡在 USB 阻塞调用），terminate 作为最后手段
-            if thread.isRunning():
-                logger.warning("worker 线程未在 2s 内退出，强制终止")
-                thread.terminate()
-                thread.wait(1000)
-        self._worker = None
+        # 立即更新 UI，不等待线程退出
         self._update_connect_ui(False, _("Status.Disconnected"))
+
+    @Slot()
+    def _on_worker_thread_finished(self):
+        """后台清理完成回调：释放 worker/thread 引用，允许重连。"""
+        self._disconnecting = False
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
 
     def _update_connect_ui(self, connected: bool, msg: str):
         self._connected = connected

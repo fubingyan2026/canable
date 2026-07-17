@@ -1,13 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 优化要点（针对启动速度）：
-#   1. onedir 模式（COLLECT 段）— 避免 onefile 解压到 /tmp 的时间
-#   2. upx=False — UPX 运行时解压会显著拖慢启动
-#   3. excludes 排除所有未使用的 Qt 模块 — 减小体积、减少动态库加载时间
+# onefile 模式：所有文件打包进单个 exe
+#   upx=False — UPX 运行时解压会显著拖慢启动
+#   排除所有未使用的 Qt 模块 — 减小体积
 
 a = Analysis(
     ['cangui.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ('libusb-1.0.dll', '.'),
+    ],
     datas=[
         ('cangui/logo.svg', 'cangui'),
         ('cangui/check.svg', 'cangui'),
@@ -21,7 +22,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # —— 未使用的 Qt 模块（按字母顺序）——
         'PySide6.Qt3DAnimation',
         'PySide6.Qt3DCore',
         'PySide6.Qt3DExtras',
@@ -72,7 +72,6 @@ a = Analysis(
         'PySide6.QtWebEngineWidgets',
         'PySide6.QtWebSockets',
         'PySide6.QtWebView',
-        # —— 其它未使用的标准库模块 ——
         'tkinter',
         'unittest',
         'pydoc',
@@ -89,13 +88,15 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,       # onefile：打包所有二进制文件
     name='CANable2.5',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
-    upx=False,                  # 关闭 UPX：启动更快
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -103,14 +104,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['cangui/logo.ico'],
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip_binaries=True,
-    upx=False,                  # 关闭 UPX：启动更快
-    upx_exclude=[],
-    name='CANable2.5',
 )
