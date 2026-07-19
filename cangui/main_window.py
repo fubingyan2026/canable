@@ -293,13 +293,6 @@ class MainWindow(QMainWindow):
         act_save.triggered.connect(self._on_save_trace)
         file_menu.addAction(act_save)
         file_menu.addSeparator()
-        act_save_send = QAction(_("File.SaveSendList"), self)
-        act_save_send.triggered.connect(self._on_save_send_list)
-        file_menu.addAction(act_save_send)
-        act_load_send = QAction(_("File.LoadSendList"), self)
-        act_load_send.triggered.connect(self._on_load_send_list)
-        file_menu.addAction(act_load_send)
-        file_menu.addSeparator()
         act_quit = QAction(_("File.Exit"), self)
         act_quit.setShortcut(QKeySequence.Quit)
         act_quit.triggered.connect(self.close)
@@ -370,8 +363,6 @@ class MainWindow(QMainWindow):
             (self._plugins_menu, "Menu.Plugins"),
             (act_open, "File.OpenTrace"),
             (act_save, "File.SaveTrace"),
-            (act_save_send, "File.SaveSendList"),
-            (act_load_send, "File.LoadSendList"),
             (act_quit, "File.Exit"),
             (act_send_once, "Tools.QuickSend"),
             (act_about, "Help.About"),
@@ -696,7 +687,7 @@ class MainWindow(QMainWindow):
     def _on_save_trace(self):
         path, _selected_filter = QFileDialog.getSaveFileName(
             self, _("File.SaveTraceTitle"), "trace.csv",
-            "CSV (*.csv);;JSON Lines (*.jsonl);;ASC (*.asc)")
+            "CSV (*.csv);;JSON Lines (*.jsonl)")
         if not path:
             return
         if path.endswith(".csv"):
@@ -718,31 +709,11 @@ class MainWindow(QMainWindow):
                         "dlc": fr.dlc, "data": fr.data.hex(),
                         "is_tx": fr.is_tx, "is_error": fr.is_error,
                     }) + "\n")
-        else:
-            # Vector ASC 风格（简化）
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("date Wed Jan 01 00:00:00.000 2025\n")
-                f.write("base hex  timestamps absolute\n")
-                f.write("internal events logged\n")
-                f.write("// version 13.0.0\n")
-                f.write("Begin Triggerblock\n")
-                t0 = self.trace_panel.view._model._rows[0].timestamp \
-                    if self.trace_panel.view._model._rows else 0.0
-                for fr in self.trace_panel.view._model._rows:
-                    ts = fr.timestamp - t0
-                    if fr.extended:
-                        head = f"{fr.can_id:08X}x"
-                    else:
-                        head = f"{fr.can_id:03X}x" if fr.rtr else f"{fr.can_id:03X}"
-                    d = " ".join(f"{b:02X}" for b in fr.data[:fr.dlc]) or "R"
-                    ch = "ERR" if fr.is_error else ("TX" if fr.is_tx else "CAN1")
-                    f.write(f"{ts:9.6f} {ch} {head} {d} Length {fr.dlc} CRC OK\n")
-                f.write("End TriggerBlock\n")
         self.status_label.setText(f"{_('File.TraceSaved')} {path}")
 
     def _on_load_trace(self):
         path, _selected_filter = QFileDialog.getOpenFileName(
-            self, _("File.OpenTraceTitle"), "", "CSV (*.csv);;JSON Lines (*.jsonl);;ASC (*.asc)")
+            self, _("File.OpenTraceTitle"), "", "CSV (*.csv);;JSON Lines (*.jsonl)")
         if not path:
             return
         try:
@@ -778,24 +749,8 @@ class MainWindow(QMainWindow):
                             _error_info="ERR" if is_err else "",
                         )
                         self.trace_panel.append_frame(fr)
-            else:
-                QMessageBox.information(self, _("File.OpenTrace"), _("File.ASCNotSupported"))
         except Exception as e:
-            QMessageBox.critical(self, _("File.LoadSendList"), f"{_('Load.Failed')}: {e}")
-
-    def _on_save_send_list(self):
-        self.send_panel.to_csv(self.send_panel.csv_path())
-        self.status_label.setText(f"{_('File.SendListSaved')}: {self.send_panel.csv_path()}")
-
-    def _on_load_send_list(self):
-        if not self.send_panel.exists():
-            self.status_label.setText(_("Scan.NoHistory"))
-            return
-        try:
-            self.send_panel.from_csv(self.send_panel.csv_path())
-            self.status_label.setText(f"{_('File.SendListLoaded')}: {self.send_panel.csv_path()}")
-        except Exception as e:
-            QMessageBox.critical(self, _("File.LoadSendList"), f"{_('Load.Failed')}: {e}")
+            QMessageBox.critical(self, _("File.OpenTraceTitle"), f"{_('Load.Failed')}: {e}")
 
     # ------------------------------------------------------------ 快速发送
     def _on_quick_send(self):

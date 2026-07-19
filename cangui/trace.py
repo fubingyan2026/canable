@@ -19,19 +19,12 @@ from .style import id_color, FG_DIM, FG_ACCENT, BG_TX, BG_ERROR
 DEFAULT_MAX_ROWS = 30_000
 
 
-# 预生成 ASCII 转换表：可打印字符保留，其余替换为 '.'
-_ASCII_TRANSLATION = bytes.maketrans(
-    bytes(range(256)),
-    bytes(b if 32 <= b < 127 else ord('.') for b in range(256)),
-)
-
-
 class TraceModel(QAbstractTableModel):
-    HEADERS = ["No.", "Time (s)", "Ch", "ID", "Type", "DLC", "Data (hex)", "ASCII",
+    HEADERS = ["No.", "Time (s)", "Ch", "ID", "Type", "DLC", "Data (hex)",
                "dt (ms)", "Period (ms)", "Count"]
 
     COL_INDEX, COL_TIME, COL_CH, COL_ID, COL_TYPE, COL_DLC, COL_DATA, \
-        COL_ASCII, COL_DELTA, COL_PERIOD, COL_COUNT = range(11)
+        COL_DELTA, COL_PERIOD, COL_COUNT = range(10)
 
     def __init__(self, max_rows: int = DEFAULT_MAX_ROWS, parent=None):
         super().__init__(parent)
@@ -75,7 +68,6 @@ class TraceModel(QAbstractTableModel):
             typ = "ERR"
             dlc = ""
             data = frame._error_info
-            ascii = frame._error_info
         else:
             cid = f"{frame.can_id:08X}" if frame.extended else f"{frame.can_id:03X}"
             if frame.rtr:
@@ -95,7 +87,6 @@ class TraceModel(QAbstractTableModel):
             else:
                 dlc = f"{dlc_code} ({data_len})"
             data = frame.data.hex(' ').upper()
-            ascii = frame.data.translate(_ASCII_TRANSLATION)
         return [
             "",                         # COL_INDEX — set on insert
             f"{t:12.6f}",
@@ -104,7 +95,6 @@ class TraceModel(QAbstractTableModel):
             typ,
             dlc,
             data,
-            ascii,
             f"{meta['dt']:.1f}" if meta['dt'] else "",
             f"{meta['period']:.1f}" if meta['period'] else "",
             str(meta['count']),
@@ -263,7 +253,7 @@ class TraceModel(QAbstractTableModel):
 
     @staticmethod
     def _make_headers():
-        return [_("Trace.No"), _("Trace.Time"), _("Trace.Ch"), _("Trace.ID"), _("Trace.Type"), _("Trace.DLC"), _("Trace.Data"), _("Trace.ASCII"),
+        return [_("Trace.No"), _("Trace.Time"), _("Trace.Ch"), _("Trace.ID"), _("Trace.Type"), _("Trace.DLC"), _("Trace.Data"),
                 _("Trace.Delta"), _("Trace.Period"), _("Trace.Count")]
 
     def update_headers(self):
@@ -321,7 +311,6 @@ class TraceView(QTableView):
             TraceModel.COL_TYPE:  65,
             TraceModel.COL_DLC:   40,
             TraceModel.COL_DATA:  220,
-            TraceModel.COL_ASCII: 90,
             TraceModel.COL_DELTA: 70,
             TraceModel.COL_PERIOD:95,
             TraceModel.COL_COUNT: 60,

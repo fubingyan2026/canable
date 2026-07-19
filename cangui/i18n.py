@@ -44,8 +44,6 @@ _TR.update({
     # File menu items
     "File.OpenTrace":        {"zh": "打开 Trace(&O)…", "en": "&Open Trace…"},
     "File.SaveTrace":        {"zh": "保存 Trace(&S)…", "en": "&Save Trace…"},
-    "File.SaveSendList":     {"zh": "保存发送列表…",    "en": "Save Send List…"},
-    "File.LoadSendList":     {"zh": "加载发送列表…",    "en": "Load Send List…"},
     "File.Exit":             {"zh": "退出(&X)", "en": "E&xit"},
 
     # View / Windows menu items
@@ -70,7 +68,6 @@ _TR.update({
     "Trace.Type":            {"zh": "类型",        "en": "Type"},
     "Trace.DLC":             {"zh": "DLC",         "en": "DLC"},
     "Trace.Data":            {"zh": "数据(hex)",   "en": "Data (hex)"},
-    "Trace.ASCII":           {"zh": "ASCII",       "en": "ASCII"},
     "Trace.Delta":           {"zh": "间隔(ms)",     "en": "dt (ms)"},
     "Trace.Period":          {"zh": "周期(ms)",    "en": "Period (ms)"},
     "Trace.Count":           {"zh": "计数",        "en": "Count"},
@@ -188,7 +185,6 @@ _TR.update({
     "Stat.HdrLastDelta":    {"zh": "最近间隔(ms)","en": "Last Δt (ms)"},
     # Main window misc
     "Scan.Failed":          {"zh": "扫描失败",    "en": "Scan failed"},
-    "Scan.NoHistory":       {"zh": "无历史记录",  "en": "No history"},
     "Send.SelectRow":       {"zh": "请先选中一行", "en": "Please select a row first"},
     "Send.Clear":           {"zh": "清空",        "en": "Clear"},
     "Send.Cleared":         {"zh": "已清空",      "en": "Cleared"},
@@ -215,9 +211,6 @@ _TR.update({
     "File.SaveTraceTitle":      {"zh": "保存 Trace", "en": "Save Trace"},
     "File.OpenTraceTitle":      {"zh": "加载 Trace", "en": "Open Trace"},
     "File.TraceSaved":          {"zh": "Trace 已保存到", "en": "Trace saved to"},
-    "File.ASCNotSupported":     {"zh": "ASC 文件请使用回放工具，暂不实现", "en": "ASC files require a replay tool, not yet supported"},
-    "File.SendListSaved":       {"zh": "发送列表已保存", "en": "Send list saved"},
-    "File.SendListLoaded":      {"zh": "发送列表已加载", "en": "Send list loaded"},
 
     # Quick send
     "Tools.QuickSendHint":      {"zh": "格式: ID,HEX_DATA    例:  0x123,DE AD BE EF 0A", "en": "Format: ID,HEX_DATA    e.g.  0x123,DE AD BE EF 0A"},
