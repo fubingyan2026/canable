@@ -75,7 +75,15 @@ class MainWindow(QMainWindow):
         self.__init_ui()
         # 插件宿主：在 UI 构建完成后加载所有插件
         self.plugins = PluginHost(self)
-        self.plugins.load_all()
+        # Block signals during programmatic plugin tab activation to avoid
+        # overwriting saved active_tab before _restore_active_tab reads it
+        self._center_tabs.blockSignals(True)
+        try:
+            self.plugins.load_all()
+        finally:
+            self._center_tabs.blockSignals(False)
+        # 恢复上次选中的中心 Tab（在插件加载完成后调用，确保插件 tab 已就绪）
+        self._restore_active_tab()
 
     def _settings_path(self):
         return os.path.join(os.path.dirname(self.send_panel.csv_path()), "settings.json")
@@ -118,6 +126,10 @@ class MainWindow(QMainWindow):
         center_tabs.addTab(self.trace_panel, _("Trace.TabLabel"))
         # Trace 是内置 Tab，不允许关闭：移除其右侧关闭按钮
         center_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
+        # 为 Trace tab 设置稳定 key，用于记忆上次选中的 tab
+        center_tabs.tabBar().setTabData(0, "trace")
+        # 用户切换 tab 时保存当前 tab 的 key 到 settings
+        center_tabs.currentChanged.connect(self._on_center_tab_changed)
         self._center_tabs = center_tabs
 
         # 左侧：设备 + 总线
@@ -405,8 +417,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------ 插件宿主辅助
     # 这些方法由 PluginContext / PluginHost 调用，避免插件直接操作内部控件
-    def _add_plugin_tab(self, title: str, widget: QWidget) -> int:
+    def _add_plugin_tab(self, title: str, widget: QWidget, plugin_name: str = "") -> int:
         idx = self._center_tabs.addTab(widget, title)
+        # 设置稳定 key，用于记忆上次选中的 tab
+        key = f"plugin.{plugin_name}" if plugin_name else f"widget.{idx}"
+        self._center_tabs.tabBar().setTabData(idx, key)
         self._center_tabs.setCurrentIndex(idx)
         return idx
 
@@ -421,6 +436,30 @@ class MainWindow(QMainWindow):
     def status_bar_set_text(self, msg: str) -> None:
         """插件用：在状态栏左侧显示文本（非临时消息）。"""
         self.status_label.setText(msg)
+
+    @Slot(int)
+    def _on_center_tab_changed(self, index: int) -> None:
+        """用户切换中心 Tab 时保存当前 tab 的稳定 key 到 settings。"""
+        if index < 0:
+            return
+        key = self._center_tabs.tabBar().tabData(index)
+        if key is None:
+            return
+        self._set("active_tab", key)
+
+    def _restore_active_tab(self) -> None:
+        """从 settings 读取上次选中的 tab key 并切换过去。"""
+        key = self._get("active_tab")
+        if not key:
+            return
+        tb = self._center_tabs.tabBar()
+        for i in range(tb.count()):
+            if tb.tabData(i) == key:
+                self._center_tabs.setCurrentIndex(i)
+                return
+        # key 找不到（对应插件未激活/已被删除），切回 Trace 并更新保存
+        self._center_tabs.setCurrentIndex(0)
+        self._set("active_tab", "trace")
 
     @Slot(int)
     def _on_tab_close_requested(self, index: int) -> None:
@@ -665,16 +704,19 @@ class MainWindow(QMainWindow):
                 w = csv.writer(f)
                 w.writerow(["time", "ch", "can_id", "ext", "rtr", "dlc", "data_hex"])
                 for fr in self.trace_panel.view._model._rows:
-                    w.writerow([f"{fr.timestamp:.6f}", "CAN1",
+                    ch = "ERR" if fr.is_error else ("TX" if fr.is_tx else "CAN1")
+                    w.writerow([f"{fr.timestamp:.6f}", ch,
                                 f"{fr.can_id:X}", int(fr.extended),
                                 int(fr.rtr), fr.dlc, fr.data.hex(' ').upper()])
         elif path.endswith(".jsonl"):
             with open(path, "w", encoding="utf-8") as f:
                 for fr in self.trace_panel.view._model._rows:
                     f.write(json.dumps({
-                        "time": fr.timestamp, "can_id": fr.can_id,
+                        "time": fr.timestamp, "ch": "TX" if fr.is_tx else "CAN1",
+                        "can_id": fr.can_id,
                         "extended": fr.extended, "rtr": fr.rtr,
                         "dlc": fr.dlc, "data": fr.data.hex(),
+                        "is_tx": fr.is_tx, "is_error": fr.is_error,
                     }) + "\n")
         else:
             # Vector ASC 风格（简化）
@@ -693,7 +735,8 @@ class MainWindow(QMainWindow):
                     else:
                         head = f"{fr.can_id:03X}x" if fr.rtr else f"{fr.can_id:03X}"
                     d = " ".join(f"{b:02X}" for b in fr.data[:fr.dlc]) or "R"
-                    f.write(f"{ts:9.6f} CAN1 {head} {d} Length {fr.dlc} CRC OK\n")
+                    ch = "ERR" if fr.is_error else ("TX" if fr.is_tx else "CAN1")
+                    f.write(f"{ts:9.6f} {ch} {head} {d} Length {fr.dlc} CRC OK\n")
                 f.write("End TriggerBlock\n")
         self.status_label.setText(f"{_('File.TraceSaved')} {path}")
 
@@ -707,24 +750,32 @@ class MainWindow(QMainWindow):
                 with open(path, "r", encoding="utf-8") as f:
                     r = csv.DictReader(f)
                     for row in r:
+                        ch = row.get("ch", "CAN1")
                         fr = CANFrame(
                             can_id=int(row["can_id"], 16),
                             data=bytes.fromhex(row["data_hex"].replace(" ", "")),
                             extended=bool(int(row["ext"])),
                             rtr=bool(int(row["rtr"])),
                             timestamp=float(row["time"]),
+                            is_tx=(ch == "TX"),
+                            _error_info="ERR" if ch == "ERR" else "",
                         )
                         self.trace_panel.append_frame(fr)
             elif path.endswith(".jsonl"):
                 with open(path, "r", encoding="utf-8") as f:
                     for line in f:
                         d = json.loads(line)
+                        ch = d.get("ch", "CAN1" if not d.get("is_tx") else "TX")
+                        is_tx = d.get("is_tx", ch == "TX")
+                        is_err = d.get("is_error", ch == "ERR")
                         fr = CANFrame(
                             can_id=d["can_id"],
                             data=bytes.fromhex(d["data"]),
                             extended=d.get("extended", False),
                             rtr=d.get("rtr", False),
                             timestamp=d["time"],
+                            is_tx=is_tx,
+                            _error_info="ERR" if is_err else "",
                         )
                         self.trace_panel.append_frame(fr)
             else:
@@ -990,7 +1041,14 @@ class MainWindow(QMainWindow):
             pass
         # 先关闭所有插件（让它们有机会发送 CANCEL 等清理帧，并保存 active_list）
         if hasattr(self, "plugins"):
-            self.plugins.shutdown()
+            # Block signals during plugin shutdown: removing active plugin tab
+            # triggers automatic tab switch to Trace, which would overwrite
+            # the saved active_tab before final flush
+            self._center_tabs.blockSignals(True)
+            try:
+                self.plugins.shutdown()
+            finally:
+                self._center_tabs.blockSignals(False)
             # 插件 shutdown 中可能写入新配置（如 active_list），需再次落盘
             self._flush_settings()
         if self._connected:

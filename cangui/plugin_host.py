@@ -57,9 +57,13 @@ class PluginContext:
         return self._mw
 
     # ----- Tab 管理 -----
-    def add_tab(self, title: str, widget: QWidget) -> int:
-        """添加为中心 Tab，返回索引。"""
-        return self._mw._add_plugin_tab(title, widget)
+    def add_tab(self, title: str, widget: QWidget, plugin_name: str = "") -> int:
+        """添加为中心 Tab，返回索引。
+
+        plugin_name 用于为 tab 设置稳定 key（"plugin.<name>"），
+        以便主程序记忆上次选中的 tab。
+        """
+        return self._mw._add_plugin_tab(title, widget, plugin_name=plugin_name)
 
     def remove_tab(self, widget: QWidget) -> None:
         """从中心 Tab 移除。"""
@@ -170,7 +174,7 @@ class Plugin(QObject):
         try:
             widget = self.build_widget(self._ctx)
             self._widget = widget
-            self._ctx.add_tab(self.display_title(), widget)
+            self._ctx.add_tab(self.display_title(), widget, plugin_name=self.name)
             if self._menu_action is not None:
                 self._menu_action.setChecked(True)
             self.on_activated()

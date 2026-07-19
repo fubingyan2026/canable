@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, Tuple, Optional
+from typing import Deque, Dict, Tuple, Optional, List
 
-import csv
-import os
-import sys
-from datetime import datetime
 from PySide6.QtCore import (Qt, QAbstractTableModel, QModelIndex, Signal,
                             QTimer)
 from PySide6.QtGui import QColor, QBrush, QFont
@@ -20,14 +16,8 @@ from .i18n import _, language_changed
 from .style import id_color, FG_DIM, FG_ACCENT, BG_TX, BG_ERROR
 
 
-DEFAULT_MAX_ROWS = 1_000
+DEFAULT_MAX_ROWS = 30_000
 
-
-def _log_dir() -> str:
-    """获取日志文件目录（兼容打包后环境）"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 预生成 ASCII 转换表：可打印字符保留，其余替换为 '.'
 _ASCII_TRANSLATION = bytes.maketrans(
@@ -46,6 +36,7 @@ class TraceModel(QAbstractTableModel):
     def __init__(self, max_rows: int = DEFAULT_MAX_ROWS, parent=None):
         super().__init__(parent)
         self._header_labels = self._make_headers()
+        # 完整数据存储：永远不折叠，按时间顺序保留所有帧
         self._rows: Deque[CANFrame] = deque(maxlen=max_rows)
         self._meta: Deque[dict]     = deque(maxlen=max_rows)
         self._text: Deque[list]     = deque(maxlen=max_rows)
@@ -53,11 +44,17 @@ class TraceModel(QAbstractTableModel):
         self._last_ts: Dict[Tuple[int, bool], float] = {}
         self._period:  Dict[Tuple[int, bool], float] = {}
         self._collapse = False
-        self._id_vis:  Dict[Tuple[int, bool], int] = {}
+        # 折叠视图层：仅影响显示，不影响 _rows 存储
+        # _view_rows[vis_pos] = _rows 真实索引；每个 cid 只占一个 vis_pos
+        self._view_rows: List[int] = []
+        self._cid_to_vis: Dict[Tuple[int, bool], int] = {}
 
     # ---------- Qt model interface ---------- #
     def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._rows)
+        if parent.isValid():
+            return 0
+        # 折叠模式下显示行数 = 唯一 cid 数
+        return len(self._view_rows) if self._collapse else len(self._rows)
 
     def columnCount(self, parent=QModelIndex()):
         return len(self._header_labels)
@@ -117,15 +114,18 @@ class TraceModel(QAbstractTableModel):
         if not index.isValid():
             return None
         row = index.row()
-        if row >= len(self._rows):
+        # 折叠模式：把显示行号映射到 _rows 真实索引
+        real_row = self._view_rows[row] if self._collapse else row
+        if real_row >= len(self._rows):
             return None
-        f = self._rows[row]
+        f = self._rows[real_row]
         col = index.column()
 
-        if role == Qt.DisplayRole and col < len(self._text[row]):
+        if role == Qt.DisplayRole and col < len(self._text[real_row]):
             if col == self.COL_INDEX:
-                return f"{row + 1}"
-            return self._text[row][col]
+                # 折叠模式下也显示真实行号，便于定位
+                return f"{real_row + 1}"
+            return self._text[real_row][col]
 
         if role == Qt.BackgroundRole:
             if f.is_error:
@@ -168,18 +168,46 @@ class TraceModel(QAbstractTableModel):
         txt = self._format_row(frame, meta)
 
         if self._collapse:
-            vis_idx = self._id_vis.get(cid)
-            if vis_idx is not None and vis_idx < len(self._rows):
-                self._rows[vis_idx] = frame
-                self._meta[vis_idx] = meta
-                self._text[vis_idx] = txt
-                self.dataChanged.emit(
-                    self.index(vis_idx, 0),
-                    self.index(vis_idx, self.columnCount() - 1),
-                )
+            # 折叠模式：_rows 始终保留所有帧，_view_rows 仅维护显示索引
+            will_drop = len(self._rows) == self._rows.maxlen
+            if will_drop:
+                # popleft 会让 _view_rows 中所有索引失效，整表重建
+                self.beginResetModel()
+                self._rows.popleft()
+                self._meta.popleft()
+                self._text.popleft()
+                self._rows.append(frame)
+                self._meta.append(meta)
+                self._text.append(txt)
+                self._rebuild_view()
+                self.endResetModel()
                 return
 
-        # append new row
+            new_row_idx = len(self._rows)
+            vis_pos = self._cid_to_vis.get(cid)
+            if vis_pos is not None:
+                # cid 已存在视图：仅更新指向，触发该行重绘
+                self._rows.append(frame)
+                self._meta.append(meta)
+                self._text.append(txt)
+                self._view_rows[vis_pos] = new_row_idx
+                self.dataChanged.emit(
+                    self.index(vis_pos, 0),
+                    self.index(vis_pos, self.columnCount() - 1),
+                )
+            else:
+                # 新 cid：在视图末尾追加一行
+                vis_pos = len(self._view_rows)
+                self._cid_to_vis[cid] = vis_pos
+                self.beginInsertRows(QModelIndex(), vis_pos, vis_pos)
+                self._rows.append(frame)
+                self._meta.append(meta)
+                self._text.append(txt)
+                self._view_rows.append(new_row_idx)
+                self.endInsertRows()
+            return
+
+        # 非折叠模式：_rows 索引 == 显示行号
         if len(self._rows) == self._rows.maxlen:
             self.beginRemoveRows(QModelIndex(), 0, 0)
             old = self._rows[0]
@@ -187,18 +215,11 @@ class TraceModel(QAbstractTableModel):
             self._meta.popleft()
             self._text.popleft()
             old_cid = (old.can_id, old.extended)
-            # 递减旧帧 ID 的可见计数
-            self._id_vis[old_cid] = self._id_vis.get(old_cid, 0) - 1
-            # 若该 ID 已无可见行，清理相关字典避免无限增长
-            if self._id_vis.get(old_cid, 0) <= 0:
-                self._id_vis.pop(old_cid, None)
+            # 若该 ID 已无任何帧，清理统计字典避免无限增长
+            if not any((f.can_id, f.extended) == old_cid for f in self._rows):
                 self._counts.pop(old_cid, None)
                 self._last_ts.pop(old_cid, None)
                 self._period.pop(old_cid, None)
-            for k in list(self._id_vis.keys()):
-                self._id_vis[k] -= 1
-                if self._id_vis[k] < 0:
-                    self._id_vis.pop(k, None)
             self.endRemoveRows()
 
         pos = len(self._rows)
@@ -206,37 +227,39 @@ class TraceModel(QAbstractTableModel):
         self._rows.append(frame)
         self._meta.append(meta)
         self._text.append(txt)
-        self._id_vis[cid] = pos
         self.endInsertRows()
+
+    def _rebuild_view(self):
+        """从 _rows 重建折叠视图索引。
+        - 每个 cid 仅保留最新一次出现的 _rows 索引
+        - cid 第一次出现的位置决定其在视图中的顺序（稳定）
+        """
+        self._view_rows.clear()
+        self._cid_to_vis.clear()
+        for i, f in enumerate(self._rows):
+            cid = (f.can_id, f.extended)
+            vis_pos = self._cid_to_vis.get(cid)
+            if vis_pos is not None:
+                # 已存在：更新指向为更晚的索引
+                self._view_rows[vis_pos] = i
+            else:
+                # 新 cid：追加到视图末尾
+                self._cid_to_vis[cid] = len(self._view_rows)
+                self._view_rows.append(i)
 
     def set_collapse_mode(self, on: bool):
         if self._collapse == on:
             return
         self._collapse = on
-        self._id_vis.clear()
+        self.beginResetModel()
         if on:
-            self.beginResetModel()
-            collapsed_rows = deque(maxlen=self._rows.maxlen)
-            collapsed_meta = deque(maxlen=self._rows.maxlen)
-            collapsed_text = deque(maxlen=self._rows.maxlen)
-            seen: Dict[Tuple[int, bool], int] = {}
-            for i, f in enumerate(self._rows):
-                cid = (f.can_id, f.extended)
-                if cid in seen:
-                    collapsed_rows[seen[cid]] = f
-                    collapsed_meta[seen[cid]] = self._meta[i]
-                    collapsed_text[seen[cid]] = self._format_row(f, self._meta[i])
-                else:
-                    idx = len(collapsed_rows)
-                    seen[cid] = idx
-                    self._id_vis[cid] = idx
-                    collapsed_rows.append(f)
-                    collapsed_meta.append(self._meta[i])
-                    collapsed_text.append(self._text[i])
-            self._rows = collapsed_rows
-            self._meta = collapsed_meta
-            self._text = collapsed_text
-            self.endResetModel()
+            # 进入折叠模式：重建视图索引，但不动 _rows
+            self._rebuild_view()
+        else:
+            # 退出折叠模式：清空视图层，rowCount 直接返回 len(_rows)
+            self._view_rows.clear()
+            self._cid_to_vis.clear()
+        self.endResetModel()
 
     @staticmethod
     def _make_headers():
@@ -255,7 +278,8 @@ class TraceModel(QAbstractTableModel):
         self._counts.clear()
         self._last_ts.clear()
         self._period.clear()
-        self._id_vis.clear()
+        self._view_rows.clear()
+        self._cid_to_vis.clear()
         self.endResetModel()
 
     def id_summary(self):
@@ -397,67 +421,13 @@ class TracePanel(QWidget):
 
         self._paused = False
         self._frame_count = 0
-        self._log_buffer = deque(maxlen=1000)
-        self._last_log_ts = 0.0
         self._summary_timer = QTimer(self)
         self._summary_timer.timeout.connect(self._update_summary)
         self._summary_timer.start(500)
 
-        self._log_path = os.path.join(_log_dir(), "trace_log.csv")
-        self._log_timer = QTimer(self)
-        self._log_timer.timeout.connect(self._flush_log)
-        self._log_timer.start(5000)
-
-    _log_max_bytes = 5 * 1024 * 1024  # 5 MB
-
-    def _flush_log(self):
-        if len(self._log_buffer) == 0:
-            return
-        try:
-            new_frames = []
-            for fm in self._log_buffer:
-                if fm.is_error or fm.timestamp <= self._last_log_ts:
-                    continue
-                dt = datetime.fromtimestamp(fm.timestamp)
-                ts = dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(dt.microsecond / 1000):03d}"
-                ch = "TX" if fm.is_tx else "CAN1"
-                cid = f"{fm.can_id:08X}" if fm.extended else f"{fm.can_id:03X}"
-                tp = []
-                if fm.fd: tp.append("FD")
-                if fm.brs: tp.append("BRS")
-                if fm.rtr: tp.append("RTR")
-                type_str = " ".join(tp) or ("Ext" if fm.extended else "SFF")
-                new_frames.append([ts, ch, cid, type_str, str(fm.dlc), fm.data.hex(" ").upper()])
-                if fm.timestamp > self._last_log_ts:
-                    self._last_log_ts = fm.timestamp
-            if not new_frames:
-                return
-            need_header = not os.path.isfile(self._log_path) or os.path.getsize(self._log_path) == 0
-            with open(self._log_path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if need_header:
-                    w.writerow(["timestamp", "ch", "can_id", "type", "dlc", "data_hex"])
-                for r in new_frames:
-                    w.writerow(r)
-            # rotate: if file exceeds size limit, rename to .1 and start fresh
-            try:
-                if os.path.getsize(self._log_path) > self._log_max_bytes:
-                    rotated = self._log_path + ".1"
-                    if os.path.isfile(rotated):
-                        os.remove(rotated)
-                    os.rename(self._log_path, rotated)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        finally:
-            self._log_buffer.clear()
-
     def _on_clear(self):
         self.view.clear()
         self._frame_count = 0
-        self._log_buffer.clear()
-        self._last_log_ts = 0.0
         self.summary_label.setText(f"{_('Trace.Received')} 0 {_('Trace.Frames')}")
         self.cleared.emit()
 
@@ -485,8 +455,6 @@ class TracePanel(QWidget):
         )
 
     def append_frame(self, frame: CANFrame):
-        # 暂停时仍记录日志，仅跳过 UI 更新
-        self._log_buffer.append(frame)
         if self._paused:
             return
         self.view.add_frame(frame)
