@@ -1,2 +1,4 @@
 *.o
 /dist
+send_list.csv
+trace.csv
