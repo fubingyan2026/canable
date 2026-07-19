@@ -11,10 +11,10 @@ from PySide6.QtCore import Qt, QTimer, QThread, Slot
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QApplication,
                                 QLabel, QComboBox, QPushButton, QSplitter, QFrame,
-                                QListWidget, QListWidgetItem, QTabWidget,
+                                QListWidget, QListWidgetItem, QTabWidget, QTabBar,
                                 QDockWidget, QStatusBar, QToolBar, QFileDialog,
                                 QMessageBox, QInputDialog, QGroupBox, QFormLayout,
-                                QCheckBox)
+                                QCheckBox, QToolButton)
 
 from PySide6.QtCore import QMutexLocker
 
@@ -24,6 +24,7 @@ from .i18n import _, language_changed, get_language, set_language
 from .worker import CANWorker
 from .trace import TracePanel
 from .send import SendPanel
+from .plugin_host import PluginHost
 
 logger = logging.getLogger("cangui.main_window")
 from .filters import FilterPanel
@@ -72,6 +73,9 @@ class MainWindow(QMainWindow):
         self._batch_timer.start(100)
 
         self.__init_ui()
+        # 插件宿主：在 UI 构建完成后加载所有插件
+        self.plugins = PluginHost(self)
+        self.plugins.load_all()
 
     def _settings_path(self):
         return os.path.join(os.path.dirname(self.send_panel.csv_path()), "settings.json")
@@ -109,7 +113,11 @@ class MainWindow(QMainWindow):
         self.trace_panel  = TracePanel(self)
         self.trace_panel.view.setAlternatingRowColors(False)
         center_tabs = QTabWidget()
+        center_tabs.setTabsClosable(True)
+        center_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         center_tabs.addTab(self.trace_panel, _("Trace.TabLabel"))
+        # Trace 是内置 Tab，不允许关闭：移除其右侧关闭按钮
+        center_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
         self._center_tabs = center_tabs
 
         # 左侧：设备 + 总线
@@ -126,23 +134,72 @@ class MainWindow(QMainWindow):
 
         # 底部 Send Dock
         self.send_panel = SendPanel(self)
-        self.send_dock = QDockWidget(_("Window.SendMessages"), self)
+        self.send_dock = QDockWidget("", self)
         self.send_dock.setObjectName("SendDock")
+        self.send_dock.setTitleBarWidget(self._make_dock_title(_("Window.SendMessages")))
         self.send_dock.setWidget(self.send_panel)
         self.send_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.send_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.send_dock)
+        # 自定义关闭按钮 → 隐藏 dock（可通过窗口菜单重新打开）
+        send_bar = self.send_dock.titleBarWidget()
+        send_bar._close_btn.clicked.connect(lambda: self.send_dock.setVisible(False))
 
         # 右侧 Filter Dock
         self.filter_panel = FilterPanel(self)
-        self.filter_dock = QDockWidget(_("Window.Filters"), self)
+        self.filter_dock = QDockWidget("", self)
         self.filter_dock.setObjectName("FilterDock")
+        self.filter_dock.setTitleBarWidget(self._make_dock_title(_("Window.Filters")))
         self.filter_dock.setWidget(self.filter_panel)
         self.filter_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.filter_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.filter_dock)
+        filter_bar = self.filter_dock.titleBarWidget()
+        filter_bar._close_btn.clicked.connect(lambda: self.filter_dock.setVisible(False))
+
+    def _make_dock_title(self, text: str) -> QWidget:
+        """自定义 Dock 标题栏（Qt 默认标题栏无法用 QSS 改文字颜色）。
+        保留原生关闭/浮动按钮，文字颜色走 FG_ACCENT 与总线连接状态一致。
+        """
+        from cangui.style import FG_ACCENT, BG_HEADER
+        bar = QWidget()
+        bar.setObjectName("dockTitleBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(10, 4, 4, 4)
+        lay.setSpacing(4)
+        lbl = QLabel(text)
+        lbl.setObjectName("dockTitle")
+        lbl.setStyleSheet(
+            f"color: {FG_ACCENT}; font-weight: bold; background: transparent;"
+        )
+        lay.addWidget(lbl)
+        lay.addStretch()
+
+        # 关闭按钮
+        close_btn = QToolButton()
+        close_btn.setObjectName("dockCloseBtn")
+        close_btn.setText("×")
+        close_btn.setAutoRaise(True)
+        close_btn.setFixedSize(20, 20)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QToolButton {{ border: none; color: {FG_ACCENT}; "
+            f"font-weight: bold; font-size: 14pt; background: transparent; }}"
+            f"QToolButton:hover {{ background-color: {BG_HEADER}; border-radius: 3px; }}"
+        )
+        lay.addWidget(close_btn)
+
+        bar._title_label = lbl  # 供 refresh_language 更新
+        bar._close_btn = close_btn
+        bar._close_callback = None
+        return bar
+
+    @staticmethod
+    def _wire_dock_close(title_bar: QWidget, callback) -> None:
+        title_bar._close_callback = callback
+        title_bar._close_btn.clicked.connect(callback)
 
     def _build_left_panel(self) -> QFrame:
         w = QFrame()
@@ -267,8 +324,8 @@ class MainWindow(QMainWindow):
         theme_group.triggered.connect(self._on_theme_changed)
 
         lang_menu = tools_menu.addMenu(_("Menu.Language"))
-        self.act_lang_zh = QAction(_("Lang.Chinese"), self, checkable=True)
-        self.act_lang_en = QAction(_("Lang.English"), self, checkable=True)
+        self.act_lang_zh = QAction("中文", self, checkable=True)
+        self.act_lang_en = QAction("English", self, checkable=True)
         self.act_lang_zh.setChecked(get_language() == "zh")
         self.act_lang_en.setChecked(get_language() != "zh")
         lang_group = QActionGroup(self)
@@ -285,6 +342,9 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(self._on_about)
         help_menu.addAction(act_about)
 
+        # 插件菜单（占位，运行时由 PluginHost 填充）
+        self._plugins_menu = mb.addMenu(_("Menu.Plugins"))
+
 
 
         # register actions for language refresh
@@ -295,6 +355,7 @@ class MainWindow(QMainWindow):
             (view_menu, "Menu.Windows"),
             (tools_menu, "Menu.Tools"),
             (help_menu, "Menu.Help"),
+            (self._plugins_menu, "Menu.Plugins"),
             (act_open, "File.OpenTrace"),
             (act_save, "File.SaveTrace"),
             (act_save_send, "File.SaveSendList"),
@@ -304,8 +365,7 @@ class MainWindow(QMainWindow):
             (act_about, "Help.About"),
             (self.act_theme_light, "Theme.Light"),
             (self.act_theme_dark, "Theme.Dark"),
-            (self.act_lang_zh, "Lang.Chinese"),
-            (self.act_lang_en, "Lang.English"),
+            # 语言菜单项使用固定文字（中文永远显示"中文"，English永远显示"English"），不参与 i18n 刷新
         ]
         QShortcut(QKeySequence("Ctrl+L"), self, self.trace_panel.clear_all)
 
@@ -342,6 +402,33 @@ class MainWindow(QMainWindow):
         self.filter_panel.filters_changed.connect(self._on_filters_changed)
         # Bitrate change in side panel
         self.bitrate_combo.currentIndexChanged.connect(self._on_bitrate_combo_changed)
+
+    # ------------------------------------------------------ 插件宿主辅助
+    # 这些方法由 PluginContext / PluginHost 调用，避免插件直接操作内部控件
+    def _add_plugin_tab(self, title: str, widget: QWidget) -> int:
+        idx = self._center_tabs.addTab(widget, title)
+        self._center_tabs.setCurrentIndex(idx)
+        return idx
+
+    def _remove_plugin_tab(self, widget: QWidget) -> None:
+        idx = self._center_tabs.indexOf(widget)
+        if idx >= 0:
+            self._center_tabs.removeTab(idx)
+
+    def _add_plugin_menu_action(self, action: QAction) -> None:
+        self._plugins_menu.addAction(action)
+
+    def status_bar_set_text(self, msg: str) -> None:
+        """插件用：在状态栏左侧显示文本（非临时消息）。"""
+        self.status_label.setText(msg)
+
+    @Slot(int)
+    def _on_tab_close_requested(self, index: int) -> None:
+        widget = self._center_tabs.widget(index)
+        # 委托给 PluginHost：若该 Tab 属于某插件，则 deactivate 它
+        if hasattr(self, "plugins") and not self.plugins.on_tab_close(widget):
+            # 非插件 Tab（理论不应发生，Trace 已禁用关闭按钮）
+            pass
 
     # ----------------------------------------------------------- 设备扫描
     @Slot()
@@ -453,6 +540,8 @@ class MainWindow(QMainWindow):
             worker._connected = False
         # 立即更新 UI，不等待线程退出
         self._update_connect_ui(False, _("Status.Disconnected"))
+        # 暂停所有周期发送（保留 enabled，重连后可恢复）
+        self.send_panel.pause_all_timers()
 
     @Slot()
     def _on_worker_thread_finished(self):
@@ -483,8 +572,13 @@ class MainWindow(QMainWindow):
     def _on_state_changed(self, connected: bool, msg: str):
         if connected:
             self._update_connect_ui(True, msg)
+            # 恢复之前暂停的周期发送（保留用户的 enabled 配置）
+            self.send_panel.resume_timers()
         else:
             self._update_connect_ui(False, msg)
+        # 通知所有 active 插件连接状态变化
+        if hasattr(self, "plugins"):
+            self.plugins.dispatch_state(connected, msg)
 
     @Slot(str)
     def _on_error(self, err: str):
@@ -518,6 +612,9 @@ class MainWindow(QMainWindow):
         for frame in batch:
             self._frame_count += 1
             self.trace_panel.append_frame(frame)
+        # 派发给所有 active 插件（回调式订阅）
+        if batch and hasattr(self, "plugins"):
+            self.plugins.dispatch_frames(batch)
 
     @Slot(float, int)
     def _on_bus_stats(self, load: float, fps: int):
@@ -747,6 +844,18 @@ class MainWindow(QMainWindow):
         set_theme(name)
         self._set("theme", name)
         QApplication.instance().setStyleSheet(get_qss())
+        # 同步自定义 dock 标题栏颜色（QSS 无法作用于内联样式）
+        from cangui.style import FG_ACCENT, BG_HEADER
+        for dock in (self.send_dock, self.filter_dock):
+            bar = dock.titleBarWidget()
+            bar._title_label.setStyleSheet(
+                f"color: {FG_ACCENT}; font-weight: bold; background: transparent;"
+            )
+            bar._close_btn.setStyleSheet(
+                f"QToolButton {{ border: none; color: {FG_ACCENT}; "
+                f"font-weight: bold; font-size: 14pt; background: transparent; }}"
+                f"QToolButton:hover {{ background-color: {BG_HEADER}; border-radius: 3px; }}"
+            )
 
     def _on_language_changed(self, action):
         self._set("language", "zh" if action == self.act_lang_zh else "en")
@@ -782,6 +891,9 @@ class MainWindow(QMainWindow):
         # docks
         self.send_dock.setWindowTitle(_("Window.SendMessages"))
         self.filter_dock.setWindowTitle(_("Window.Filters"))
+        # 同步自定义标题栏文字
+        self.send_dock.titleBarWidget()._title_label.setText(_("Window.SendMessages"))
+        self.filter_dock.titleBarWidget()._title_label.setText(_("Window.Filters"))
         # center tab
         if hasattr(self, "_center_tabs"):
             self._center_tabs.setTabText(0, _("Trace.TabLabel"))
@@ -841,6 +953,9 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.sample_combo.setCurrentIndex(idx)
             self.sample_combo.blockSignals(False)
+        # 通知插件刷新语言
+        if hasattr(self, "plugins"):
+            self.plugins.refresh_language()
 
     def closeEvent(self, e):
         if not hasattr(self, 'bitrate_combo'):
@@ -873,6 +988,11 @@ class MainWindow(QMainWindow):
             self.send_panel.to_csv(self.send_panel.csv_path())
         except Exception:
             pass
+        # 先关闭所有插件（让它们有机会发送 CANCEL 等清理帧，并保存 active_list）
+        if hasattr(self, "plugins"):
+            self.plugins.shutdown()
+            # 插件 shutdown 中可能写入新配置（如 active_list），需再次落盘
+            self._flush_settings()
         if self._connected:
             self._disconnect()
         e.accept()

@@ -1,5 +1,5 @@
 name,can_id,extended,rtr,fd,brs,dlc,data,period_ms,enabled
 哈哈哈,0x100,False,False,True,True,12,00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00,100.0,False
 rerer,0x100,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
-eee,0x100,False,False,True,True,8,00 00 00 00 00 00 00 00,100.0,False
+eee,0x100,False,False,True,True,8,00 00 00 00 00 00 00 00,2.0,False
 222,0x100,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False

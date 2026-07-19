@@ -403,6 +403,41 @@ QToolTip {{
     border-radius: 4px;
     font-size: 9pt;
 }}
+
+QMessageBox {{
+    background-color: {p['BG_CARD']};
+}}
+
+QMessageBox QLabel {{
+    color: {p['FG_TEXT']};
+    background-color: transparent;
+    font-size: 10pt;
+}}
+
+QMessageBox QPushButton {{
+    min-width: 80px;
+    padding: 6px 18px;
+}}
+
+QFileDialog {{
+    background-color: {p['BG_MAIN']};
+}}
+
+QFileDialog QPushButton {{
+    min-width: 72px;
+}}
+
+QInputDialog {{
+    background-color: {p['BG_CARD']};
+}}
+
+QDockWidget {{
+    border: none;
+    background-color: {p['BG_CARD']};
+}}
+
+/* Dock 标题栏样式由 MainWindow._make_dock_title() 内联设置，
+   Qt 默认标题栏 QSS 不生效（已知问题） */
 """
 
 

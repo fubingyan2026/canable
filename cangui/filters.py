@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 
 from .worker import CANFilter
 from .i18n import _
-from .style import id_color, FG_DIM, FG_ACCENT
+from .style import id_color, FG_ACCENT
 
 
 def _make_item(text, align=None, color=None):
@@ -99,11 +99,6 @@ class FilterPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        self.info_label = QLabel(_("Filter.Info"))
-        self.info_label.setStyleSheet(f"color: {FG_DIM};")
-        self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
-
         self.table = QTableWidget(0, len(self.HEADERS), self)
         self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
         self.table.verticalHeader().setVisible(False)
@@ -184,7 +179,6 @@ class FilterPanel(QWidget):
         self.edit_btn.setText(_("Filter.Edit"))
         self.del_btn.setText(_("Filter.Delete"))
         self.clear_btn.setText(_("Filter.Clear"))
-        self.info_label.setText(_("Filter.Info"))
         self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
         self._refresh()
 

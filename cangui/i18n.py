@@ -37,6 +37,7 @@ _TR.update({
     "Menu.Windows":          {"zh": "窗口(&W)",  "en": "&Windows"},
     "Menu.Tools":            {"zh": "工具(&T)",  "en": "&Tools"},
     "Menu.Help":             {"zh": "帮助(&H)",  "en": "&Help"},
+    "Menu.Plugins":          {"zh": "插件(&P)",  "en": "&Plugins"},
     "Menu.Language":         {"zh": "语言",      "en": "Language"},
     "Menu.Theme":           {"zh": "主题",      "en": "Theme"},
 
@@ -57,9 +58,7 @@ _TR.update({
     # Help menu items
     "Help.About":            {"zh": "关于 CANable 2.5", "en": "About CANable 2.5"},
 
-    # Language names
-    "Lang.Chinese":          {"zh": "中文",   "en": "Chinese"},
-    "Lang.English":          {"zh": "英文",   "en": "English"},
+    # Language names — 不再使用 i18n key，语言菜单项固定显示原生语种（中文/English）
     "Theme.Light":          {"zh": "浅色",     "en": "Light"},
     "Theme.Dark":           {"zh": "深色",     "en": "Dark"},
 
@@ -164,10 +163,9 @@ _TR.update({
     "About.Desc":           {"zh": "CANable 2.5 USB-CAN 适配器 上位机", "en": "CANable 2.5 USB-CAN Adapter GUI"},
     "About.Tech":           {"zh": "基于 PySide6 / Qt 6 + canable_sdk 驱动", "en": "Built with PySide6 / Qt 6 + canable_sdk driver"},
     # Filter panel
-    "Filter.Info":          {"zh": "过滤器：未命中任何规则时默认放行。", "en": "Filters: unmatched frames pass by default."},
     "Filter.Drop":          {"zh": "丢弃",        "en": "Drop"},
     "Filter.Pass":          {"zh": "放行",        "en": "Pass"},
-    "Filter.HdrIndex":      {"zh": "#",          "en": "#"},
+    "Filter.HdrIndex":      {"zh": "序号",      "en": "Index"},
     "Filter.HdrRange":      {"zh": "ID 范围",    "en": "ID Range"},
     "Filter.HdrType":       {"zh": "类型",       "en": "Type"},
     "Filter.HdrAction":     {"zh": "动作",       "en": "Action"},

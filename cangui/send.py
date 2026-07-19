@@ -344,10 +344,27 @@ class SendPanel(QWidget):
                     e.timer.stop()
 
     def stop_all_timers(self):
+        """停所有定时器并清空 enabled。用于 to_csv 前 / 退出前彻底停止。"""
         for e in self.entries:
             if e.timer and e.timer.isActive():
                 e.timer.stop()
             e.enabled = False
+        self._refresh_all()
+
+    def pause_all_timers(self):
+        """暂停所有周期发送定时器，但保留 enabled 状态。
+        用于 CAN 断开连接场景，重连后可调 resume_timers() 恢复。
+        """
+        for e in self.entries:
+            if e.timer and e.timer.isActive():
+                e.timer.stop()
+        self._refresh_all()
+
+    def resume_timers(self):
+        """根据 enabled 字段恢复所有周期发送定时器。
+        用于 CAN 重新连接后自动恢复暂停的发送。
+        """
+        self._sync_timers()
 
     # ---- 按钮回调 ---- #
     def _on_add(self):
