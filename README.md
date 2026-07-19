@@ -140,7 +140,9 @@ canable/
 │   ├── logo.svg               # 应用图标
 │   ├── check.svg              # 复选框勾选图标
 │   ├── close.svg              # Tab 关闭按钮图标
-│   └── close_hover.svg        # Tab 关闭按钮 hover 图标
+│   ├── close_hover.svg        # Tab 关闭按钮 hover 图标
+│   ├── arrow_down.svg         # 下拉框菱形箭头（浅色主题）
+│   └── arrow_down_dark.svg    # 下拉框菱形箭头（深色主题）
 ├── plugins/                   # 用户插件目录（自动加载）
 ├── canable_sdk/               # Python SDK
 │   ├── driver.py              # ZDTCanable 主驱动
