@@ -60,11 +60,13 @@ USB device → worker thread (receive loop, filter, buffer)
 
 | Class | File | Role |
 |-------|------|------|
-| `MainWindow` | `cangui/main_window.py` | QMainWindow with dock layout, device connect/disconnect lifecycle, settings persistence (2s debounced JSON) |
+| `MainWindow` | `cangui/main_window.py` | Frameless QMainWindow with dock layout, macOS-style title bar, device connect/disconnect lifecycle, settings persistence (2s debounced JSON), application-wide edge-resize event filter |
+| `MacTitleBar` | `cangui/title_bar.py` | Custom title bar with traffic-light buttons (close/minimize/maximize), centered title, embedded into window via `setMenuWidget` |
 | `CANWorker` | `cangui/worker.py` | QObject running in QThread — owns `ZDTCanable`, runs receive loop, manages send queue, emits `bus_stats`/`error`/`noack_warning` signals |
 | `TracePanel` | `cangui/trace.py` | CAN message table with `TraceModel` (QAbstractTableModel), supports collapse-by-ID mode, autoscroll, CSV/JSONL/ASC export |
-| `SendPanel` | `cangui/send.py` | Single-frame and periodic send table, CSV persistence to `send_list.csv`, FD-aware DLC range |
+| `SendPanel` | `cangui/send.py` | Single-frame and periodic send table, CSV persistence to `send_list.csv`, FD-aware DLC range, unified toggle button for start/stop (rejects start when disconnected) |
 | `FilterPanel` | `cangui/filters.py` | ID-range filters (pass/discard actions), integrated per-ID statistics table |
+| `PluginHost` | `cangui/plugin_host.py` | Loads user plugins from `plugins/` directory into center tabs |
 | `CANFilter` | `cangui/worker.py` | Filter rule: ID min/max, extended flag, pass_or_discard action |
 | `ZDTCanable` | `canable_sdk/driver.py` | Main driver — device open/close, bitrate config, send/receive, FD support, termination, filters, pin control |
 | `CANFrame` | `canable_sdk/frame.py` | Data class with ElmueSoft + Legacy dual-protocol serialization, error frame detection |
@@ -115,3 +117,19 @@ All colors must use exported constants from `cangui/style.py` (`BG_CARD`, `FG_AC
 - `fd_mode` must be set **before** `start()`
 - Data bitrate must be higher than nominal bitrate for BRS to work
 - Data phase timing has hardware limits: TSEG1≤15, TSEG2≤15, SJW≤15 (STM32G4)
+
+### Logging
+
+Logging is configured in `cangui/__main__.py:setup_logging()` and starts before any GUI module is imported:
+
+- Each app launch creates `logs/canable_YYYYMMDD_HHMMSS.log`
+- Terminal handler: INFO level
+- File handler: DEBUG level
+- Format: `%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s`
+- Noisy third-party loggers (`urllib3`, `PIL`, `usb._debug`) suppressed to WARNING
+- SIGINT is handled via `signal.signal(SIGINT, SIG_DFL)` + a 500ms `QTimer` to wake the Qt event loop, allowing clean Ctrl+C exit from `eventFilter`
+
+Logging conventions:
+- Log only **event transitions**: connection/disconnection, start/stop, errors, configuration changes
+- **Never** log per-frame data (USB raw bytes, TX/RX frame dumps, protocol parse details) — these would flood the file at high fps
+- Use `logger = logging.getLogger("cangui.<module>")` per module; SDK modules use `logging.getLogger("canable_sdk.<module>")`

@@ -2,3 +2,5 @@
 /dist
 send_list.csv
 trace.csv
+logs/
+*.log

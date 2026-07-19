@@ -1,6 +1,7 @@
 """Trace panel: CAN message stream table (cangaroo style)."""
 from __future__ import annotations
 
+import logging
 from collections import deque
 from typing import Deque, Dict, Tuple, Optional, List
 
@@ -14,6 +15,9 @@ from PySide6.QtWidgets import (QTableView, QHeaderView, QAbstractItemView,
 from canable_sdk import CANFrame
 from .i18n import _, language_changed
 from .style import id_color, FG_DIM, FG_ACCENT, BG_TX, BG_ERROR
+from . import icons as icon_lib
+
+logger = logging.getLogger("cangui.trace")
 
 
 DEFAULT_MAX_ROWS = 30_000
@@ -378,10 +382,12 @@ class TracePanel(QWidget):
         bar.setSpacing(6)
 
         self.clear_btn = QPushButton(_("Trace.Clear"))
+        self.clear_btn.setIcon(icon_lib.make_icon("trash"))
         self.clear_btn.clicked.connect(self._on_clear)
         bar.addWidget(self.clear_btn)
 
         self.pause_btn = QPushButton(_("Trace.Pause"))
+        self.pause_btn.setIcon(icon_lib.make_icon("pause"))
         self.pause_btn.setCheckable(True)
         self.pause_btn.toggled.connect(self._on_pause)
         bar.addWidget(self.pause_btn)
@@ -404,7 +410,7 @@ class TracePanel(QWidget):
         self.view = TraceView(self)
         layout.addWidget(self.view, 1)
 
-        self.summary_label = QLabel(f"{_("Trace.Received")} 0 {_("Trace.Count")}")
+        self.summary_label = QLabel(f"{_("Trace.Received")} 0 {_("Trace.Frames")}")
         self.summary_label.setStyleSheet(f"color: {FG_DIM};")
         layout.addWidget(self.summary_label)
 
@@ -415,6 +421,7 @@ class TracePanel(QWidget):
         self._summary_timer.start(500)
 
     def _on_clear(self):
+        logger.info("清空 trace: count=%d", self._frame_count)
         self.view.clear()
         self._frame_count = 0
         self.summary_label.setText(f"{_('Trace.Received')} 0 {_('Trace.Frames')}")
@@ -422,7 +429,9 @@ class TracePanel(QWidget):
 
     def _on_pause(self, checked):
         self._paused = checked
+        logger.info("Trace %s", "暂停" if checked else "继续")
         self.pause_btn.setText(_("Trace.Resume") if checked else _("Trace.Pause"))
+        self.pause_btn.setIcon(icon_lib.make_icon("play" if checked else "pause"))
 
     def _on_autoscroll(self, checked):
         self.view._auto_scroll = checked
@@ -461,6 +470,11 @@ class TracePanel(QWidget):
         self.view.update()
         if hasattr(hdr, "headerDataChanged"):
             hdr.headerDataChanged(Qt.Horizontal, 0, self.view._model.columnCount()-1)
+
+    def refresh_icons(self):
+        """主题切换时重新生成图标（颜色随主题变化）。"""
+        self.clear_btn.setIcon(icon_lib.make_icon("trash"))
+        self.pause_btn.setIcon(icon_lib.make_icon("play" if self._paused else "pause"))
 
     def clear_all(self):
         self._on_clear()

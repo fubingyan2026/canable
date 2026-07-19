@@ -113,15 +113,25 @@ class ZDTCanable:
         kwargs = dict(idVendor=self.vid, idProduct=self.pid)
         if self.serial:
             kwargs.setdefault("serial_number", self.serial)
+        logger.debug("查找设备: VID=0x%04X PID=0x%04X", self.vid, self.pid)
         self.dev = usb.core.find(**kwargs)
         if self.dev is None:
             raise RuntimeError(f"CANable not found (VID=0x{self.vid:04X}, PID=0x{self.pid:04X})")
 
+        # 获取设备序列号用于日志追踪
+        try:
+            sn = usb.util.get_string(self.dev, self.dev.iSerialNumber)
+            logger.info("设备已打开: serial=%s", sn)
+        except Exception:
+            logger.info("设备已打开: serial=<unknown>")
+
         self._setup_usb()
         self._init_device()
         self._detect_protocol()
+        logger.debug("协议检测完成: protocol=%s", self._protocol.__class__.__name__)
 
     def close(self):
+        logger.debug("关闭设备")
         if self._running:
             try:
                 self.stop()
@@ -449,12 +459,7 @@ class ZDTCanable:
             return None
 
         raw = bytes(data)
-        logger.debug("USB IN %3d hex: %s", len(raw), raw[:32].hex())
         frames = self._parser.feed(raw)
-        if frames:
-            logger.debug("parsed %d frames", len(frames))
-        else:
-            logger.debug("no frame from %d bytes (string/busload)", len(raw))
 
         return self._take_first_frame(frames)
 

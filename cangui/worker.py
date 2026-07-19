@@ -11,7 +11,7 @@ from collections import deque
 from typing import List, Optional
 
 import usb.core
-from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker, QObject, Slot
+from PySide6.QtCore import Signal, QMutex, QMutexLocker, QObject, Slot
 
 from .i18n import _
 
@@ -98,6 +98,7 @@ class CANWorker(QObject):
         if self._connected:
             return
         try:
+            logger.info("打开设备: bitrate=%d fd=%s", self.bitrate, self.fd_mode)
             self._bus = ZDTCanable()
             self._bus.open()
             self._bus.set_bitrate(self.bitrate)
@@ -111,6 +112,7 @@ class CANWorker(QObject):
             if self.fd_mode:
                 fd_ok = self._bus.check_fd_support()
                 if not fd_ok:
+                    logger.warning("固件不支持 CAN FD，降级为 Classic CAN")
                     self.error.emit(
                         f"⚠️ {_('Error.FDNotSupported')}"
                     )
@@ -121,10 +123,12 @@ class CANWorker(QObject):
                         self._bus.set_data_bitrate(self.data_bitrate)
                     # 仅在固件支持 FD 时才设置标志
                     self._bus.fd_mode = True
+                    logger.info("启用 FD 模式: data_bitrate=%s", self.data_bitrate)
 
             self._bus.start()
             self._connected = True
             self._running   = True
+            logger.info("CAN 控制器已启动")
             # 诊断：读取错误寄存器，帮助用户判断物理层是否正常
             try:
                 err = self._bus.read_error_register()
@@ -138,21 +142,11 @@ class CANWorker(QObject):
                 pass
             self.state_changed.emit(True, f"{_('Status.ConnectedAt')} {self.bitrate:,} bps")
         except Exception as e:
+            logger.exception("连接失败: %s", e)
             self._bus = None
             self._connected = False
             self.error.emit(f"{_('Error.ConnectFailed')}: {e}")
             self.state_changed.emit(False, _("Status.Disconnected"))
-
-    @Slot()
-    def disconnect(self):
-        self._running = False
-        self._connected = False
-        # 立即停止 CAN 控制器（短超时，不阻塞）
-        if self._bus is not None:
-            try:
-                self._bus.stop()
-            except Exception:
-                pass
 
     def take_batch(self):
         with QMutexLocker(self._buffer_mutex):
@@ -223,7 +217,6 @@ class CANWorker(QObject):
             frame.timestamp = time.time()
             try:
                 self._bus.send(frame)
-                logger.debug("TX  %s", frame)
                 with QMutexLocker(self._buffer_mutex):
                     self._frame_buffer.append(frame)
             except Exception as e:
@@ -232,7 +225,7 @@ class CANWorker(QObject):
                     self.error.emit(_("Error.SendFailedRecover"))
                 else:
                     self.error.emit(f"{_('Error.SendFailed')}: {e}")
-                    logger.warning("TX  失败 %s : %s", frame, e)
+                    logger.warning("TX  失败 id=0x%X: %s", frame.can_id, e)
 
     # ---------- 主循环 ---------- #
     @Slot()
@@ -301,7 +294,6 @@ class CANWorker(QObject):
                 frame_times.append(now)
                 while frame_times and frame_times[0] < now - window_s:
                     frame_times.popleft()
-                logger.debug("RX  %s", frame)
                 if self._pass(frame):
                     with QMutexLocker(self._buffer_mutex):
                         self._frame_buffer.append(frame)

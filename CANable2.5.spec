@@ -12,6 +12,10 @@ a = Analysis(
     datas=[
         ('cangui/logo.svg', 'cangui'),
         ('cangui/check.svg', 'cangui'),
+        ('cangui/close.svg', 'cangui'),
+        ('cangui/close_hover.svg', 'cangui'),
+        ('cangui/arrow_down.svg', 'cangui'),
+        ('cangui/arrow_down_dark.svg', 'cangui'),
         ('cangui/logo.ico', 'cangui'),
     ],
     hiddenimports=[

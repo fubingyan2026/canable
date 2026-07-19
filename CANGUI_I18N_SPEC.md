@@ -23,7 +23,7 @@
 | `Left.*` | 左侧面板 | `Left.Bitrate`, `Left.NoDevice` |
 | `Send.*` | 发送面板 | `Send.Add`, `Send.HdrID` |
 | `Send.Dlg*` | 发送对话框 | `Send.DlgID`, `Send.DlgFD` |
-| `Trace.*` | 跟踪面板 | `Trace.Clear`, `Trace.HdrID` |
+| `Trace.*` | 跟踪面板 | `Trace.Clear`, `Trace.ID` |
 | `Filter.*` | 过滤面板 | `Filter.Add`, `Filter.Drop` |
 | `Filter.Dlg*` | 过滤对话框 | `Filter.DlgTitle`, `Filter.DlgExt` |
 | `Stat.*` | 统计面板 | `Stat.TotalFrames`, `Stat.HdrCount` |
@@ -38,7 +38,7 @@
 - 使用 PascalCase，用点号分隔区域和具体键名
 - 对话框内的控件用 `模块.Dlg` 前缀区分
 - 表格表头用 `模块.Hdr` 前缀
-- 状态文本用动词过去式或名词：`Send.Started` / `Send.Stopped`
+- 状态文本用动词过去式或名词：`Send.StartAll` / `Send.StopAll`
 - 错误消息以名词短语开头：`Error.NotConnected`
 
 ---
@@ -201,7 +201,7 @@ _TR.update({
 ```
 
 - 快捷键用 `(&X)` 标记：`"Menu.File": {"zh": "文件(&F)", "en": "&File"}`
-- 省略号用 `…`（Unicode U+2026）：`"Tools.QuickSend": {"zh": "快速发送…", "en": "Quick Send…"}`
+- 省略号用 `…`（Unicode U+2026）：`"File.OpenTrace": {"zh": "打开 Trace(&O)…", "en": "&Open Trace…"}`
 - 冒号在标签后：`"Left.Bitrate": {"zh": "比特率:", "en": "Bitrate:"}`
 
 ---

@@ -121,7 +121,6 @@ class _ElmueProtocol:
         self._pending_frames = frames + self._pending_frames
 
     def _parse_message(self, msg: bytes, msg_type: int) -> Optional[CANFrame]:
-        logger.debug("parse: type=%d size=%d", msg_type, len(msg))
         if msg_type == MSG_RxFrame:
             return CANFrame.from_elmue_rx(msg, self._has_timestamp)
         elif msg_type == MSG_TxEcho:

@@ -60,7 +60,7 @@ QTableView 渲染
 ### 关键限制
 
 - `_frame_buffer`（worker）：`deque(maxlen=10000)` — 子线程缓冲上限
-- `_rows`（TraceModel）：`deque(maxlen=1000)` — UI 显示行数上限
+- `_rows`（TraceModel）：`deque(maxlen=30000)` — UI 显示行数上限（`DEFAULT_MAX_ROWS`）
 - `MAX_BATCH`：每批最多处理 1000 帧 — 超出部分丢弃
 - `_batch_timer`：100ms 间隔 — 主线程唤醒频率
 
@@ -112,13 +112,13 @@ QTableView 渲染
 | 组件 | 大小 | 说明 |
 |------|------|------|
 | `_frame_buffer`（worker） | 上限 3 MB | `maxlen=10000 × ~300B` |
-| `_rows`/`_text`/`_meta`（trace） | 0.5 MB | `maxlen=1000 × ~500B` |
+| `_rows`/`_text`/`_meta`（trace） | 上限 15 MB | `maxlen=30000 × ~500B` |
 | `_counts`/`_last_ts`/`_period` | ~50 KB | 唯一 ID 数有限 |
 | `_log_buffer`（trace 日志） | 0.2 MB | `maxlen=1000 × ~200B` |
 | `frame_times`（fps 统计） | 16 KB | `maxlen=2000 × 8B` |
 | Qt6 框架基线 | ~125 MB | 固定 |
 | Python 运行时 | ~15 MB | 解释器 + 模块 |
-| **总 RSS** | **~140-160 MB** | 长时间运行稳定 |
+| **总 RSS** | **~155-180 MB** | 长时间运行稳定 |
 
 ### 内存稳定性结论
 
@@ -227,9 +227,8 @@ QTableView 渲染
 | [worker.py:238-312](file:///home/fubingyan/桌面/canable/cangui/worker.py#L238-L312) | `run()` 主循环 | 接收+过滤+缓冲 |
 | [main_window.py:67-70](file:///home/fubingyan/桌面/canable/cangui/main_window.py#L67-L70) | `_batch_timer` 100ms | 批量刷新定时器 |
 | [main_window.py:489-499](file:///home/fubingyan/桌面/canable/cangui/main_window.py#L489-L499) | `_on_batch_frames()` | 批量帧处理 |
-| [trace.py:22](file:///home/fubingyan/桌面/canable/cangui/trace.py#L22) | `DEFAULT_MAX_ROWS=1000` | UI 显示行数上限 |
+| [trace.py:23](file:///home/fubingyan/桌面/canable/cangui/trace.py#L23) | `DEFAULT_MAX_ROWS=30000` | UI 显示行数上限 |
 | [trace.py:149-200](file:///home/fubingyan/桌面/canable/cangui/trace.py#L149-L200) | `add_frame()` | 帧添加+字典清理 |
-| [trace.py:33-35](file:///home/fubingyan/桌面/canable/cangui/trace.py#L33-L35) | `_ASCII_TRANSLATION` | ASCII 预生成表 |
 
 ---
 

@@ -1,6 +1,7 @@
 """Filter / Statistics 面板。"""
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from PySide6.QtCore import Qt, Signal, QSettings
@@ -13,7 +14,10 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 
 from .worker import CANFilter
 from .i18n import _
+from . import icons as icon_lib
 from .style import id_color, FG_ACCENT
+
+logger = logging.getLogger("cangui.filters")
 
 
 def _make_item(text, align=None, color=None):
@@ -115,9 +119,13 @@ class FilterPanel(QWidget):
 
         bar = QHBoxLayout()
         self.add_btn   = QPushButton(_("Filter.Add"))
+        self.add_btn.setIcon(icon_lib.make_icon("plus"))
         self.edit_btn  = QPushButton(_("Filter.Edit"))
+        self.edit_btn.setIcon(icon_lib.make_icon("pencil"))
         self.del_btn   = QPushButton(_("Filter.Delete"))
+        self.del_btn.setIcon(icon_lib.make_icon("trash"))
         self.clear_btn = QPushButton(_("Filter.Clear"))
+        self.clear_btn.setIcon(icon_lib.make_icon("trash"))
         for b in (self.add_btn, self.edit_btn, self.del_btn, self.clear_btn):
             bar.addWidget(b)
         bar.addStretch()
@@ -144,6 +152,7 @@ class FilterPanel(QWidget):
         return rows[0].row() if rows else None
 
     def _emit(self):
+        logger.info("过滤器变更: count=%d", len(self.filters))
         self.filters_changed.emit(list(self.filters))
 
     def _on_add(self):
@@ -181,6 +190,13 @@ class FilterPanel(QWidget):
         self.clear_btn.setText(_("Filter.Clear"))
         self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
         self._refresh()
+
+    def refresh_icons(self):
+        """主题切换时重新生成图标。"""
+        self.add_btn.setIcon(icon_lib.make_icon("plus"))
+        self.edit_btn.setIcon(icon_lib.make_icon("pencil"))
+        self.del_btn.setIcon(icon_lib.make_icon("trash"))
+        self.clear_btn.setIcon(icon_lib.make_icon("trash"))
 
     def to_dict_list(self):
         return [

@@ -51,7 +51,6 @@ _TR.update({
     "Window.Filters":        {"zh": "过滤器",  "en": "Filters"},
 
     # Tools menu items
-    "Tools.QuickSend":       {"zh": "快速发送…", "en": "Quick Send…"},
 
     # Help menu items
     "Help.About":            {"zh": "关于 CANable 2.5", "en": "About CANable 2.5"},
@@ -78,9 +77,9 @@ _TR.update({
     "Trace.Resume":          {"zh": "继续",        "en": "Resume"},
     "Trace.AutoScroll":      {"zh": "自动滚动",    "en": "Auto scroll"},
     "Trace.Collapse":        {"zh": "折叠 ID",     "en": "Collapse"},
-    "Trace.MaxRows":         {"zh": "最大行数:",   "en": "Max rows:"},
     "Trace.Received":        {"zh": "已接收:",     "en": "Received:"},
     "Trace.UniqueIDs":       {"zh": "唯一 ID:",    "en": "Unique IDs:"},
+
 
     # Send panel
     "Send.Add":              {"zh": "添加",        "en": "Add"},
@@ -91,13 +90,11 @@ _TR.update({
     "Send.Stop":             {"zh": "停止",        "en": "Stop"},
     "Send.StartAll":         {"zh": "已启动周期发送", "en": "Periodic send started"},
     "Send.StopAll":          {"zh": "已停止周期发送", "en": "Periodic send stopped"},
-    "Send.ClearAll":         {"zh": "清空列表",    "en": "Clear list"},
     "Send.DialogTitle":      {"zh": "编辑发送报文", "en": "Edit Send Message"},
     "Send.Ready":            {"zh": "就绪",        "en": "Ready"},
 
     # Send panel table headers
     "Send.HdrName":        {"zh": "名称",    "en": "Name"},
-    "Send.HdrIndex":         {"zh": "#",       "en": "#"},
     "Send.HdrID":            {"zh": "ID",      "en": "ID"},
     "Send.HdrType":          {"zh": "类型",    "en": "Type"},
     "Send.HdrDLC":           {"zh": "DLC",     "en": "DLC"},
@@ -143,6 +140,7 @@ _TR.update({
     "Left.Disconnect":       {"zh": "断开",            "en": "Disconnect"},
     "Left.NoDeviceSelected": {"zh": "请先选择一个设备", "en": "Please select a device first"},
     "Left.NoDevice":         {"zh": "未发现 candleLight 设备", "en": "No candleLight device found"},
+    "Left.RestoreSidebar":   {"zh": "恢复侧栏", "en": "Restore sidebar"},
 
     # Status bar
     "Status.Connected":      {"zh": "已连接",          "en": "Connected"},
@@ -186,11 +184,7 @@ _TR.update({
     # Main window misc
     "Scan.Failed":          {"zh": "扫描失败",    "en": "Scan failed"},
     "Send.SelectRow":       {"zh": "请先选中一行", "en": "Please select a row first"},
-    "Send.Clear":           {"zh": "清空",        "en": "Clear"},
-    "Send.Cleared":         {"zh": "已清空",      "en": "Cleared"},
-    "Send.Items":           {"zh": "条发送项",    "en": "send items"},
     "Load.Failed":          {"zh": "加载失败",    "en": "Load failed"},
-    "Format.Error":         {"zh": "格式错误",    "en": "Format error"},
 
     # Worker errors
     "Error.FDNotSupported":     {"zh": "固件不支持 CAN FD，已回退到经典 CAN 模式，请取消勾选 CAN FD 选项", "en": "Firmware does not support CAN FD, reverted to Classic CAN. Uncheck CAN FD option"},
@@ -199,7 +193,6 @@ _TR.update({
     "Status.ConnectedAt":       {"zh": "已连接 @", "en": "Connected @"},
     "Error.BitrateFailed":      {"zh": "设置波特率失败", "en": "Failed to set bitrate"},
     "Error.NotConnected":       {"zh": "未连接，无法发送", "en": "Not connected, cannot send"},
-    "Error.ControllerNotRunning": {"zh": "控制器未启动，无法发送", "en": "Controller not running, cannot send"},
     "Error.SendFailedRecover":  {"zh": "发送失败: 控制器已自动恢复，请重试", "en": "Send failed: controller auto-recovered, please retry"},
     "Error.SendFailed":         {"zh": "发送失败", "en": "Send failed"},
     "Error.ReceiveError":       {"zh": "接收错误", "en": "Receive error"},
@@ -211,10 +204,6 @@ _TR.update({
     "File.SaveTraceTitle":      {"zh": "保存 Trace", "en": "Save Trace"},
     "File.OpenTraceTitle":      {"zh": "加载 Trace", "en": "Open Trace"},
     "File.TraceSaved":          {"zh": "Trace 已保存到", "en": "Trace saved to"},
-
-    # Quick send
-    "Tools.QuickSendHint":      {"zh": "格式: ID,HEX_DATA    例:  0x123,DE AD BE EF 0A", "en": "Format: ID,HEX_DATA    e.g.  0x123,DE AD BE EF 0A"},
-    "Tools.Sent":               {"zh": "已发送", "en": "Sent"},
 
     # Trace misc
     "Trace.CollapseTooltip":    {"zh": "每个 CAN ID 仅显示最新帧", "en": "Show only latest frame per CAN ID"},

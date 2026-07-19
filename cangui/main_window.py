@@ -5,26 +5,26 @@ import os
 import csv
 import json
 import logging
-from typing import List, Optional
+from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QThread, Slot
-from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QThread, Slot, QEvent, QPoint, QMutexLocker
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut, QColor
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QApplication,
                                 QLabel, QComboBox, QPushButton, QSplitter, QFrame,
                                 QListWidget, QListWidgetItem, QTabWidget, QTabBar,
-                                QDockWidget, QStatusBar, QToolBar, QFileDialog,
-                                QMessageBox, QInputDialog, QGroupBox, QFormLayout,
-                                QCheckBox, QToolButton)
-
-from PySide6.QtCore import QMutexLocker
+                                QDockWidget, QStatusBar, QFileDialog,
+                                QMessageBox, QGroupBox, QFormLayout,
+                                QCheckBox, QToolButton, QGraphicsDropShadowEffect)
 
 from canable_sdk import ZDTCanable, CANFrame
-from .style import set_theme, get_qss, current_theme, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR
-from .i18n import _, language_changed, get_language, set_language
+from .style import set_theme, get_qss, current_theme
+from .i18n import _, get_language, set_language
 from .worker import CANWorker
 from .trace import TracePanel
 from .send import SendPanel
 from .plugin_host import PluginHost
+from .title_bar import MacTitleBar
+from . import icons as icon_lib
 
 logger = logging.getLogger("cangui.main_window")
 from .filters import FilterPanel
@@ -42,9 +42,14 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # macOS 风格无边框窗口：自定义标题栏 + 边缘缩放
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setWindowTitle("CANable 2.5")
         self.resize(1400, 850)
         self.setDockOptions(self.dockOptions() & ~QMainWindow.AnimatedDocks)
+        # 鼠标跟踪用于边缘缩放光标提示
+        self.setMouseTracking(True)
+        self._resize_margin = 5  # 边缘缩放触发宽度（px）
 
         self._settings_dirty = False
         self._settings_timer = QTimer(self)
@@ -67,12 +72,14 @@ class MainWindow(QMainWindow):
         self._settings = {}
 
         # 批量帧刷新定时器（主线程）
-        # 100ms 间隔：稳定性优先，支持 ~5000 fps 不丢帧（受 MAX_BATCH=500 限制）
+        # 100ms 间隔：稳定性优先，支持 ~5000 fps 不丢帧（受 MAX_BATCH=1000 限制）
         self._batch_timer = QTimer(self)
         self._batch_timer.timeout.connect(self._on_batch_frames)
         self._batch_timer.start(100)
 
         self.__init_ui()
+        # 边缘缩放事件过滤器：监听整个应用内的鼠标移动，命中窗口边缘时启动系统缩放
+        QApplication.instance().installEventFilter(self)
         # 插件宿主：在 UI 构建完成后加载所有插件
         self.plugins = PluginHost(self)
         # Block signals during programmatic plugin tab activation to avoid
@@ -110,6 +117,7 @@ class MainWindow(QMainWindow):
 
     def __init_ui(self):
         self._build_ui()
+        self._build_titlebar()
         self._build_menubar()
         self._build_statusbar()
         self._wire_signals()
@@ -132,17 +140,48 @@ class MainWindow(QMainWindow):
         center_tabs.currentChanged.connect(self._on_center_tab_changed)
         self._center_tabs = center_tabs
 
-        # 左侧：设备 + 总线
-        left = self._build_left_panel()
+        # 左侧：设备 + 总线（包装为圆角卡片，带柔和投影）
+        left_inner = self._build_left_panel()
+        # left_inner 保留 objectName="sidebar"（QSS 中已改为透明背景），
+        # 由外层 sidebarCard 提供卡片底色 + 圆角 + 投影
+        # 外层 margins 与 dock 一致（2px），保持左右间隔视觉统一
+        left_card = QFrame()
+        left_card.setObjectName("sidebarCard")
+        left_card_lay = QVBoxLayout(left_card)
+        left_card_lay.setContentsMargins(2, 2, 2, 2)
+        left_card_lay.setSpacing(0)
+        left_card_lay.addWidget(left_inner)
+        # 柔和投影
+        shadow = QGraphicsDropShadowEffect(left_card)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(0, 0, 0, 35))
+        left_card.setGraphicsEffect(shadow)
+        self._left_inner = left_inner
 
         # 主分割
         self.splitter = QSplitter(Qt.Horizontal)
-        self.splitter.addWidget(left)
+        self.splitter.addWidget(left_card)
         self.splitter.addWidget(center_tabs)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([260, 1140])
+        self.splitter.setSizes([280, 1120])
+        self.splitter.setHandleWidth(4)
+        # 允许把左侧拖到 0 宽度以完全收起（恢复按钮会在收起时显示）
+        self.splitter.setChildrenCollapsible(True)
+        left_card.setMinimumWidth(0)
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
         self.setCentralWidget(self.splitter)
+        self._left_card = left_card
+
+        # 浮动恢复按钮：sidebar 被收起时显示在窗口左侧中部
+        self._sidebar_restore_btn = QPushButton("›", self)
+        self._sidebar_restore_btn.setObjectName("sidebarRestoreBtn")
+        self._sidebar_restore_btn.setFixedSize(14, 70)
+        self._sidebar_restore_btn.setCursor(Qt.PointingHandCursor)
+        self._sidebar_restore_btn.setToolTip(_("Left.RestoreSidebar"))
+        self._sidebar_restore_btn.hide()
+        self._sidebar_restore_btn.clicked.connect(self._restore_sidebar)
 
         # 底部 Send Dock
         self.send_panel = SendPanel(self)
@@ -171,36 +210,173 @@ class MainWindow(QMainWindow):
         filter_bar = self.filter_dock.titleBarWidget()
         filter_bar._close_btn.clicked.connect(lambda: self.filter_dock.setVisible(False))
 
-    def _make_dock_title(self, text: str) -> QWidget:
-        """自定义 Dock 标题栏（Qt 默认标题栏无法用 QSS 改文字颜色）。
-        保留原生关闭/浮动按钮，文字颜色走 FG_ACCENT 与总线连接状态一致。
+    def _build_titlebar(self):
+        """构建 macOS 风格标题栏并嵌入到菜单栏上方。
+
+        使用 ``setMenuWidget`` 把 [MacTitleBar + QMenuBar] 容器作为窗口顶部装饰。
+        注意：直接构造 QMenuBar 实例，不通过 ``self.menuBar()`` 获取，
+        避免 ``setMenuWidget`` 替换菜单组件时引用错乱。
         """
-        from cangui.style import FG_ACCENT, BG_HEADER
-        bar = QWidget()
+        from PySide6.QtWidgets import QMenuBar
+        self.title_bar = MacTitleBar("CANable 2.5", self)
+        self._menubar = QMenuBar(self)
+        container = QWidget()
+        container.setObjectName("titleContainer")
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.title_bar)
+        lay.addWidget(self._menubar)
+        self.setMenuWidget(container)
+        # 交通灯信号
+        self.title_bar.close_requested.connect(self.close)
+        self.title_bar.minimize_requested.connect(self.showMinimized)
+        self.title_bar.maximize_requested.connect(self._toggle_maximize)
+
+    def _toggle_maximize(self):
+        """切换最大化/还原。"""
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    # ---- 左侧 sidebar 收起/恢复 ----
+    DEFAULT_SIDEBAR_WIDTH = 280
+
+    def _on_splitter_moved(self, pos: int, index: int):
+        """splitter 拖动时检测左侧是否被收起到极小宽度。"""
+        sizes = self.splitter.sizes()
+        if not sizes:
+            return
+        left_w = sizes[0]
+        btn = self._sidebar_restore_btn
+        # 用 isHidden() 而非 isVisible()：isVisible() 在父窗口未显示时也返回 False
+        if left_w < 30 and btn.isHidden():
+            btn.show()
+            btn.raise_()
+            self._position_restore_btn()
+        elif left_w >= 30 and not btn.isHidden():
+            btn.hide()
+
+    def _restore_sidebar(self):
+        """点击恢复按钮：把左侧 sidebar 恢复到默认宽度。"""
+        total = self.splitter.width()
+        target = min(self.DEFAULT_SIDEBAR_WIDTH, max(200, total // 4))
+        self.splitter.setSizes([target, max(0, total - target)])
+        self._sidebar_restore_btn.hide()
+
+    def _position_restore_btn(self):
+        """把恢复按钮定位到窗口左侧垂直中部。"""
+        btn = self._sidebar_restore_btn
+        # 标题栏 + 菜单栏下方，垂直居中
+        top_offset = self.title_bar.height() + (self._menubar.height() if self._menubar else 0)
+        avail_h = self.height() - top_offset
+        if avail_h <= 0:
+            avail_h = self.height()
+        y = top_offset + (avail_h - btn.height()) // 2
+        btn.move(0, max(top_offset, y))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_sidebar_restore_btn") and not self._sidebar_restore_btn.isHidden():
+            self._position_restore_btn()
+
+    # ---- 边缘缩放（事件过滤器监听整个应用的鼠标事件） ----
+    def eventFilter(self, obj, event):
+        try:
+            t = event.type()
+            if t == QEvent.MouseMove or t == QEvent.MouseButtonPress:
+                if isinstance(obj, QWidget) and (obj is self or self.isAncestorOf(obj)):
+                    # 鼠标位置（全局坐标转窗口局部坐标）
+                    global_pos = event.globalPosition().toPoint()
+                    local_pos = self.mapFromGlobal(global_pos)
+                    edges = self._resize_edges(local_pos)
+                    if t == QEvent.MouseMove:
+                        if edges:
+                            cursor = self._cursor_for_edges(edges)
+                            if cursor is not None:
+                                self.setCursor(cursor)
+                        else:
+                            # 仅当当前光标是缩放光标时才还原，避免覆盖子控件设置的光标
+                            cur = self.cursor()
+                            if cur.shape() in (Qt.SizeHorCursor, Qt.SizeVerCursor,
+                                                Qt.SizeFDiagCursor, Qt.SizeBDiagCursor):
+                                self.unsetCursor()
+                    elif t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                        if edges:
+                            wh = self.windowHandle()
+                            if wh is not None:
+                                wh.startSystemResize(edges)
+                                return True  # 拦截，防止子控件也响应
+            return super().eventFilter(obj, event)
+        except KeyboardInterrupt:
+            # Ctrl+C：让 Qt 正常退出，避免 eventFilter 抛异常导致 Qt 报错
+            QApplication.quit()
+            return True
+        except Exception:
+            # 其他异常：吞掉，防止 eventFilter 抛异常导致 Qt 报错
+            logger.exception("eventFilter 异常")
+            return False
+
+    def _resize_edges(self, pos: QPoint):
+        """根据鼠标在窗口内的位置返回需要缩放的边集合（Qt.Edges）。"""
+        m = self._resize_margin
+        left = pos.x() <= m
+        right = pos.x() >= self.width() - m
+        top = pos.y() <= m
+        bottom = pos.y() >= self.height() - m
+        if not (left or right or top or bottom):
+            return None
+        edges = Qt.Edges()
+        if left: edges |= Qt.LeftEdge
+        if right: edges |= Qt.RightEdge
+        if top: edges |= Qt.TopEdge
+        if bottom: edges |= Qt.BottomEdge
+        return edges
+
+    @staticmethod
+    def _cursor_for_edges(edges) -> Qt.CursorShape | None:
+        if edges is None:
+            return None
+        has_left = Qt.LeftEdge in edges
+        has_right = Qt.RightEdge in edges
+        has_top = Qt.TopEdge in edges
+        has_bottom = Qt.BottomEdge in edges
+        # 角落：对角缩放
+        if (has_left and has_top) or (has_right and has_bottom):
+            return Qt.SizeFDiagCursor
+        if (has_right and has_top) or (has_left and has_bottom):
+            return Qt.SizeBDiagCursor
+        # 单边
+        if has_left or has_right:
+            return Qt.SizeHorCursor
+        if has_top or has_bottom:
+            return Qt.SizeVerCursor
+        return None
+
+    def _make_dock_title(self, text: str) -> QWidget:
+        """自定义 Dock 标题栏：macOS 风格小标题 + 圆角关闭按钮。
+
+        样式由 QSS 统一控制（#dockTitleBar / #dockTitle / #dockCloseBtn），
+        主题切换时不需要手动同步内联样式。
+        """
+        bar = QFrame()
         bar.setObjectName("dockTitleBar")
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(10, 4, 4, 4)
-        lay.setSpacing(4)
+        lay.setContentsMargins(10, 4, 6, 4)
+        lay.setSpacing(6)
         lbl = QLabel(text)
         lbl.setObjectName("dockTitle")
-        lbl.setStyleSheet(
-            f"color: {FG_ACCENT}; font-weight: bold; background: transparent;"
-        )
         lay.addWidget(lbl)
         lay.addStretch()
 
         # 关闭按钮
         close_btn = QToolButton()
         close_btn.setObjectName("dockCloseBtn")
-        close_btn.setText("×")
+        close_btn.setText("\u00D7")  # ×
         close_btn.setAutoRaise(True)
-        close_btn.setFixedSize(20, 20)
+        close_btn.setFixedSize(22, 22)
         close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setStyleSheet(
-            f"QToolButton {{ border: none; color: {FG_ACCENT}; "
-            f"font-weight: bold; font-size: 14pt; background: transparent; }}"
-            f"QToolButton:hover {{ background-color: {BG_HEADER}; border-radius: 3px; }}"
-        )
         lay.addWidget(close_btn)
 
         bar._title_label = lbl  # 供 refresh_language 更新
@@ -217,7 +393,8 @@ class MainWindow(QMainWindow):
         w = QFrame()
         w.setObjectName("sidebar")
         layout = QVBoxLayout(w)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
 
         # 总线配置
         self._bus_box = QGroupBox(_("Left.Bus"))
@@ -265,11 +442,13 @@ class MainWindow(QMainWindow):
         self.device_list = QListWidget()
         dv.addWidget(self.device_list)
         self.scan_btn = QPushButton(_("Left.Scan"))
+        self.scan_btn.setIcon(icon_lib.make_icon("scan"))
         self.scan_btn.clicked.connect(self._scan_devices)
         self.device_list.currentItemChanged.connect(self._on_device_selection_changed)
         dv.addWidget(self.scan_btn)
         self.connect_btn = QPushButton(_("Left.ConnectDevice"))
         self.connect_btn.setObjectName("connectBtn")
+        self.connect_btn.setIcon(icon_lib.make_icon("power"))
         self.connect_btn.setCheckable(True)
         self.connect_btn.setEnabled(False)
         self.connect_btn.clicked.connect(self._on_connect_toggle)
@@ -279,7 +458,9 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_menubar(self):
-        mb = self.menuBar()
+        # 使用 _build_titlebar 中创建的 self._menubar（已被 setMenuWidget 装入容器）。
+        # 不能改用 self.menuBar()：在 setMenuWidget 之后它可能返回一个新的 QMenuBar 实例。
+        mb = self._menubar
 
         self._menu_actions = []
         # File
@@ -309,10 +490,6 @@ class MainWindow(QMainWindow):
 
         # Tools
         tools_menu = mb.addMenu(_("Menu.Tools"))
-        act_send_once = QAction(_("Tools.QuickSend"), self)
-        act_send_once.setShortcut("Ctrl+Return")
-        act_send_once.triggered.connect(self._on_quick_send)
-        tools_menu.addAction(act_send_once)
 
         # Language submenu
         theme_menu = tools_menu.addMenu(_("Menu.Theme"))
@@ -364,7 +541,6 @@ class MainWindow(QMainWindow):
             (act_open, "File.OpenTrace"),
             (act_save, "File.SaveTrace"),
             (act_quit, "File.Exit"),
-            (act_send_once, "Tools.QuickSend"),
             (act_about, "Help.About"),
             (self.act_theme_light, "Theme.Light"),
             (self.act_theme_dark, "Theme.Dark"),
@@ -529,6 +705,9 @@ class MainWindow(QMainWindow):
         self._worker.fd_mode = self.fd_chk.isChecked()
         if self.fd_chk.isChecked():
             self._worker.data_bitrate = self.data_bitrate_combo.currentData()
+        logger.info("连接请求: bitrate=%d fd=%s data_bitrate=%s",
+                    self._worker.bitrate, self._worker.fd_mode,
+                    getattr(self._worker, 'data_bitrate', None))
         # 使用 _batch_timer 100ms 批量刷新，不连接逐帧 frame_received 信号
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.error.connect(self._on_error)
@@ -553,6 +732,7 @@ class MainWindow(QMainWindow):
     def _disconnect(self):
         if self._worker is None:
             return
+        logger.info("断开请求: frame_count=%d", self._frame_count)
         self._disconnecting = True
         worker = self._worker
         # 断开所有信号，防止后台清理时的回调干扰 UI
@@ -592,14 +772,21 @@ class MainWindow(QMainWindow):
         self.status_label.style().polish(self.status_label)
         self.connect_btn.setChecked(connected)
         self.connect_btn.setText(_("Left.Disconnect") if connected else _("Left.ConnectDevice"))
+        # 连接状态切换图标：连接后用 power_off（提示断开），未连接用 power
+        self.connect_btn.setIcon(icon_lib.make_icon("power_off" if connected else "power"))
         if not connected:
             item = self.device_list.currentItem()
             self.connect_btn.setEnabled(item is not None and bool(item.flags() & Qt.ItemIsEnabled))
         self.bitrate_combo.setEnabled(not connected)
         self.bitrate_label.setText(f"{self.bitrate_combo.currentData():,} {_('Left.BPS')}" if connected else f"— {_('Left.BPS')}")
+        # 同步连接状态到发送面板：未连接时禁止启动周期发送。
+        # 放在 _update_connect_ui 而非 _on_state_changed，确保主动 _disconnect()
+        # （已断开 state_changed 信号，_on_state_changed 不会被触发）也能正确同步。
+        self.send_panel.set_connected(connected)
 
     @Slot(bool, str)
     def _on_state_changed(self, connected: bool, msg: str):
+        logger.info("状态变更: connected=%s msg=%s", connected, msg)
         if connected:
             self._update_connect_ui(True, msg)
             # 恢复之前暂停的周期发送（保留用户的 enabled 配置）
@@ -638,6 +825,7 @@ class MainWindow(QMainWindow):
         # throttle: limit frames per batch to prevent UI freeze
         MAX_BATCH = 1000
         if len(batch) > MAX_BATCH:
+            logger.warning("批量帧超限截断: %d -> %d", len(batch), MAX_BATCH)
             batch = batch[-MAX_BATCH:]
         for frame in batch:
             self._frame_count += 1
@@ -752,25 +940,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, _("File.OpenTraceTitle"), f"{_('Load.Failed')}: {e}")
 
-    # ------------------------------------------------------------ 快速发送
-    def _on_quick_send(self):
-        text, ok = QInputDialog.getText(
-            self, _("Tools.QuickSend"),
-            _("Tools.QuickSendHint"),
-        )
-        if not ok or not text.strip():
-            return
-        try:
-            parts = [p.strip() for p in text.split(",")]
-            can_id = int(parts[0], 16)
-            data = bytes.fromhex(parts[1].replace(" ", "")) if len(parts) > 1 else b""
-            extended = can_id > 0x7FF
-            frame = CANFrame(can_id, data, extended=extended)
-            self._on_send_frame(frame)
-            self.status_label.setText(f"{_('Tools.Sent')}: {frame}")
-        except Exception as e:
-            QMessageBox.warning(self, _("File.OpenTrace"), f"{_('Format.Error')}: {e}")
-
     # ------------------------------------------------------------ 关闭
     def _on_about(self):
         QMessageBox.information(self, _("Help.About"),
@@ -813,6 +982,8 @@ class MainWindow(QMainWindow):
         splitter_hex = s.get("splitter")
         if splitter_hex:
             self.splitter.restoreState(bytes.fromhex(splitter_hex))
+        # 恢复后检查 sidebar 是否处于收起状态
+        self._on_splitter_moved(0, 0)
         trace_hdr = s.get("trace_hdr")
         if trace_hdr:
             self.trace_panel.view.horizontalHeader().restoreState(bytes.fromhex(trace_hdr))
@@ -850,18 +1021,20 @@ class MainWindow(QMainWindow):
         set_theme(name)
         self._set("theme", name)
         QApplication.instance().setStyleSheet(get_qss())
-        # 同步自定义 dock 标题栏颜色（QSS 无法作用于内联样式）
-        from cangui.style import FG_ACCENT, BG_HEADER
-        for dock in (self.send_dock, self.filter_dock):
-            bar = dock.titleBarWidget()
-            bar._title_label.setStyleSheet(
-                f"color: {FG_ACCENT}; font-weight: bold; background: transparent;"
-            )
-            bar._close_btn.setStyleSheet(
-                f"QToolButton {{ border: none; color: {FG_ACCENT}; "
-                f"font-weight: bold; font-size: 14pt; background: transparent; }}"
-                f"QToolButton:hover {{ background-color: {BG_HEADER}; border-radius: 3px; }}"
-            )
+        # 清空图标缓存（颜色随主题变化），并让子面板重新生成图标
+        icon_lib.clear_cache()
+        for panel in (self.trace_panel, self.send_panel, self.filter_panel):
+            if hasattr(panel, "refresh_icons"):
+                panel.refresh_icons()
+        # 主窗口自身的按钮图标
+        if hasattr(self, "scan_btn"):
+            self.scan_btn.setIcon(icon_lib.make_icon("scan"))
+        if hasattr(self, "connect_btn"):
+            self.connect_btn.setIcon(icon_lib.make_icon("power"))
+        if hasattr(self, "title_bar"):
+            # 标题栏颜色由 QSS 自动同步；触发一次 polish 确保生效
+            self.title_bar.style().unpolish(self.title_bar)
+            self.title_bar.style().polish(self.title_bar)
 
     def _on_language_changed(self, action):
         self._set("language", "zh" if action == self.act_lang_zh else "en")
@@ -888,6 +1061,9 @@ class MainWindow(QMainWindow):
         self._lbl_sample.setText(_("Left.SamplePoint"))
         self._lbl_canmode.setText(_("Left.CANMode"))
         self.fd_chk.setText(_("Left.CANFD"))
+        # 浮动恢复按钮
+        if hasattr(self, "_sidebar_restore_btn"):
+            self._sidebar_restore_btn.setToolTip(_("Left.RestoreSidebar"))
         # status bar
         if hasattr(self, "fps_label"):
             self.fps_label.setText(f"{self._last_fps} {_('Status.FPS')}")
@@ -964,6 +1140,7 @@ class MainWindow(QMainWindow):
             self.plugins.refresh_language()
 
     def closeEvent(self, e):
+        logger.info("窗口关闭: frame_count=%d connected=%s", self._frame_count, self._connected)
         if not hasattr(self, 'bitrate_combo'):
             e.accept()
             return

@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """CANable 2.5 启动脚本。运行 python cangui.py 即可。
 
-启动时会在终端输出 INFO 级别的日志，包含：
-  - CAN 控制器状态（连接 / 启动 / 停止）
-  - 每次 TX / RX 帧内容（标准帧 [123 SFF] DE AD BE EF)
-  - 错误与警告
+日志配置在 cangui/__main__.py 的 setup_logging() 中：
+  - 终端输出 INFO 级别（精简，便于实时观察）
+  - 文件输出 DEBUG 级别（详细，便于事后排查）
+  - 每次启动新建一个日志文件：logs/canable_YYYYMMDD_HHMMSS.log
 """
 import sys
 import os
-import logging
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 在 import 任何业务模块前配置 logging，确保 canable_sdk 内的 logger 也能输出
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stderr,
-)
-
 from cangui.__main__ import main
-main()
+
+if __name__ == "__main__":
+    main()

@@ -4,16 +4,25 @@
 
 ## 目录
 
-- [硬件需求](#硬件需求)
-- [功能特性](#功能特性)
-- [环境搭建](#环境搭建)
-  - [Windows](#windows)
-  - [Linux](#linux)
-- [运行](#运行)
-- [打包 EXE](#打包-exe)
-- [目录结构](#目录结构)
-- [开发规范](#开发规范)
-- [常见问题](#常见问题)
+- [CANable 2.5 GUI](#canable-25-gui)
+  - [目录](#目录)
+  - [硬件需求](#硬件需求)
+  - [功能特性](#功能特性)
+  - [环境搭建](#环境搭建)
+    - [Windows](#windows)
+    - [Linux](#linux)
+  - [运行](#运行)
+  - [打包 EXE](#打包-exe)
+  - [目录结构](#目录结构)
+  - [开发规范](#开发规范)
+    - [国际化（i18n）](#国际化i18n)
+    - [主题](#主题)
+    - [设置持久化](#设置持久化)
+    - [日志系统](#日志系统)
+  - [常见问题](#常见问题)
+    - [扫描不到设备](#扫描不到设备)
+    - [CAN FD 无法接收 BRS 帧](#can-fd-无法接收-brs-帧)
+    - [RX 超时错误](#rx-超时错误)
 
 ## 硬件需求
 
@@ -29,9 +38,11 @@
 - **统计面板** — 按 ID 统计帧数、周期、总线负载
 - **CAN FD** — 支持 CAN FD + BRS，独立配置数据比特率
 - **中/英双语** — 运行时切换，无需重启
-- **浅色/深色主题** — 马卡龙色系主题，运行时切换
+- **浅色/深色主题** — macOS 风格界面，自定义交通灯标题栏、圆角卡片、柔和投影，运行时切换
 - **参数持久化** — 窗口布局、比特率、过滤器、发送列表等自动保存恢复
 - **Trace 导出** — 支持 CSV / JSON Lines / ASC 格式
+- **插件系统** — 中心 Tab 支持加载自定义插件（`plugins/` 目录）
+- **日志系统** — 每次启动生成独立日志文件（`logs/canable_YYYYMMDD_HHMMSS.log`），终端 INFO + 文件 DEBUG
 
 ## 环境搭建
 
@@ -97,21 +108,15 @@ python -m cangui
 # 1. 安装 PyInstaller
 pip install pyinstaller
 
-# 2. 打包
-pyinstaller --clean --noconfirm `
-    --onefile --windowed `
-    --name "CANable2.5" `
-    --icon "cangui/logo.svg" `
-    --add-data "cangui/logo.svg;cangui" `
-    --add-data "cangui/check.svg;cangui" `
-    --add-data "libusb-1.0.dll;." `
-    --hidden-import "usb.backend.libusb1" `
-    --hidden-import "usb.backend.libusb0" `
-    --hidden-import "PySide6.QtXml" `
-    cangui.py
+# 2. 使用 spec 文件打包（onedir 模式，UPX 已禁用以加快启动）
+pyinstaller --clean --noconfirm CANable2.5.spec
 ```
 
-输出：`dist/CANable2.5.exe`
+输出：`dist/CANable2.5/CANable2.5.exe`
+
+`CANable2.5.spec` 已配置：
+- 资源文件：`logo.svg`、`check.svg`、`close.svg`、`close_hover.svg`、`libusb-1.0.dll`
+- 隐藏导入：`usb.backend.libusb1`、`usb.backend.libusb0`、`PySide6.QtXml`
 
 `settings.json` 和 `send_list.csv` 保存在 exe 同目录下，持久化不丢失。
 
@@ -121,16 +126,22 @@ pyinstaller --clean --noconfirm `
 canable/
 ├── cangui.py                  # 入口脚本
 ├── cangui/                    # PySide6 GUI 模块
-│   ├── __main__.py            # 模块入口
-│   ├── main_window.py         # 主窗口
+│   ├── __main__.py            # 模块入口（日志系统 + SIGINT 处理）
+│   ├── main_window.py         # 主窗口（无边框 + macOS 风格标题栏）
+│   ├── title_bar.py           # 自定义交通灯标题栏（红/黄/绿按钮）
 │   ├── worker.py              # CAN 工作线程
 │   ├── trace.py               # Trace 面板（消息流表格）
-│   ├── send.py                # 发送面板（单帧/周期发送）
+│   ├── send.py                # 发送面板（单帧/周期发送，toggle 启停按钮）
 │   ├── filters.py             # 过滤器 + 统计面板
+│   ├── plugin_host.py         # 插件宿主（中心 Tab 加载插件）
+│   ├── icons.py               # SVG 图标渲染（QSvgRenderer）
 │   ├── i18n.py                # 中/英国际化
-│   ├── style.py               # 主题（马卡龙浅色/深色）
+│   ├── style.py               # 主题（macOS 风格浅色/深色）
 │   ├── logo.svg               # 应用图标
-│   └── check.svg              # 复选框勾选图标
+│   ├── check.svg              # 复选框勾选图标
+│   ├── close.svg              # Tab 关闭按钮图标
+│   └── close_hover.svg        # Tab 关闭按钮 hover 图标
+├── plugins/                   # 用户插件目录（自动加载）
 ├── canable_sdk/               # Python SDK
 │   ├── driver.py              # ZDTCanable 主驱动
 │   ├── frame.py               # CANFrame 数据类
@@ -138,7 +149,9 @@ canable/
 │   ├── constants.py           # USB ID、枚举常量
 │   ├── bitrate.py             # 位时序表
 │   └── cli.py                 # CLI 命令行工具
+├── logs/                      # 运行日志（每次启动新建一个 .log）
 ├── CANGUI_I18N_SPEC.md        # 国际化开发规范
+├── CANable2.5.spec            # PyInstaller 打包配置
 ├── libusb-1.0.dll             # Windows USB 后端
 ├── install_udev.sh            # Linux udev 规则
 └── requirements.txt
@@ -176,6 +189,18 @@ self.my_btn = QPushButton("添加")
 - 主题和语言偏好
 
 对话框的几何信息通过 `QSettings` 自动保存恢复。
+
+### 日志系统
+
+每次应用启动会在 `logs/` 目录创建独立日志文件（`canable_YYYYMMDD_HHMMSS.log`）：
+- **终端输出**：INFO 级别及以上
+- **文件输出**：DEBUG 级别及以上（完整诊断信息）
+- **格式**：`%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s`
+
+日志规范：
+- 只记录事件切换（连接/断开、启动/停止、错误、配置变更）
+- 禁止记录高频逐帧数据（USB raw bytes、TX/RX 帧详情、协议解析细节）
+- 第三方库（urllib3、PIL、usb._debug）默认压制到 WARNING 级别
 
 ## 常见问题
 
