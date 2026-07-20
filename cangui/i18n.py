@@ -39,7 +39,6 @@ _TR.update({
     "Menu.Help":             {"zh": "帮助(&H)",  "en": "&Help"},
     "Menu.Plugins":          {"zh": "插件(&P)",  "en": "&Plugins"},
     "Menu.Language":         {"zh": "语言",      "en": "Language"},
-    "Menu.Theme":           {"zh": "主题",      "en": "Theme"},
 
     # File menu items
     "File.OpenTrace":        {"zh": "打开 Trace(&O)…", "en": "&Open Trace…"},
@@ -54,10 +53,6 @@ _TR.update({
 
     # Help menu items
     "Help.About":            {"zh": "关于 CANable 2.5", "en": "About CANable 2.5"},
-
-    # Language names — 不再使用 i18n key，语言菜单项固定显示原生语种（中文/English）
-    "Theme.Light":          {"zh": "浅色",     "en": "Light"},
-    "Theme.Dark":           {"zh": "深色",     "en": "Dark"},
 
     # Trace column headers
     "Trace.No":              {"zh": "序号",        "en": "No."},
@@ -140,7 +135,6 @@ _TR.update({
     "Left.Disconnect":       {"zh": "断开",            "en": "Disconnect"},
     "Left.NoDeviceSelected": {"zh": "请先选择一个设备", "en": "Please select a device first"},
     "Left.NoDevice":         {"zh": "未发现 candleLight 设备", "en": "No candleLight device found"},
-    "Left.RestoreSidebar":   {"zh": "恢复侧栏", "en": "Restore sidebar"},
 
     # Status bar
     "Status.Connected":      {"zh": "已连接",          "en": "Connected"},

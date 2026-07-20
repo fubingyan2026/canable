@@ -38,7 +38,6 @@
 - **统计面板** — 按 ID 统计帧数、周期、总线负载
 - **CAN FD** — 支持 CAN FD + BRS，独立配置数据比特率
 - **中/英双语** — 运行时切换，无需重启
-- **浅色/深色主题** — macOS 风格界面，自定义交通灯标题栏、圆角卡片、柔和投影，运行时切换
 - **参数持久化** — 窗口布局、比特率、过滤器、发送列表等自动保存恢复
 - **Trace 导出** — 支持 CSV / JSON Lines / ASC 格式
 - **插件系统** — 中心 Tab 支持加载自定义插件（`plugins/` 目录）
@@ -127,8 +126,8 @@ canable/
 ├── cangui.py                  # 入口脚本
 ├── cangui/                    # PySide6 GUI 模块
 │   ├── __main__.py            # 模块入口（日志系统 + SIGINT 处理）
-│   ├── main_window.py         # 主窗口（无边框 + macOS 风格标题栏）
-│   ├── title_bar.py           # 自定义交通灯标题栏（红/黄/绿按钮）
+│   ├── main_window.py         # 主窗口（标准 QMainWindow，Dock 布局）
+│   ├── title_bar.py           # 自定义标题栏（已废弃，保留兼容）
 │   ├── worker.py              # CAN 工作线程
 │   ├── trace.py               # Trace 面板（消息流表格）
 │   ├── send.py                # 发送面板（单帧/周期发送，toggle 启停按钮）
@@ -136,13 +135,8 @@ canable/
 │   ├── plugin_host.py         # 插件宿主（中心 Tab 加载插件）
 │   ├── icons.py               # SVG 图标渲染（QSvgRenderer）
 │   ├── i18n.py                # 中/英国际化
-│   ├── style.py               # 主题（macOS 风格浅色/深色）
-│   ├── logo.svg               # 应用图标
-│   ├── check.svg              # 复选框勾选图标
-│   ├── close.svg              # Tab 关闭按钮图标
-│   ├── close_hover.svg        # Tab 关闭按钮 hover 图标
-│   ├── arrow_down.svg         # 下拉框菱形箭头（浅色主题）
-│   └── arrow_down_dark.svg    # 下拉框菱形箭头（深色主题）
+│   ├── style.py               # 样式（最小化 QSS，功能性样式）
+│   └── logo.svg               # 应用图标
 ├── plugins/                   # 用户插件目录（自动加载）
 ├── canable_sdk/               # Python SDK
 │   ├── driver.py              # ZDTCanable 主驱动
@@ -180,7 +174,7 @@ self.my_btn = QPushButton("添加")
 
 ### 主题
 
-颜色常量定义在 `style.py` 中，支持浅色/深色两套调色板。所有颜色必须使用 `style.py` 导出的常量（如 `BG_CARD`、`FG_ACCENT`），禁止硬编码颜色值，以确保主题切换时一致。
+样式使用 Qt 默认风格，`style.py` 仅定义必要的颜色常量（用于程序逻辑）和最小化 QSS（用于状态栏连接状态、总线负载级别等功能性样式）。控件不再使用自定义 QSS，保持原生平台外观。
 
 ### 设置持久化
 

@@ -7,27 +7,26 @@ import json
 import logging
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QThread, Slot, QEvent, QPoint, QMutexLocker
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut, QColor
+from PySide6.QtCore import Qt, QTimer, QThread, Slot, QMutexLocker
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QApplication,
                                 QLabel, QComboBox, QPushButton, QSplitter, QFrame,
                                 QListWidget, QListWidgetItem, QTabWidget, QTabBar,
                                 QDockWidget, QStatusBar, QFileDialog,
                                 QMessageBox, QGroupBox, QFormLayout,
-                                QCheckBox, QToolButton, QGraphicsDropShadowEffect)
+                                QCheckBox, QToolButton)
 
 from canable_sdk import ZDTCanable, CANFrame
-from .style import set_theme, get_qss, current_theme
+from .style import get_qss
 from .i18n import _, get_language, set_language
 from .worker import CANWorker
 from .trace import TracePanel
 from .send import SendPanel
+from .filters import FilterPanel
 from .plugin_host import PluginHost
-from .title_bar import MacTitleBar
 from . import icons as icon_lib
 
 logger = logging.getLogger("cangui.main_window")
-from .filters import FilterPanel
 
 # --------------------------------------------------------------------------- #
 #  主窗口
@@ -42,14 +41,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        # macOS 风格无边框窗口：自定义标题栏 + 边缘缩放
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setWindowTitle("CANable 2.5")
         self.resize(1400, 850)
         self.setDockOptions(self.dockOptions() & ~QMainWindow.AnimatedDocks)
-        # 鼠标跟踪用于边缘缩放光标提示
-        self.setMouseTracking(True)
-        self._resize_margin = 5  # 边缘缩放触发宽度（px）
 
         self._settings_dirty = False
         self._settings_timer = QTimer(self)
@@ -78,8 +72,6 @@ class MainWindow(QMainWindow):
         self._batch_timer.start(100)
 
         self.__init_ui()
-        # 边缘缩放事件过滤器：监听整个应用内的鼠标移动，命中窗口边缘时启动系统缩放
-        QApplication.instance().installEventFilter(self)
         # 插件宿主：在 UI 构建完成后加载所有插件
         self.plugins = PluginHost(self)
         # Block signals during programmatic plugin tab activation to avoid
@@ -117,7 +109,6 @@ class MainWindow(QMainWindow):
 
     def __init_ui(self):
         self._build_ui()
-        self._build_titlebar()
         self._build_menubar()
         self._build_statusbar()
         self._wire_signals()
@@ -151,12 +142,6 @@ class MainWindow(QMainWindow):
         left_card_lay.setContentsMargins(2, 2, 2, 2)
         left_card_lay.setSpacing(0)
         left_card_lay.addWidget(left_inner)
-        # 柔和投影
-        shadow = QGraphicsDropShadowEffect(left_card)
-        shadow.setBlurRadius(18)
-        shadow.setOffset(0, 2)
-        shadow.setColor(QColor(0, 0, 0, 35))
-        left_card.setGraphicsEffect(shadow)
         self._left_inner = left_inner
 
         # 主分割
@@ -167,71 +152,29 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([280, 1120])
         self.splitter.setHandleWidth(4)
-        # 允许把左侧拖到 0 宽度以完全收起（恢复按钮会在收起时显示）
-        self.splitter.setChildrenCollapsible(True)
-        left_card.setMinimumWidth(0)
-        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+        left_card.setMinimumWidth(150)
         self.setCentralWidget(self.splitter)
         self._left_card = left_card
 
-        # 浮动恢复按钮：sidebar 被收起时显示在窗口左侧中部
-        self._sidebar_restore_btn = QPushButton("›", self)
-        self._sidebar_restore_btn.setObjectName("sidebarRestoreBtn")
-        self._sidebar_restore_btn.setFixedSize(14, 70)
-        self._sidebar_restore_btn.setCursor(Qt.PointingHandCursor)
-        self._sidebar_restore_btn.setToolTip(_("Left.RestoreSidebar"))
-        self._sidebar_restore_btn.hide()
-        self._sidebar_restore_btn.clicked.connect(self._restore_sidebar)
-
         # 底部 Send Dock
         self.send_panel = SendPanel(self)
-        self.send_dock = QDockWidget("", self)
+        self.send_dock = QDockWidget(_("Window.SendMessages"), self)
         self.send_dock.setObjectName("SendDock")
-        self.send_dock.setTitleBarWidget(self._make_dock_title(_("Window.SendMessages")))
         self.send_dock.setWidget(self.send_panel)
         self.send_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.send_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.send_dock)
-        # 自定义关闭按钮 → 隐藏 dock（可通过窗口菜单重新打开）
-        send_bar = self.send_dock.titleBarWidget()
-        send_bar._close_btn.clicked.connect(lambda: self.send_dock.setVisible(False))
 
         # 右侧 Filter Dock
         self.filter_panel = FilterPanel(self)
-        self.filter_dock = QDockWidget("", self)
+        self.filter_dock = QDockWidget(_("Window.Filters"), self)
         self.filter_dock.setObjectName("FilterDock")
-        self.filter_dock.setTitleBarWidget(self._make_dock_title(_("Window.Filters")))
         self.filter_dock.setWidget(self.filter_panel)
         self.filter_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.filter_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.filter_dock)
-        filter_bar = self.filter_dock.titleBarWidget()
-        filter_bar._close_btn.clicked.connect(lambda: self.filter_dock.setVisible(False))
-
-    def _build_titlebar(self):
-        """构建 macOS 风格标题栏并嵌入到菜单栏上方。
-
-        使用 ``setMenuWidget`` 把 [MacTitleBar + QMenuBar] 容器作为窗口顶部装饰。
-        注意：直接构造 QMenuBar 实例，不通过 ``self.menuBar()`` 获取，
-        避免 ``setMenuWidget`` 替换菜单组件时引用错乱。
-        """
-        from PySide6.QtWidgets import QMenuBar
-        self.title_bar = MacTitleBar("CANable 2.5", self)
-        self._menubar = QMenuBar(self)
-        container = QWidget()
-        container.setObjectName("titleContainer")
-        lay = QVBoxLayout(container)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        lay.addWidget(self.title_bar)
-        lay.addWidget(self._menubar)
-        self.setMenuWidget(container)
-        # 交通灯信号
-        self.title_bar.close_requested.connect(self.close)
-        self.title_bar.minimize_requested.connect(self.showMinimized)
-        self.title_bar.maximize_requested.connect(self._toggle_maximize)
 
     def _toggle_maximize(self):
         """切换最大化/还原。"""
@@ -239,155 +182,6 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showMaximized()
-
-    # ---- 左侧 sidebar 收起/恢复 ----
-    DEFAULT_SIDEBAR_WIDTH = 280
-
-    def _on_splitter_moved(self, pos: int, index: int):
-        """splitter 拖动时检测左侧是否被收起到极小宽度。"""
-        sizes = self.splitter.sizes()
-        if not sizes:
-            return
-        left_w = sizes[0]
-        btn = self._sidebar_restore_btn
-        # 用 isHidden() 而非 isVisible()：isVisible() 在父窗口未显示时也返回 False
-        if left_w < 30 and btn.isHidden():
-            btn.show()
-            btn.raise_()
-            self._position_restore_btn()
-        elif left_w >= 30 and not btn.isHidden():
-            btn.hide()
-
-    def _restore_sidebar(self):
-        """点击恢复按钮：把左侧 sidebar 恢复到默认宽度。"""
-        total = self.splitter.width()
-        target = min(self.DEFAULT_SIDEBAR_WIDTH, max(200, total // 4))
-        self.splitter.setSizes([target, max(0, total - target)])
-        self._sidebar_restore_btn.hide()
-
-    def _position_restore_btn(self):
-        """把恢复按钮定位到窗口左侧垂直中部。"""
-        btn = self._sidebar_restore_btn
-        # 标题栏 + 菜单栏下方，垂直居中
-        top_offset = self.title_bar.height() + (self._menubar.height() if self._menubar else 0)
-        avail_h = self.height() - top_offset
-        if avail_h <= 0:
-            avail_h = self.height()
-        y = top_offset + (avail_h - btn.height()) // 2
-        btn.move(0, max(top_offset, y))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "_sidebar_restore_btn") and not self._sidebar_restore_btn.isHidden():
-            self._position_restore_btn()
-
-    # ---- 边缘缩放（事件过滤器监听整个应用的鼠标事件） ----
-    def eventFilter(self, obj, event):
-        try:
-            t = event.type()
-            if t == QEvent.MouseMove or t == QEvent.MouseButtonPress:
-                if isinstance(obj, QWidget) and (obj is self or self.isAncestorOf(obj)):
-                    # 鼠标位置（全局坐标转窗口局部坐标）
-                    global_pos = event.globalPosition().toPoint()
-                    local_pos = self.mapFromGlobal(global_pos)
-                    edges = self._resize_edges(local_pos)
-                    if t == QEvent.MouseMove:
-                        if edges:
-                            cursor = self._cursor_for_edges(edges)
-                            if cursor is not None:
-                                self.setCursor(cursor)
-                        else:
-                            # 仅当当前光标是缩放光标时才还原，避免覆盖子控件设置的光标
-                            cur = self.cursor()
-                            if cur.shape() in (Qt.SizeHorCursor, Qt.SizeVerCursor,
-                                                Qt.SizeFDiagCursor, Qt.SizeBDiagCursor):
-                                self.unsetCursor()
-                    elif t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                        if edges:
-                            wh = self.windowHandle()
-                            if wh is not None:
-                                wh.startSystemResize(edges)
-                                return True  # 拦截，防止子控件也响应
-            return super().eventFilter(obj, event)
-        except KeyboardInterrupt:
-            # Ctrl+C：让 Qt 正常退出，避免 eventFilter 抛异常导致 Qt 报错
-            QApplication.quit()
-            return True
-        except Exception:
-            # 其他异常：吞掉，防止 eventFilter 抛异常导致 Qt 报错
-            logger.exception("eventFilter 异常")
-            return False
-
-    def _resize_edges(self, pos: QPoint):
-        """根据鼠标在窗口内的位置返回需要缩放的边集合（Qt.Edges）。"""
-        m = self._resize_margin
-        left = pos.x() <= m
-        right = pos.x() >= self.width() - m
-        top = pos.y() <= m
-        bottom = pos.y() >= self.height() - m
-        if not (left or right or top or bottom):
-            return None
-        edges = Qt.Edges()
-        if left: edges |= Qt.LeftEdge
-        if right: edges |= Qt.RightEdge
-        if top: edges |= Qt.TopEdge
-        if bottom: edges |= Qt.BottomEdge
-        return edges
-
-    @staticmethod
-    def _cursor_for_edges(edges) -> Qt.CursorShape | None:
-        if edges is None:
-            return None
-        has_left = Qt.LeftEdge in edges
-        has_right = Qt.RightEdge in edges
-        has_top = Qt.TopEdge in edges
-        has_bottom = Qt.BottomEdge in edges
-        # 角落：对角缩放
-        if (has_left and has_top) or (has_right and has_bottom):
-            return Qt.SizeFDiagCursor
-        if (has_right and has_top) or (has_left and has_bottom):
-            return Qt.SizeBDiagCursor
-        # 单边
-        if has_left or has_right:
-            return Qt.SizeHorCursor
-        if has_top or has_bottom:
-            return Qt.SizeVerCursor
-        return None
-
-    def _make_dock_title(self, text: str) -> QWidget:
-        """自定义 Dock 标题栏：macOS 风格小标题 + 圆角关闭按钮。
-
-        样式由 QSS 统一控制（#dockTitleBar / #dockTitle / #dockCloseBtn），
-        主题切换时不需要手动同步内联样式。
-        """
-        bar = QFrame()
-        bar.setObjectName("dockTitleBar")
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(10, 4, 6, 4)
-        lay.setSpacing(6)
-        lbl = QLabel(text)
-        lbl.setObjectName("dockTitle")
-        lay.addWidget(lbl)
-        lay.addStretch()
-
-        # 关闭按钮
-        close_btn = QToolButton()
-        close_btn.setObjectName("dockCloseBtn")
-        close_btn.setText("\u00D7")  # ×
-        close_btn.setAutoRaise(True)
-        close_btn.setFixedSize(22, 22)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        lay.addWidget(close_btn)
-
-        bar._title_label = lbl  # 供 refresh_language 更新
-        bar._close_btn = close_btn
-        bar._close_callback = None
-        return bar
-
-    @staticmethod
-    def _wire_dock_close(title_bar: QWidget, callback) -> None:
-        title_bar._close_callback = callback
-        title_bar._close_btn.clicked.connect(callback)
 
     def _build_left_panel(self) -> QFrame:
         w = QFrame()
@@ -458,9 +252,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_menubar(self):
-        # 使用 _build_titlebar 中创建的 self._menubar（已被 setMenuWidget 装入容器）。
-        # 不能改用 self.menuBar()：在 setMenuWidget 之后它可能返回一个新的 QMenuBar 实例。
-        mb = self._menubar
+        mb = self.menuBar()
 
         self._menu_actions = []
         # File
@@ -491,20 +283,6 @@ class MainWindow(QMainWindow):
         # Tools
         tools_menu = mb.addMenu(_("Menu.Tools"))
 
-        # Language submenu
-        theme_menu = tools_menu.addMenu(_("Menu.Theme"))
-        self.act_theme_light = QAction(_("Theme.Light"), self, checkable=True)
-        self.act_theme_dark = QAction(_("Theme.Dark"), self, checkable=True)
-        self.act_theme_light.setChecked(current_theme() == "light")
-        self.act_theme_dark.setChecked(current_theme() == "dark")
-        theme_group = QActionGroup(self)
-        theme_group.setExclusive(True)
-        theme_group.addAction(self.act_theme_light)
-        theme_group.addAction(self.act_theme_dark)
-        theme_menu.addAction(self.act_theme_light)
-        theme_menu.addAction(self.act_theme_dark)
-        theme_group.triggered.connect(self._on_theme_changed)
-
         lang_menu = tools_menu.addMenu(_("Menu.Language"))
         self.act_lang_zh = QAction("中文", self, checkable=True)
         self.act_lang_en = QAction("English", self, checkable=True)
@@ -531,7 +309,6 @@ class MainWindow(QMainWindow):
 
         # register actions for language refresh
         self._menu_actions = [
-            (theme_menu, "Menu.Theme"),
             (lang_menu, "Menu.Language"),
             (self._menu_file, "Menu.File"),
             (view_menu, "Menu.Windows"),
@@ -542,9 +319,6 @@ class MainWindow(QMainWindow):
             (act_save, "File.SaveTrace"),
             (act_quit, "File.Exit"),
             (act_about, "Help.About"),
-            (self.act_theme_light, "Theme.Light"),
-            (self.act_theme_dark, "Theme.Dark"),
-            # 语言菜单项使用固定文字（中文永远显示"中文"，English永远显示"English"），不参与 i18n 刷新
         ]
         QShortcut(QKeySequence("Ctrl+L"), self, self.trace_panel.clear_all)
 
@@ -965,16 +739,11 @@ class MainWindow(QMainWindow):
         if s.get("collapse", False):
             self.trace_panel.collapse_chk.setChecked(True)
         lang = s.get("language", "zh")
-        theme = s.get("theme", "light")
-        set_theme(theme)
         QApplication.instance().setStyleSheet(get_qss())
         set_language(lang)
         if hasattr(self, "act_lang_zh"):
             self.act_lang_zh.setChecked(lang == "zh")
             self.act_lang_en.setChecked(lang != "zh")
-        if hasattr(self, "act_theme_light"):
-            self.act_theme_light.setChecked(theme == "light")
-            self.act_theme_dark.setChecked(theme == "dark")
         try:
             self.filter_panel.from_dict_list(s.get("filters", []), emit=False)
         except Exception:
@@ -982,8 +751,6 @@ class MainWindow(QMainWindow):
         splitter_hex = s.get("splitter")
         if splitter_hex:
             self.splitter.restoreState(bytes.fromhex(splitter_hex))
-        # 恢复后检查 sidebar 是否处于收起状态
-        self._on_splitter_moved(0, 0)
         trace_hdr = s.get("trace_hdr")
         if trace_hdr:
             self.trace_panel.view.horizontalHeader().restoreState(bytes.fromhex(trace_hdr))
@@ -1016,26 +783,6 @@ class MainWindow(QMainWindow):
         self._refresh_language()
 
 
-    def _on_theme_changed(self, action):
-        name = "dark" if action == self.act_theme_dark else "light"
-        set_theme(name)
-        self._set("theme", name)
-        QApplication.instance().setStyleSheet(get_qss())
-        # 清空图标缓存（颜色随主题变化），并让子面板重新生成图标
-        icon_lib.clear_cache()
-        for panel in (self.trace_panel, self.send_panel, self.filter_panel):
-            if hasattr(panel, "refresh_icons"):
-                panel.refresh_icons()
-        # 主窗口自身的按钮图标
-        if hasattr(self, "scan_btn"):
-            self.scan_btn.setIcon(icon_lib.make_icon("scan"))
-        if hasattr(self, "connect_btn"):
-            self.connect_btn.setIcon(icon_lib.make_icon("power"))
-        if hasattr(self, "title_bar"):
-            # 标题栏颜色由 QSS 自动同步；触发一次 polish 确保生效
-            self.title_bar.style().unpolish(self.title_bar)
-            self.title_bar.style().polish(self.title_bar)
-
     def _on_language_changed(self, action):
         self._set("language", "zh" if action == self.act_lang_zh else "en")
         set_language("zh" if action == self.act_lang_zh else "en")
@@ -1061,9 +808,6 @@ class MainWindow(QMainWindow):
         self._lbl_sample.setText(_("Left.SamplePoint"))
         self._lbl_canmode.setText(_("Left.CANMode"))
         self.fd_chk.setText(_("Left.CANFD"))
-        # 浮动恢复按钮
-        if hasattr(self, "_sidebar_restore_btn"):
-            self._sidebar_restore_btn.setToolTip(_("Left.RestoreSidebar"))
         # status bar
         if hasattr(self, "fps_label"):
             self.fps_label.setText(f"{self._last_fps} {_('Status.FPS')}")
@@ -1073,9 +817,6 @@ class MainWindow(QMainWindow):
         # docks
         self.send_dock.setWindowTitle(_("Window.SendMessages"))
         self.filter_dock.setWindowTitle(_("Window.Filters"))
-        # 同步自定义标题栏文字
-        self.send_dock.titleBarWidget()._title_label.setText(_("Window.SendMessages"))
-        self.filter_dock.titleBarWidget()._title_label.setText(_("Window.Filters"))
         # center tab
         if hasattr(self, "_center_tabs"):
             self._center_tabs.setTabText(0, _("Trace.TabLabel"))
@@ -1150,7 +891,6 @@ class MainWindow(QMainWindow):
         self._set("sample_point", self.sample_combo.currentIndex())
         self._set("autoscroll", self.trace_panel.autoscroll_chk.isChecked())
         self._set("collapse", self.trace_panel.collapse_chk.isChecked())
-        self._set("theme", current_theme())
         self._set("language", get_language())
         self._set("filters", self.filter_panel.to_dict_list())
         self._set("splitter", bytes(self.splitter.saveState().toHex()).decode())
