@@ -56,16 +56,16 @@ class BootUpgradePlugin(Plugin):
             return True  # 异常时允许关闭，避免卡死
 
     def on_deactivating(self) -> None:
-        """Tab 即将关闭：若升级进行中，发送 CANCEL 释放节点状态。
+        """Tab 即将关闭：若升级进行中，取消升级。
 
         此时 widget 仍存在，可安全调用 panel 方法。
-        配置已通过 ctx.set_setting() 写入主 settings.json，由主程序统一防抖落盘。
+        UpgradeTask 在宿主 worker 线程上运行，cancel() 设置标志位即可。
         """
         if self._panel is None:
             return
         try:
-            if self._panel._upgrader.is_active:
-                self._panel._upgrader.cancel()
+            if self._panel._task is not None:
+                self._panel._task.cancel()
         except Exception:
             pass
 
@@ -85,8 +85,7 @@ class BootUpgradePlugin(Plugin):
             self._panel.on_disconnect()
 
     def on_frames(self, frames) -> None:
-        if self._panel is not None:
-            self._panel.on_frames(frames)
+        pass  # Upgrader 自有 CAN 连接，不依赖宿主派发帧
 
     def refresh_language(self) -> None:
         if self._panel is not None:

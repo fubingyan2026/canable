@@ -106,6 +106,18 @@ class PluginContext:
         else:
             self._mw.status_bar_set_text(msg)
 
+    # ----- 升级任务 (供插件在 worker 线程上执行) -----
+    def start_upgrade(self, task) -> None:
+        """在 CAN worker 线程上执行升级任务。
+
+        task 必须实现 ``run(bus: ZDTCanable)`` 方法。
+        worker 线程会在下次循环迭代时调用 task.run(bus)，
+        期间正常 CAN 收发暂停，完成后自动恢复。
+        """
+        if self._mw._worker is None:
+            raise RuntimeError("CAN not connected")
+        self._mw._worker.set_upgrade_task(task)
+
     # ----- i18n -----
     def register_i18n(self, key: str, zh: str, en: str) -> str:
         """注册一个 i18n key 并返回当前语言文本。后注册覆盖先注册。
@@ -329,6 +341,8 @@ class PluginHost:
             if not os.path.isdir(full):
                 continue
             if not os.path.isfile(os.path.join(full, "__init__.py")):
+                continue
+            if not os.path.isfile(os.path.join(full, "plugin.py")):
                 continue
             plugin = self._load_one(entry)
             if plugin is None:

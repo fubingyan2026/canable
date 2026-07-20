@@ -1,469 +1,347 @@
-"""Bootloader 升级状态机（主机端）。
+"""Bootloader 升级状态机 — 在宿主 CAN worker 线程上运行。
 
-实现 boot_protocol_spec.md §5 升级流程与 §6 错误处理：
+UpgradeSignals: QObject, 驻留主线程, 发射信号更新 UI。
+UpgradeTask: plain object, worker 线程调用 task.run(bus)。
 
-状态流转::
-
-    IDLE → HANDSHAKE → TRANSFER → VERIFY → REBOOT → DONE
-                       ↓            ↓
-                     FAILED       FAILED
-
-设计要点：
-- 通过 PluginContext.send_frame() 走 worker 线程安全队列发送
-- 通过 on_frame() 接收节点 ACK/NACK（由插件 on_frames 派发）
-- QTimer 实现 ACK 等待与全局超时
-- 断点续传：DATA_START NACK(BLOCK_INDEX_MISMATCH) 时跳到期望块号
-- 同块最多重试 MAX_RETRIES 次
-
-注：本状态机运行在主线程，所有 Qt 信号/定时器均可直接使用。
+对齐 flash_tool/worker.py 的稳定实现：
+- 同步 while 循环状态机
+- _poll_response() 帧间 1ms 节流 + 中途 NACK 拦截
+- _last_rx_monotonic 节点失联检测
+- 断点续传 + 重同步 (RESYNC_STATUS)
 """
 from __future__ import annotations
 
-import logging
-from typing import Optional, List
+import time
+from typing import Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Signal
 
-from canable_sdk import CANFrame
-from cangui.i18n import _
+from canable_sdk import ZDTCanable, CANFrame
 from . import protocol as P
-from .protocol import Cmd, Err
+from .protocol import Cmd, Err, parse_nack_block_index, RESYNC_STATUS
 
-logger = logging.getLogger("plugin.boot_upgrade")
-
-
-class BootState:
-    IDLE = "idle"
-    HANDSHAKE = "handshake"
-    TRANSFER = "transfer"
-    VERIFY = "verify"
-    REBOOT = "reboot"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+# ── 超时 / 重试常量 (对齐 flash_tool) ──
+BLOCK_ACK_TIMEOUT = 1.0
+HANDSHAKE_TIMEOUT = 5.0
+MAX_RETRIES = 3
+NODE_LOST_TIMEOUT = 6.0
+MAX_SAME_BLOCK = 5
 
 
-# 处于这些状态时表示升级"进行中"，关闭 Tab / 断开连接应触发 CANCEL
-ACTIVE_STATES = (BootState.HANDSHAKE, BootState.TRANSFER,
-                  BootState.VERIFY, BootState.REBOOT)
+class BootConfig:
+    """升级配置 (由 UI 构建)。"""
+    def __init__(self, *, fw: bytes, fw_version: int = 0x0100,
+                 hw_id: int = 0x0001, max_frame_size: int = 64,
+                 host_id: int = 0x701):
+        self.fw = fw
+        self.fw_version = fw_version & 0xFFFF
+        self.hw_id = hw_id & 0xFFFF
+        self.max_frame_size = max_frame_size
+        self.host_id = host_id & 0x7FF
+        self.node_id = (host_id + 1) & 0x7FF
 
 
-class Upgrader(QObject):
-    """主机端 Bootloader 状态机。
-
-    信号：
-        state_changed(str)      — 状态变化
-        progress(int, int)      — (已完成块数, 总块数)
-        block_progress(int,int) — (块内已发帧数, 块内总帧数)
-        log(str, str)           — (level, message)  level: info/warn/error
-        finished(bool, str)     — (success, message)
-    """
-
+class UpgradeSignals(QObject):
+    """升级过程信号 (主线程 QObject，供 widget 连接)。"""
     state_changed = Signal(str)
     progress = Signal(int, int)
     block_progress = Signal(int, int)
     log = Signal(str, str)
     finished = Signal(bool, str)
 
-    def __init__(self, ctx):
-        super().__init__()
-        self._ctx = ctx
-        self._fw: Optional[bytes] = None
-        self._fw_version: int = 0
-        self._hw_id: int = 0
-        self._max_frame_size: int = 64
-        self._host_id: int = P.DEFAULT_HOST_ID
-        self._node_id: int = P.DEFAULT_NODE_ID
 
-        self._state = BootState.IDLE
-        self._expected_block = 0
-        self._total_blocks = 0
-        self._retries = 0
+class UpgradeTask:
+    """升级状态机 — plain object，在 worker 线程上执行。
 
-        # 请求-响应配对
-        self._pending_ack_cmd: Optional[int] = None
+    用法::
 
-        # ACK 等待定时器（每命令一个）
-        self._ack_timer = QTimer(self)
-        self._ack_timer.setSingleShot(True)
-        self._ack_timer.timeout.connect(self._on_ack_timeout)
+        signals = UpgradeSignals()
+        signals.state_changed.connect(...)
+        task = UpgradeTask(config, signals)
+        ctx.start_upgrade(task)  # worker 线程调用 task.run(bus)
+    """
 
-        # 全局会话超时（6s 无响应 → 失败）
-        self._global_timer = QTimer(self)
-        self._global_timer.setSingleShot(True)
-        self._global_timer.timeout.connect(self._on_global_timeout)
+    def __init__(self, config: BootConfig, signals: UpgradeSignals):
+        self._cfg = config
+        self._sig = signals
+        self.cancel_requested = False
 
-    # ------------------------------------------------------------------ #
-    #  属性
-    # ------------------------------------------------------------------ #
-    @property
-    def state(self) -> str:
-        return self._state
+    def cancel(self):
+        """主线程调用：请求取消升级。"""
+        self.cancel_requested = True
 
-    @property
-    def node_id(self) -> int:
-        return self._node_id
-
-    @property
-    def host_id(self) -> int:
-        return self._host_id
-
-    @property
-    def is_active(self) -> bool:
-        """升级进行中（用于插件判断是否需阻止关闭）。"""
-        return self._state in ACTIVE_STATES
-
-    # ------------------------------------------------------------------ #
-    #  配置
-    # ------------------------------------------------------------------ #
-    def configure(self, fw: bytes, fw_version: int, hw_id: int,
-                  max_frame_size: int, host_id: int) -> None:
-        if max_frame_size not in P.SUPPORTED_FRAME_SIZES:
-            raise ValueError(f"frame_size {max_frame_size} not in {P.SUPPORTED_FRAME_SIZES}")
-        # 固件大小由用户自行负责：节点侧会校验 fw_size ≤ App 分区并回 NACK(FW_TOO_BIG)
-        self._fw = fw
-        self._fw_version = fw_version & 0xFFFF
-        self._hw_id = hw_id & 0xFFFF
-        self._max_frame_size = max_frame_size
-        self._host_id = host_id & 0x7FF  # 标准帧
-        self._node_id = (host_id + 1) & 0x7FF
-        self._total_blocks = P.total_blocks(len(fw))
-
-    # ------------------------------------------------------------------ #
-    #  启动 / 取消
-    # ------------------------------------------------------------------ #
-    def start(self) -> bool:
-        if not self._ctx.is_connected():
-            self._emit_log("error", _("Boot.Log.NotConnected"))
-            self._set_state(BootState.FAILED)
-            self.finished.emit(False, _("Boot.Log.NotConnectedFinished"))
-            return False
-        if not self._fw:
-            self._emit_log("error", _("Boot.Log.NoFirmware"))
-            return False
-        if self._state in ACTIVE_STATES:
-            self._emit_log("warn", _("Boot.Log.AlreadyActive"))
-            return False
-
-        self._set_state(BootState.HANDSHAKE)
-        self._global_timer.start(P.GLOBAL_TIMEOUT_MS)
-        self._expected_block = 0
-        self._retries = 0
-        self.progress.emit(0, self._total_blocks)
-        return self._send_start()
-
-    def cancel(self) -> None:
-        """用户主动取消。无论当前状态都发送 CANCEL 并复位。"""
-        if self._state in (BootState.IDLE, BootState.DONE,
-                           BootState.FAILED, BootState.CANCELLED):
-            self._set_state(BootState.CANCELLED)
-            self.finished.emit(False, _("Boot.Log.UserCancel"))
-            return
-        self._emit_log("info", _("Boot.Log.CancelSent"))
+    # ── 由 worker 线程调用 ──
+    def run(self, bus: ZDTCanable):
+        """在 worker 线程上执行同步升级状态机。bus 是宿主已打开的 ZDTCanable。"""
+        self._bus = bus
+        success = False
         try:
-            self._send_frame(build_cancel_payload(), fd=False, force=False)
+            self._do_upgrade()
+            success = True
+            self._sig.finished.emit(True, "升级完成")
         except Exception as e:
-            logger.warning("CANCEL 发送失败: %s", e)
-        self._ack_timer.stop()
-        self._global_timer.stop()
-        self._pending_ack_cmd = None
-        self._set_state(BootState.CANCELLED)
-        self.finished.emit(False, _("Boot.Log.UserCancel"))
+            self._log_e(f"升级失败: {e}")
+            self._sig.finished.emit(False, str(e))
+        finally:
+            if not success and self.cancel_requested:
+                try:
+                    self._send(P.build_cancel(), 8)
+                    self._log_i("→ CANCEL (节点退回 IDLE)")
+                except Exception:
+                    pass
 
-    def reset(self) -> None:
-        """复位到 IDLE（不发送任何帧）。"""
-        self._ack_timer.stop()
-        self._global_timer.stop()
-        self._pending_ack_cmd = None
-        self._expected_block = 0
-        self._retries = 0
-        self._set_state(BootState.IDLE)
+    # ── 日志 ──
+    def _log_i(self, msg: str):
+        self._sig.log.emit("info", msg)
 
-    # ------------------------------------------------------------------ #
-    #  帧接收（由插件 on_frames 调用）
-    # ------------------------------------------------------------------ #
-    def on_frame(self, frame: CANFrame) -> None:
-        if frame.can_id != self._node_id:
+    def _log_w(self, msg: str):
+        self._sig.log.emit("warn", msg)
+
+    def _log_e(self, msg: str):
+        self._sig.log.emit("error", msg)
+
+    # ── CAN 收发 ──
+    def _send(self, data: bytes, frame_size: int):
+        frame = CANFrame(
+            can_id=self._cfg.host_id, data=data.ljust(frame_size, b'\x00'),
+            extended=False, fd=frame_size > 8, brs=False,
+        )
+        self._bus.send(frame)
+
+    def _recv(self, timeout: float) -> Optional[CANFrame]:
+        end_time = time.monotonic() + timeout
+        while time.monotonic() < end_time:
+            if self.cancel_requested:
+                raise RuntimeError("用户取消")
+            remaining = end_time - time.monotonic()
+            if remaining <= 0:
+                break
+            frame = self._bus.receive(timeout=min(remaining, 0.2))
+            if frame is not None and frame.can_id == self._cfg.node_id:
+                self._last_rx_monotonic = time.monotonic()
+                return frame
+        return None
+
+    def _poll_response(self) -> Optional[CANFrame]:
+        """1ms 短超时：帧间节流 + 中途 NACK 拦截。"""
+        frame = self._bus.receive(timeout=0.001)
+        if frame is not None and frame.can_id == self._cfg.node_id:
+            self._last_rx_monotonic = time.monotonic()
+            return frame
+        return None
+
+    def _reseek_index(self, data: Optional[bytes]) -> Optional[int]:
+        if data is None or len(data) < 3 or data[0] != Cmd.NACK:
+            return None
+        code = data[2] if len(data) > 2 else 0
+        if code in RESYNC_STATUS:
+            return parse_nack_block_index(data)
+        return None
+
+    # ── 等待响应 ──
+    def _wait_ack(self, expected_cmd: int, timeout: float = HANDSHAKE_TIMEOUT) -> None:
+        while True:
+            resp = self._recv(timeout)
+            if resp is None:
+                raise TimeoutError(f"等待 ACK(0x{expected_cmd:02X}) 超时 ({timeout}s)")
+            data = resp.data
+            if len(data) < 2:
+                continue
+            cmd = data[0]
+            if cmd == Cmd.NACK:
+                continue
+            if cmd != Cmd.ACK:
+                continue
+            if data[1] != expected_cmd:
+                continue
             return
-        if getattr(frame, "is_tx", False):
-            return  # 忽略自己的 TX echo
-        # 取 DLC 范围内数据
-        dlc = getattr(frame, "dlc", len(frame.data))
-        raw = bytes(frame.data[:dlc]) if dlc <= len(frame.data) else bytes(frame.data)
-        ack = P.parse_response(raw)
-        if ack is None:
-            return
 
-        # 收到任何响应，重置全局超时
-        if self._state in ACTIVE_STATES:
-            self._global_timer.start(P.GLOBAL_TIMEOUT_MS)
+    def _wait_block(self, expected_cmd: int) -> tuple:
+        while True:
+            resp = self._recv(BLOCK_ACK_TIMEOUT)
+            if resp is None:
+                return False, None
+            data = resp.data
+            if len(data) < 2:
+                continue
+            cmd, acked_cmd = data[0], data[1]
+            if cmd == Cmd.ACK and acked_cmd == expected_cmd:
+                return True, resp
+            if cmd == Cmd.NACK and acked_cmd == expected_cmd:
+                return False, resp
 
-        # 不在等待任何 ACK
-        if self._pending_ack_cmd is None:
-            if not ack.is_ack:
-                self._emit_log("warn",
-                               _("Boot.Log.EarlyNack").format(
-                                   ack.acked_cmd, ack.status, ack.block_index))
-            return
+    # ── 主状态机 ──
+    def _do_upgrade(self):
+        cfg = self._cfg
+        fw_data = cfg.fw
+        actual_fw_size = len(fw_data)
+        fw_checksum = P.calc_32bit_checksum(fw_data)
 
-        # 命令字不匹配
-        if ack.acked_cmd != self._pending_ack_cmd:
-            self._emit_log("warn",
-                           _("Boot.Log.UnexpectedAck").format(
-                               ack.acked_cmd, self._pending_ack_cmd))
-            return
+        self._log_i("=" * 50)
+        self._log_i(f"固件升级: {actual_fw_size}B, v0x{cfg.fw_version:04X}, "
+                     f"HW 0x{cfg.hw_id:04X}, frame={cfg.max_frame_size}")
+        self._log_i("=" * 50)
 
-        self._ack_timer.stop()
-        expected_cmd = self._pending_ack_cmd
-        self._pending_ack_cmd = None
+        blocks = _block_chunks(fw_data)
+        total_blocks = len(blocks)
 
-        # 分发到对应处理器
-        handler = {
-            Cmd.START:      self._on_start_ack,
-            Cmd.METADATA:   self._on_metadata_ack,
-            Cmd.DATA_START: self._on_data_start_ack,
-            Cmd.DATA_END:   self._on_data_end_ack,
-            Cmd.VERIFY:     self._on_verify_ack,
-            Cmd.REBOOT:     self._on_reboot_ack,
-            Cmd.CANCEL:     self._on_cancel_ack,
-        }.get(expected_cmd)
-        if handler:
-            handler(ack)
+        self._last_rx_monotonic = time.monotonic()
 
-    # ------------------------------------------------------------------ #
-    #  命令发送
-    # ------------------------------------------------------------------ #
-    def _send_frame(self, payload: bytes, fd: bool = False, force: bool = False) -> None:
-        """构造 CANFrame 并经 ctx 发送。
+        # Phase 1: Handshake
+        self._sig.state_changed.emit("handshake")
+        self._log_i("握手: START")
+        self._send(P.build_start(actual_fw_size, cfg.hw_id, cfg.max_frame_size), 8)
+        self._wait_ack(Cmd.START)
+        self._log_i("握手: START → ACK ✓")
 
-        Args:
-            payload: 帧数据（含 Cmd/Seq/Payload）
-            fd:      是否使用 CAN FD（True 时同时置 BRS）
-            force:   True 时即使未连接也尝试（用于 CANCEL 等）
-        """
-        if not force and not self._ctx.is_connected():
-            self._emit_log("warn", _("Boot.Log.NotConnectedSkip"))
-            return
-        frame = CANFrame(can_id=self._host_id, data=payload,
-                         extended=False, fd=fd)
-        if fd:
-            frame.brs = True
-        self._ctx.send_frame(frame)
+        self._send(P.build_metadata(fw_checksum, cfg.fw_version), cfg.max_frame_size)
+        self._wait_ack(Cmd.METADATA)
+        self._log_i("握手: METADATA → ACK ✓")
 
-    def _wait_ack(self, cmd: int, timeout_ms: int = P.BLOCK_ACK_TIMEOUT_MS) -> None:
-        """设置待 ACK 命令字。必须在 _send_frame 之后调用，避免 timer 起点早于实际发送。"""
-        self._pending_ack_cmd = cmd
-        self._ack_timer.start(timeout_ms)
+        # Phase 2: Data Transfer
+        self._sig.state_changed.emit("transfer")
+        d = cfg.max_frame_size - 2
+        frames_per_block = (P.BLOCK_SIZE + d - 1) // d
 
-    # ---- 各命令构造 ---- #
-    def _send_start(self) -> bool:
-        payload = P.build_start(len(self._fw), self._hw_id, self._max_frame_size)
-        self._emit_log("info",
-                        _("Boot.Log.SendStart").format(
-                            len(self._fw), self._hw_id, self._max_frame_size))
-        self._send_frame(payload, fd=False)  # START 固定 8 字节经典 CAN
-        self._wait_ack(Cmd.START, 2000)
-        return True
+        block_idx = 0
+        attempt = 0
+        same_block_streak = 0
+        while block_idx < total_blocks:
+            if self.cancel_requested:
+                raise RuntimeError("用户取消")
+            block = blocks[block_idx]
+            self._sig.progress.emit(block_idx, total_blocks)
 
-    def _send_metadata(self) -> None:
-        cs = P.calc_32bit_checksum(self._fw)
-        payload = P.build_metadata(cs, self._fw_version)
-        self._emit_log("info",
-                       _("Boot.Log.SendMetadata").format(cs, self._fw_version))
-        self._send_frame(payload, fd=False)
-        self._wait_ack(Cmd.METADATA, 2000)
+            # DATA_START
+            self._send(P.build_data_start(block_idx), 8)
+            if self.cancel_requested:
+                raise RuntimeError("用户取消")
+            ack, resp = self._wait_block(Cmd.DATA_START)
+            if not ack:
+                reseek = self._reseek_index(resp.data) if resp is not None else None
+                if reseek is not None:
+                    self._log_w(f"重同步: 期望块 {reseek}, 跳转")
+                    same_block_streak = (same_block_streak + 1) if reseek == block_idx else 0
+                    block_idx = reseek
+                    attempt = 0
+                    continue
+                if resp is None:
+                    if time.monotonic() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
+                        raise TimeoutError(f"节点失联超过 {NODE_LOST_TIMEOUT:.0f}s")
+                    self._log_w(f"Block {block_idx} DATA_START 无响应, 重试…")
+                    continue
+                n_code = resp.data[2] if len(resp.data) > 2 else 0
+                raise RuntimeError(f"Block {block_idx} DATA_START NACK: {_err_name(n_code)} (0x{n_code:02X})")
 
-    def _send_block(self, block_index: int) -> None:
-        """发送 DATA_START + 所有 DATA + DATA_END。"""
-        # 1) DATA_START（固定 8B 经典 CAN）
-        ds = P.build_data_start(block_index)
-        self._emit_log("info", _("Boot.Log.SendDataStart").format(block_index))
-        self._send_frame(ds, fd=False)
-        self._wait_ack(Cmd.DATA_START, 1000)
+            tag = f"{block_idx + 1}/{total_blocks}"
+            if attempt > 0:
+                self._log_i(f"{tag} 重试 #{attempt}")
+            self._log_i(f"{tag} DATA_START → ACK ✓")
 
-    def _send_data_frames(self, block_index: int) -> None:
-        """收到 DATA_START ACK 后，发送该块的全部 DATA + DATA_END。"""
-        start = block_index * P.BLOCK_SIZE
-        end = min(start + P.BLOCK_SIZE, len(self._fw))
-        block = self._fw[start:end]
-        if len(block) < P.BLOCK_SIZE:
-            block = block + bytes(P.BLOCK_SIZE - len(block))
+            # DATA 帧序列 (帧间 1ms 节流 + NACK 拦截)
+            interrupted_to = None
+            total_frames = frames_per_block
+            for seq_idx in range(frames_per_block - 1):
+                chunk = block[seq_idx * d:(seq_idx + 1) * d]
+                self._send(P.build_data(seq_idx, chunk), cfg.max_frame_size)
+                self._sig.block_progress.emit(seq_idx + 1, total_frames)
+                poll = self._poll_response()
+                reseek = self._reseek_index(poll.data) if poll is not None else None
+                if reseek is not None:
+                    code = poll.data[2] if len(poll.data) > 2 else 0
+                    self._log_w(f"途中拦截 NACK [{_err_name(code)}]: 重同步到块 {reseek}")
+                    interrupted_to = reseek
+                    break
+                if self.cancel_requested:
+                    raise RuntimeError("用户取消")
 
-        # 拆分
-        data_frames, end_seq, end_remaining = P.split_block(block, self._max_frame_size)
-        total_frames = len(data_frames) + 1
-        use_fd = self._max_frame_size > 8
+            if interrupted_to is not None:
+                same_block_streak = (same_block_streak + 1) if interrupted_to == block_idx else 0
+                block_idx = interrupted_to
+                attempt = 0
+                continue
 
-        # 2) DATA 帧序列（无 ACK）
-        for i, (seq, payload) in enumerate(data_frames):
-            data = P.build_data(seq, payload)
-            self._send_frame(data, fd=use_fd)
-            self.block_progress.emit(i + 1, total_frames)
+            # DATA_END
+            last_start = (frames_per_block - 1) * d
+            remaining = block[last_start:last_start + d]
+            checksum = P.calc_16bit_checksum(block)
+            end_raw = P.build_data_end(frames_per_block - 1, checksum, remaining)
+            self._send(end_raw, cfg.max_frame_size)
+            self._sig.block_progress.emit(total_frames, total_frames)
+            if self.cancel_requested:
+                raise RuntimeError("用户取消")
 
-        # 3) DATA_END（含 16-bit checksum + remaining）
-        cs = P.calc_16bit_checksum(block)
-        end_payload = P.build_data_end(end_seq, cs, end_remaining)
-        # CAN FD DLC 离散填充：不足时零填充到 max_frame_size
-        if use_fd and len(end_payload) < self._max_frame_size:
-            end_payload = end_payload + bytes(self._max_frame_size - len(end_payload))
-        self._emit_log("info",
-                       _("Boot.Log.SendDataEnd").format(
-                           end_seq, cs, block_index, total_frames))
-        self._send_frame(end_payload, fd=use_fd)
-        self._wait_ack(Cmd.DATA_END, 2000)
+            ack, resp = self._wait_block(Cmd.DATA_END)
+            if ack:
+                self._log_i(f"{tag} DATA_END → ACK ✓")
+                block_idx += 1
+                attempt = 0
+                same_block_streak = 0
+                continue
 
-    def _send_verify(self) -> None:
-        self._emit_log("info", _("Boot.Log.SendVerify"))
-        self._send_frame(P.build_verify(), fd=False)
-        self._wait_ack(Cmd.VERIFY, 3000)
+            reseek = self._reseek_index(resp.data) if resp is not None else None
+            if reseek is not None:
+                self._log_w(f"重同步: 期望块 {reseek}, 跳转")
+                if reseek == block_idx:
+                    same_block_streak += 1
+                    if same_block_streak > MAX_SAME_BLOCK:
+                        self._log_w(f"同块 {block_idx} 重试 {same_block_streak} 次, 跳过")
+                        block_idx = reseek + 1
+                        same_block_streak = 0
+                    else:
+                        block_idx = reseek
+                else:
+                    same_block_streak = 0
+                    block_idx = reseek
+                attempt = 0
+                continue
+            if resp is not None:
+                n_code = resp.data[2] if len(resp.data) > 2 else 0
+                if n_code == Err.BLOCK_CHECKSUM:
+                    attempt += 1
+                    if attempt > MAX_RETRIES:
+                        raise RuntimeError(f"Block {block_idx + 1} 校验失败重试超限 ({MAX_RETRIES} 次)")
+                    self._log_i(f"{tag} NACK: CHECKSUM, 重试")
+                    continue
+                raise RuntimeError(f"Block {block_idx + 1} DATA_END NACK: {_err_name(n_code)} (0x{n_code:02X})")
+            if time.monotonic() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
+                raise TimeoutError(f"节点失联超过 {NODE_LOST_TIMEOUT:.0f}s")
+            self._log_w(f"Block {block_idx + 1} 无响应, 重试…")
 
-    def _send_reboot(self) -> None:
-        self._emit_log("info", _("Boot.Log.SendReboot"))
-        self._send_frame(P.build_reboot(), fd=False)
-        self._wait_ack(Cmd.REBOOT, 2000)
+        self._sig.progress.emit(total_blocks, total_blocks)
+        self._log_i("数据传输完成 ✓")
 
-    # ------------------------------------------------------------------ #
-    #  ACK 处理
-    # ------------------------------------------------------------------ #
-    def _on_start_ack(self, ack: P.AckInfo) -> None:
-        if not ack.ok:
-            self._fail(_("Boot.Log.StartFailed").format(ack.status, _err_name(ack.status)))
-            return
-        self._emit_log("info", _("Boot.Log.AckStart"))
-        self._send_metadata()
+        # Phase 3: VERIFY + REBOOT
+        self._sig.state_changed.emit("verify")
+        self._send(P.build_verify(), cfg.max_frame_size)
+        self._wait_ack(Cmd.VERIFY)
+        self._log_i("校验和通过 ✓")
 
-    def _on_metadata_ack(self, ack: P.AckInfo) -> None:
-        if not ack.ok:
-            self._fail(_("Boot.Log.MetadataFailed").format(ack.status, _err_name(ack.status)))
-            return
-        self._emit_log("info", _("Boot.Log.AckMetadata"))
-        self._set_state(BootState.TRANSFER)
-        self._expected_block = 0
-        self._retries = 0
-        self._send_block(0)
-
-    def _on_data_start_ack(self, ack: P.AckInfo) -> None:
-        if ack.ok:
-            self._emit_log("info",
-                           _("Boot.Log.AckDataStart").format(ack.block_index))
-            self._send_data_frames(self._expected_block)
-        elif ack.status == P.Err.BLOCK_INDEX_MISMATCH:
-            # 节点期望不同块号，跳转续传
-            self._emit_log("warn",
-                           _("Boot.Log.NackBlockMismatch").format(ack.block_index))
-            # 续传也递增重试计数，防止异常节点诱导无限循环
-            self._retries += 1
-            if self._retries > P.MAX_RETRIES:
-                self._fail_block(_("Boot.Log.BlockJumpExceeded").format(P.MAX_RETRIES))
-                return
-            self._expected_block = ack.block_index
-            self._send_block(self._expected_block)
+        self._sig.state_changed.emit("reboot")
+        self._send(P.build_reboot(), cfg.max_frame_size)
+        resp = self._recv(HANDSHAKE_TIMEOUT)
+        if resp is not None and len(resp.data) > 0 and resp.data[0] == Cmd.ACK:
+            self._log_i("→ ACK ✓")
         else:
-            self._fail_block(_("Boot.Log.DataStartFailed").format(ack.status))
+            raise TimeoutError(f"等待 REBOOT ACK 超时 ({HANDSHAKE_TIMEOUT}s)")
 
-    def _on_data_end_ack(self, ack: P.AckInfo) -> None:
-        if ack.ok:
-            self._emit_log("info",
-                           _("Boot.Log.AckDataEnd").format(self._expected_block))
-            self._retries = 0
-            self._expected_block += 1
-            self.progress.emit(self._expected_block, self._total_blocks)
-            if self._expected_block >= self._total_blocks:
-                self._set_state(BootState.VERIFY)
-                self._send_verify()
-            else:
-                self._send_block(self._expected_block)
-        elif ack.status == P.Err.BLOCK_CHECKSUM:
-            self._emit_log("warn",
-                           _("Boot.Log.NackBlockChecksum").format(self._expected_block))
-            self._retries += 1
-            if self._retries > P.MAX_RETRIES:
-                self._fail_block(_("Boot.Log.BlockRetryExceeded").format(
-                    self._expected_block, P.MAX_RETRIES))
-            else:
-                self._send_block(self._expected_block)
-        else:
-            self._fail_block(_("Boot.Log.DataEndFailed").format(ack.status))
-
-    def _on_verify_ack(self, ack: P.AckInfo) -> None:
-        if not ack.ok:
-            self._fail(_("Boot.Log.VerifyFailed").format(ack.status, _err_name(ack.status)))
-            return
-        self._emit_log("info", _("Boot.Log.AckVerify"))
-        self._set_state(BootState.REBOOT)
-        self._send_reboot()
-
-    def _on_reboot_ack(self, ack: P.AckInfo) -> None:
-        self._emit_log("info", _("Boot.Log.AckReboot"))
-        self._global_timer.stop()
-        self._set_state(BootState.DONE)
-        self.finished.emit(True, _("Boot.Log.Finished"))
-
-    def _on_cancel_ack(self, ack: P.AckInfo) -> None:
-        self._emit_log("info", _("Boot.Log.AckCancel"))
-        self._global_timer.stop()
-        self._set_state(BootState.CANCELLED)
-        self.finished.emit(False, _("Boot.Log.Cancelled"))
-
-    # ------------------------------------------------------------------ #
-    #  超时处理
-    # ------------------------------------------------------------------ #
-    def _on_ack_timeout(self) -> None:
-        cmd = self._pending_ack_cmd
-        self._pending_ack_cmd = None
-        cmd_str = f"0x{cmd:02X}" if cmd is not None else "None"
-        self._fail(_("Boot.Log.AckTimeout").format(cmd_str))
-
-    def _on_global_timeout(self) -> None:
-        self._ack_timer.stop()
-        self._pending_ack_cmd = None
-        self._fail(_("Boot.Log.GlobalTimeout"))
-
-    # ------------------------------------------------------------------ #
-    #  失败处理
-    # ------------------------------------------------------------------ #
-    def _fail(self, msg: str) -> None:
-        """升级失败：停定时器 + 尝试发 CANCEL 释放节点状态 + emit finished。
-
-        规范 §5.4：上位机会话终止应发送 CANCEL，令节点立即退出而非等待 6s 全局超时。
-        """
-        self._ack_timer.stop()
-        self._global_timer.stop()
-        self._pending_ack_cmd = None
-        self._emit_log("error", msg)
-        # 尝试发 CANCEL 释放节点状态（force=True 即使断连也尝试）
-        # 仅在仍连接时尝试，避免无意义的发送日志
-        if self._ctx.is_connected():
-            try:
-                cancel_payload = build_cancel_payload()
-                self._send_frame(cancel_payload, fd=False, force=True)
-                self._emit_log("info", _("Boot.Log.CancelOnFail"))
-            except Exception as e:
-                logger.warning("失败后发送 CANCEL 异常: %s", e)
-        self._set_state(BootState.FAILED)
-        self.finished.emit(False, msg)
-
-    def _fail_block(self, msg: str) -> None:
-        """块级失败。"""
-        self._fail(_("Boot.Log.BlockFailed").format(self._expected_block, msg))
-
-    # ------------------------------------------------------------------ #
-    #  辅助
-    # ------------------------------------------------------------------ #
-    def _set_state(self, state: str) -> None:
-        self._state = state
-        self.state_changed.emit(state)
-
-    def _emit_log(self, level: str, msg: str) -> None:
-        self.log.emit(level, msg)
+        self._sig.state_changed.emit("done")
+        self._log_i("=" * 50)
+        self._log_i(f"升级完成！({total_blocks} blocks, {actual_fw_size} bytes)")
+        self._log_i("=" * 50)
 
 
-def build_cancel_payload() -> bytes:
-    return P.build_cancel()
+def _block_chunks(fw_data: bytes) -> list[bytes]:
+    blocks = []
+    for offset in range(0, len(fw_data), P.BLOCK_SIZE):
+        block = fw_data[offset:offset + P.BLOCK_SIZE]
+        block = block.ljust(P.BLOCK_SIZE, b'\x00')
+        blocks.append(block)
+    return blocks
 
 
 def _err_name(code: int) -> str:
     try:
-        return P.Err(code).name
+        return Err(code).name
     except ValueError:
         return f"UNKNOWN({code:#04X})"

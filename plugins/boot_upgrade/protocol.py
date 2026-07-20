@@ -63,12 +63,9 @@ class Err(IntEnum):
 BLOCK_SIZE = 1024                       # 1KB
 PROTOCOL_HEADER_LEN = 2                 # Cmd + Seq
 SUPPORTED_FRAME_SIZES = (8, 12, 16, 20, 24, 32, 48, 64)
-MAX_RETRIES = 3                          # 同块最大重试
-GLOBAL_TIMEOUT_MS = 6000                 # 全局会话超时
-BLOCK_ACK_TIMEOUT_MS = 1000              # 单命令 ACK 等待
-FRAME_GAP_TIMEOUT_MS = 100               # 块内帧间隔（节点侧）
-APP_PARTITION_MAX = 40 * 1024            # App 分区 40KB
-METADATA_MAGIC = 0x424F4F54
+
+# 节点回这些错误码时在 NACK 负载中带期望块号，Host 据此重同步/断点续传
+RESYNC_STATUS = (Err.BLOCK_INDEX_MISMATCH, Err.INVALID_FRAME, Err.TIMEOUT)
 
 
 # --------------------------------------------------------------------- #
@@ -111,6 +108,19 @@ def parse_response(frame_data: bytes) -> Optional[AckInfo]:
     block_index = (frame_data[3] << 8) | frame_data[4]
     return AckInfo(acked_cmd=acked_cmd, status=status,
                    block_index=block_index, is_ack=is_ack)
+
+
+def parse_nack_block_index(frame_data: bytes) -> Optional[int]:
+    """从 NACK 帧负载提取节点期望的块号（重同步/断点续传）。
+
+    NACK 格式: [0x11][cmd][error_code][idx_H][idx_L][填充]
+    返回 Byte 3-4 的 uint16（大端序）；长度不足时返回 None。
+    """
+    if len(frame_data) < 5:
+        return None
+    if frame_data[0] != Cmd.NACK:
+        return None
+    return (frame_data[3] << 8) | frame_data[4]
 
 
 # --------------------------------------------------------------------- #

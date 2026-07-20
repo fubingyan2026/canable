@@ -231,23 +231,79 @@ def display_title(self):
     return _("UDS.Title")
 ```
 
-### 4.6 只读主窗口访问
+### 4.7 Worker 线程独占任务 (v1.4.0+)
+
+```python
+def start_upgrade(self, task) -> None
+```
+
+将自定义任务提交到 **CAN worker 线程** 上执行。任务期间宿主暂停正常收发循环，
+任务获得 `ZDTCanable` 的直接访问权。完成后 worker 自动恢复正常工作。
+
+`task` 必须实现 `run(bus: ZDTCanable)` 方法。适用于需要帧级控制的长任务
+（固件升级、诊断会话等）。
+
+**使用模式**：
+
+```python
+from PySide6.QtCore import QObject, Signal
+
+# 1) 定义信号载体 (QObject, 驻留主线程)
+class MyTaskSignals(QObject):
+    progress = Signal(int, int)
+    log = Signal(str, str)
+    finished = Signal(bool, str)
+
+# 2) 定义任务 (plain object, 在 worker 线程执行)
+class MyTask:
+    def __init__(self, config, signals: MyTaskSignals):
+        self._cfg = config
+        self._sig = signals
+        self.cancel_requested = False
+
+    def cancel(self):
+        """主线程调用：请求取消。"""
+        self.cancel_requested = True
+
+    def run(self, bus: ZDTCanable):
+        """Worker 线程调用。bus 是宿主已打开的 ZDTCanable。
+        期间可自由 send/receive，帧间需加 _poll_response() 节流。"""
+        self._sig.log.emit("info", "task started")
+        # ... 同步状态机 ...
+        self._sig.finished.emit(True, "done")
+
+# 3) Widget 中提交
+self._signals = MyTaskSignals()
+self._signals.progress.connect(self._on_progress)
+self._signals.finished.connect(self._on_finished)
+self._task = MyTask(config, self._signals)
+ctx.start_upgrade(self._task)
+```
+
+**关键设计要点**：
+- `task` 是 **plain object**（非 QObject），可在 worker 线程安全调用
+- `signals` 是 **QObject**（驻留主线程），`emit()` 跨线程安全
+- `task.run(bus)` 在 worker 线程同步执行，期间阻塞 worker 循环
+- 帧间必须 `bus.receive(timeout=0.001)` 节流（1ms），防止板端帧间隔超时
+- 取消通过 `task.cancel()` 设置标志位，`run()` 内周期性检查
+
+参考实现：[`plugins/boot_upgrade/upgrader.py`](boot_upgrade/upgrader.py) 的 `UpgradeTask` +
+`UpgradeSignals`。
+
+### 4.8 只读主窗口访问
 
 ```python
 @property
 def main_window(self)
 ```
 
-**仅用于只读访问**。**不要**调用主窗口的私有方法（`_xxx`）或修改其状态。
+**仅用于只读访问**。
 
 ```python
 # 允许
 ctx.main_window.statusBar()
-ctx.main_window.window()
-
 # 禁止
-ctx.main_window._disconnect()   # 会破坏状态机
-ctx.main_window.fd_chk.setChecked(True)  # 会绕过信号机制
+ctx.main_window._disconnect()
 ```
 
 ---
@@ -512,7 +568,17 @@ if isinstance(v, (int, float)):
 
 ## 9. CAN 收发规范
 
-### 9.1 发送
+### 9.1 两种收发模式
+
+| 模式 | 适用场景 | CAN 访问方式 | 帧间控制 |
+|------|---------|-------------|---------|
+| **普通模式** | 偶发帧、查询、监控 | `ctx.send_frame()` + `on_frames()` | 无 (宿主 100ms 批量) |
+| **独占模式** | 批量传输、协议状态机 | `ctx.start_upgrade(task)` → `task.run(bus)` | 完全控制 (帧间节流、应答匹配) |
+
+**普通模式**适合绝大多数插件。**独占模式**用于需要帧级时序控制的场景
+（如固件升级中的 171 帧/块连续传输，需 1ms 帧间节流防止板端超时）。
+
+### 9.2 发送 (普通模式)
 
 ```python
 from canable_sdk import CANFrame
@@ -527,7 +593,7 @@ frame.brs = True  # 比特率切换（需主界面启用 CAN FD）
 ctx.send_frame(frame)
 ```
 
-### 9.2 接收
+### 9.3 接收 (普通模式)
 
 通过 `on_frames` 回调，100ms 批量，最多 1000 帧/批：
 
@@ -544,7 +610,7 @@ def on_frames(self, frames: List[CANFrame]) -> None:
         self._handle_response(f)
 ```
 
-### 9.3 请求-响应模式
+### 9.4 请求-响应模式 (普通模式)
 
 CAN 是多主广播，没有内置的"请求-响应"。需要在插件内自己实现：
 
@@ -572,9 +638,9 @@ class MyProtocol:
             self._pending = None
 ```
 
-参考：[`plugins/boot_upgrade/upgrader.py`](boot_upgrade/upgrader.py) 的状态机实现。
+普通模式的请求-响应适合偶发帧。批量传输请用 §4.7 的独占模式。
 
-### 9.4 CAN FD 模式检查
+### 9.5 CAN FD 模式检查
 
 帧长 > 8 字节时，**必须**先检查主界面是否启用 CAN FD：
 
@@ -653,12 +719,14 @@ def teardown_widget(self, widget):
 | `Plugin` / `PluginContext` / UI widget | 主线程（Qt event loop） |
 | `CANWorker` | worker 线程（QThread） |
 | `Plugin.on_frames` | 主线程（100ms 定时器触发） |
+| `UpgradeTask.run(bus)` | **worker 线程**（通过 `ctx.start_upgrade()` 提交） |
 
 ### 11.2 线程安全接口
 
 | 接口 | 线程安全? | 说明 |
 |---|---|---|
 | `ctx.send_frame()` | ✅ | 内部走 worker `_send_queue`（带 mutex） |
+| `ctx.start_upgrade(task)` | ✅ | task 提交到 worker，worker 取出执行 |
 | `ctx.is_connected()` | ✅ | 读 bool，原子 |
 | `ctx.get/set_setting()` | ✅ | 主线程 dict 读写 |
 | 直接访问 `worker._xxx` | ❌ | 跨线程读写会 race |
@@ -666,9 +734,9 @@ def teardown_widget(self, widget):
 
 ### 11.3 长任务处理
 
-**禁止**在主线程做阻塞 I/O（文件读取 > 100ms、网络、USB 操作）。
+#### 普通 QThread（无 CAN 访问）
 
-若需长任务（OTA 烧录、大文件解析）：
+适用于文件解析、数据计算等不涉及 CAN 的耗时操作：
 
 ```python
 from PySide6.QtCore import QThread, Signal
@@ -678,24 +746,32 @@ class WorkerThread(QThread):
     finished_ok = Signal(str)
 
     def run(self):
-        # 阻塞操作放这里
         for i in range(100):
             ...
             self.progress.emit(i)
         self.finished_ok.emit("done")
 
-# 在插件 panel 中
 self._thread = WorkerThread()
 self._thread.progress.connect(self._on_progress)
-self._thread.finished_ok.connect(self._on_done)
 self._thread.start()
 ```
 
-发 CAN 帧仍走 `ctx.send_frame()`（内部线程安全）。
+#### Worker 线程独占任务（需 CAN 帧级控制）
+
+适用于固件升级、诊断会话等需要直接操作 CAN 总线的长任务。
+**不需要创建新线程**，任务在宿主 worker 线程上执行：
+
+```python
+# 见 §4.7，task.run(bus) 在 worker 线程同步执行
+ctx.start_upgrade(my_task)
+```
+
+优势：复用宿主已打开的 `ZDTCanable`，无需管理设备生命周期。
 
 ### 11.4 禁忌清单
 
-- ❌ 创建第二个 `ZDTCanable` 实例（会与主 worker 抢 USB）
+- ❌ 创建第二个 `ZDTCanable` 实例（应通过 `ctx.start_upgrade(task)` 访问 bus）
+- ❌ 在自己的 QThread 中打开 USB 设备
 - ❌ 直接调用 `usb.core.find()` 或其他 USB API
 - ❌ 修改 `cangui/` 核心文件（应通过 ctx 接口）
 - ❌ 在 `init()` 中构建 UI（此时 Tab 还没注册）
@@ -822,17 +898,19 @@ worker.result.connect(self._on_result)  # 主线程槽
 | [`plugin.py`](boot_upgrade/plugin.py) | 插件入口，导出 `create_plugin()` |
 | [`widget.py`](boot_upgrade/widget.py) | UI 面板 + `_ConfigStore` 配置管理 |
 | [`protocol.py`](boot_upgrade/protocol.py) | 协议编解码（无 Qt 依赖） |
-| [`upgrader.py`](boot_upgrade/upgrader.py) | 状态机（QObject + QTimer） |
+| [`upgrader.py`](boot_upgrade/upgrader.py) | 状态机 (`UpgradeSignals` QObject + `UpgradeTask` plain class) |
 
 该插件实现了：
-- 完整 Bootloader 协议（START / METADATA / DATA / DATA_END / VERIFY / REBOOT / CANCEL）
-- 请求-响应配对与 ACK 超时
-- 断点续传（NACK BLOCK_INDEX_MISMATCH 跳转）
-- 同块最多重试 3 次
-- 全局 6s 超时
+- 完整 Bootloader 协议（START / METADATA / DATA_START / DATA / DATA_END / VERIFY / REBOOT / CANCEL）
+- **Worker 线程独占任务模式** (`ctx.start_upgrade(task)` → `task.run(bus)`)
+- **帧间 1ms 节流** (`_poll_response`) + 中途 NACK 拦截
+- **重同步机制** (`RESYNC_STATUS`: BLOCK_INDEX_MISMATCH / INVALID_FRAME / TIMEOUT)
+- 同块校验重试 (`MAX_RETRIES=3`) + 同块重同步保护 (`MAX_SAME_BLOCK=5`)
+- 节点失联检测 (`NODE_LOST_TIMEOUT=6s`)
+- 会话级断点续传
+- 响应过滤 (`_wait_block(expected_cmd)` 过滤过期帧)
 - 配置持久化（CAN ID / HW ID / 版本 / 帧长 / 固件路径）
 - 关闭确认 + 自动发 CANCEL
-- 双语 i18n（中/英）
-- 主题适配
+- 双语 i18n（中/英）+ 主题适配
 
-可作为新插件的完整参考。
+可作为需要帧级 CAN 控制的插件的完整参考。

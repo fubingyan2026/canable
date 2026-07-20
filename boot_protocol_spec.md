@@ -2,12 +2,13 @@
 
 | 项目 | 信息 |
 |------|------|
-| **文档版本** | V1.3.1 |
+| **文档版本** | V1.4.0 |
 | **作者** | maximillian |
 | **创建日期** | 2026-07-07 |
-| **最后更新** | 2026-07-10 |
+| **最后更新** | 2026-07-20 |
 | **目标 MCU** | STM32G474RBTx (Cortex-M4, 128KB Flash) |
 | **传输层** | CAN 2.0B / CAN FD (ISO 11898-1:2015) |
+| **上位机参考实现** | `plugins/boot_upgrade/` (cangui 插件), `plugins/flash_tool/` (独立工具) |
 
 ---
 
@@ -361,13 +362,23 @@ sequenceDiagram
 
 ### 6.1 超时参数
 
+#### 6.1.1 板端 (Node) 超时
+
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | 全局会话超时 | 6 秒 | 无 CAN 活动 → 复位到 IDLE（会话放弃边界） |
-| Block 局部看门狗 | 100 ms | 块活跃期帧间隔溢出（如尾帧丢失）→ NACK(TIMEOUT, expected_index) + 安全等待 |
-| Block 帧间隔超时 | 100 ms | 帧间隔 > 100ms → 请求重传 |
-| 同块最大重试 | 3 次 | 上位机侧；节点无独立重试计数，靠 6s 全局超时兜底 |
+| Block 帧间隔超时 | 100 ms | 块内帧间隔溢出 → NACK(TIMEOUT, expected_index) |
 | IDLE 状态 | 永不超时 | 永久等待 START |
+
+#### 6.1.2 上位机 (Host) 超时
+
+| 参数 | 值 | 定义位置 | 说明 |
+|------|-----|----------|------|
+| `HANDSHAKE_TIMEOUT` | 5.0 s | `upgrader.py` | START / METADATA / VERIFY / REBOOT ACK 等待 |
+| `BLOCK_ACK_TIMEOUT` | 1.0 s | `upgrader.py` | DATA_START / DATA_END 单次等待 (内部 while 循环过滤过期响应) |
+| `NODE_LOST_TIMEOUT` | 6.0 s | `upgrader.py` | 节点连续无任何响应即判定失联，中止升级 (对齐板端全局超时) |
+| `MAX_RETRIES` | 3 | `upgrader.py` | BLOCK_CHECKSUM 同块最大重试次数 |
+| `MAX_SAME_BLOCK` | 5 | `upgrader.py` | 同块连续重同步上限，超过则跳过该块继续 (防死循环) |
 
 ### 6.2 状态机（5 状态）
 
@@ -391,24 +402,50 @@ sequenceDiagram
 
 ### 6.3 错误恢复
 
-| 错误场景 | 板卡行为 | 恢复方式 |
-|---------|---------|---------|
-| Block Checksum 不匹配 | NACK, 复位 Block | 重发当前 Block |
+| 错误场景 | 板卡行为 | Host 恢复方式 |
+|---------|---------|-------------|
+| Block Checksum 不匹配 | NACK(BLOCK_CHECKSUM) | 重发当前 Block (最多 `MAX_RETRIES` 次) |
 | 整包 Checksum 不匹配 | NACK, 回到 IDLE | 重新发起 START |
 | Flash 写入/校验失败 | NACK, 回到 IDLE | 检查硬件 |
-| 帧间隔超时 | NACK (BLOCK_CHECKSUM), 重传 | 等待主机重发 |
-| 尾帧/结束帧丢失 | 100ms 局部看门狗 → NACK(TIMEOUT, expected_index) + 安全等待 | Host 重发 DATA_START 重同步 |
-| 6s 内瞬时断连 | 保留 expected_block_index，停留 DATA_TRANSFER | Host 经 DATA_START 会话级续传 |
+| 帧间隔超时 / 错序 / 块号不匹配 | NACK 带 `expected_index` (RESYNC_STATUS) | `_reseek_index()` 提取期望块号 → 跳转续传 |
+| 尾帧丢失 / 节点无响应 | 节点静默 (或已复位) | `_wait_block()` 超时 → 10ms 后重试 → `NODE_LOST_TIMEOUT` 6s 仍无响应则中止 |
+| 途中 NACK 拦截 | 板端在 DATA 帧序列期间发送 NACK | `_poll_response()` 1ms 轮询捕获 → 中止当前块 → 跳转续传 |
+| 6s 内瞬时断连 | 保留 expected_block_index | Host 经 DATA_START 重同步恢复 |
 | 全局会话超时 (>6s) | 复位到 IDLE | 重新发起 START |
-| 用户主动取消 | 收到 CANCEL → 复位并退回 IDLE | 立即可重新 START，免等 6s |
-| 错序/残留帧 | 立即 NACK 带期望块号，不再静默丢弃 | 主机据 NACK 即时中止并重同步 |
+| 用户主动取消 | 收到 CANCEL → 复位并退回 IDLE | Host 发送 CANCEL 后中止 |
+| 同块重同步死循环 | 节点持续回 NACK(RESYNC_STATUS, same_block) | `same_block_streak` 追踪，超 `MAX_SAME_BLOCK=5` 则跳过该块继续 |
 
-> **丢包即时恢复：** 一旦检测到错序帧（即收到 Seq N+1 但期望 Seq N），板端立即发送
-> `NACK (INVALID_FRAME, 0x05)` 并在 Byte 3-4 回带当前期望块号；块号不匹配时发送
-> `NACK (BLOCK_INDEX_MISMATCH, 0x0D)`；局部看门狗溢出时发送 `NACK (TIMEOUT, 0x07)`——
-> 三者均携带期望块号。**不再采用静默丢弃策略**，Host 据此毫秒级中止无效子帧并重同步。
+> **重同步机制 (RESYNC_STATUS)：** `BLOCK_INDEX_MISMATCH (0x0D)` / `INVALID_FRAME (0x05)` /
+> `TIMEOUT (0x07)` 三者均在 NACK 负载 Byte 3-4 携带板端期望块号。Host 通过
+> `parse_nack_block_index()` 提取 → `_reseek_index()` 返回目标块号 → while 循环跳转至该块重发。
+> **不再采用静默丢弃策略**，Host 据此毫秒级中止无效子帧并重同步。
 
-### 6.4 CAN Bus-Off 自恢复
+### 6.4 上位机帧间节流 (Frame Pacing)
+
+DATA 帧序列发送时，上位机**每发一帧后立即执行 1ms USB 轮询** (`_poll_response`)，
+兼作两项关键功能：
+
+| 功能 | 说明 |
+|------|------|
+| **帧间节流** | 1ms 轮询确保相邻 DATA 帧间隔远低于板端 100ms 超时阈值，防止板端误判 TIMEOUT |
+| **中途 NACK 拦截** | 若板端在传输途中检测到错序/超时，所发 NACK 会被 1ms 轮询即时捕获，Host 立即中止当前块并跳转续传，避免继续发送无效子帧 |
+
+对于 Classic CAN (8B 帧, 171 帧/块)，无节流的 burst 发送会导致板端帧间隔超时。
+这是 boot_upgrade 早期版本不稳定的根本原因，对齐 flash_tool 的 `_poll_response` 模式后解决。
+
+### 6.5 响应过滤
+
+上位机 `_wait_block(expected_cmd)` 仅接受 `acked_cmd` 匹配的 ACK/NACK 帧。
+过期响应（如前一块的 `NACK(BLOCK_CHECKSUM)` 迟到至当前 DATA_START 等待窗口）被静默丢弃并继续等待。
+这避免了过期 NACK 被误当作当前命令的致命错误。
+
+### 6.6 同块重同步保护
+
+当板端反复对同一 Block 回 NACK(RESYNC_STATUS) 时（通常因 Classic CAN 帧数多、时序紧张），
+上位机追踪 `same_block_streak` 计数器。超过 `MAX_SAME_BLOCK = 5` 次后跳过该块继续下一块，
+防止无限循环。整包 VERIFY 阶段的 32-bit 累加和校验会兜底发现数据完整性问题。
+
+### 6.7 CAN Bus-Off 自恢复
 
 物理链路断开或恶劣电磁环境导致节点连续发送失败时，FDCAN 内核会累加 TEC 至 256 进入 Bus-Off，
 自动置位 `CCCR.INIT` 离线。节点侧驱动周期性（约 100ms）检测 Bus-Off 状态，一旦发现即经
@@ -470,4 +507,10 @@ sequenceDiagram
 | Magic | `0x424F4F54` | `BOOT_METADATA_MAGIC` |
 | 全局超时 | 6 秒 | `BOOT_FSM_TIMEOUT_MS` |
 | Block 帧间隔超时 | 100 ms | `BOOT_BLOCK_TIMEOUT_MS` |
-| 同块最大重试（上位机） | 3 次 | `MAX_RETRIES` (worker.py) |
+| 握手 ACK 等待 (Host) | 5.0 s | `HANDSHAKE_TIMEOUT` (upgrader.py) |
+| 块 ACK 等待 (Host) | 1.0 s | `BLOCK_ACK_TIMEOUT` (upgrader.py) |
+| 节点失联判定 (Host) | 6.0 s | `NODE_LOST_TIMEOUT` (upgrader.py) |
+| 同块校验最大重试 (Host) | 3 次 | `MAX_RETRIES` (upgrader.py) |
+| 同块重同步上限 (Host) | 5 次 | `MAX_SAME_BLOCK` (upgrader.py) |
+| 重同步状态码 | `{0x05, 0x07, 0x0D}` | `RESYNC_STATUS` (protocol.py) |
+| 帧间轮询间隔 (Host) | 1 ms | `_poll_response()` (upgrader.py) |

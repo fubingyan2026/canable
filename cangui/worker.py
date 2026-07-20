@@ -71,6 +71,9 @@ class CANWorker(QObject):
         # 发送队列：主线程放入，子线程在 run() 中取出执行
         self._send_queue: deque = deque()
         self._send_mutex = QMutex()
+        # 升级任务：插件设置，worker 线程在 run() 循环中取出执行
+        self._upgrade_task: Optional[object] = None
+        self._upgrade_task_mutex = QMutex()
 
     # ---------- 过滤 ---------- #
     def set_filters(self, filters: List[CANFilter]):
@@ -228,6 +231,11 @@ class CANWorker(QObject):
                     logger.warning("TX  失败 id=0x%X: %s", frame.can_id, e)
 
     # ---------- 主循环 ---------- #
+    def set_upgrade_task(self, task) -> None:
+        """主线程调用：设置升级任务。worker 循环在下次迭代时取出执行。"""
+        with QMutexLocker(self._upgrade_task_mutex):
+            self._upgrade_task = task
+
     @Slot()
     def run(self):
         window_s = 1.0
@@ -235,6 +243,17 @@ class CANWorker(QObject):
         last_stats_emit = 0.0
 
         while self._running and self._bus is not None:
+            # ── 检查是否有升级任务需要执行 ──
+            with QMutexLocker(self._upgrade_task_mutex):
+                task = self._upgrade_task
+                self._upgrade_task = None
+            if task is not None:
+                try:
+                    task.run(self._bus)
+                except Exception as e:
+                    logger.exception("升级任务异常: %s", e)
+                continue
+
             # 处理主线程投递的发送请求
             self._process_send_queue()
 

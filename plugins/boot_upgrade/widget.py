@@ -10,6 +10,10 @@
     ├─────────────────────────────────────────────┤
     │ 日志区  (协议交互文本)                          │
     └─────────────────────────────────────────────┘
+
+升级期间 UpgradeTask 在宿主 CAN worker 线程上运行，直接操作已打开的 ZDTCanable
+（帧间 1ms 节流 + 中途 NACK 拦截，对齐 flash_tool）。
+插件不管理设备生命周期，只负责数据收发。
 """
 from __future__ import annotations
 
@@ -24,14 +28,27 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox,
                                 QPlainTextEdit, QProgressBar, QPushButton,
                                 QSpinBox, QVBoxLayout, QWidget)
 
-from canable_sdk import CANFrame
 from . import protocol as P
-from .upgrader import BootState, Upgrader
+from .upgrader import UpgradeTask, UpgradeSignals, BootConfig
 
 logger = logging.getLogger("plugin.boot_upgrade")
 
+# ── 状态常量 ──
+class BootState:
+    IDLE = "idle"
+    HANDSHAKE = "handshake"
+    TRANSFER = "transfer"
+    VERIFY = "verify"
+    REBOOT = "reboot"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
-# i18n keys（运行时通过 ctx.register_i18n 注册）
+
+ACTIVE_STATES = (BootState.HANDSHAKE, BootState.TRANSFER,
+                 BootState.VERIFY, BootState.REBOOT)
+
+
 _I18N_KEYS = {
     "Boot.Title":            ("Boot 升级",        "Boot Upgrade"),
     "Boot.Config":           ("配置",             "Configuration"),
@@ -45,7 +62,7 @@ _I18N_KEYS = {
     "Boot.BlockProgress":    ("当前块进度",        "Block Progress"),
     "Boot.OverallProgress":  ("总进度",           "Overall"),
     "Boot.State":            ("状态",             "State"),
-    "Boot.Start":            ("开始升级",          "Start"),
+    "Boot.Start":            ("开始升级",          "Start Upgrade"),
     "Boot.Cancel":           ("取消升级",          "Cancel"),
     "Boot.Log":              ("日志",             "Log"),
     "Boot.SelectFirmware":    ("选择固件文件",      "Select Firmware File"),
@@ -61,89 +78,16 @@ _I18N_KEYS = {
     "Boot.Done":             ("升级完成",          "Upgrade complete"),
     "Boot.LoadFailed":       ("读取固件失败: {}",
                               "Failed to read firmware: {}"),
-    "Boot.CloseConfirm":     ("升级进行中，关闭 Tab 将发送 CANCEL。是否继续？",
-                              "Upgrade in progress. Closing the tab will send CANCEL. Continue?"),
+    "Boot.CloseConfirm":     ("升级进行中，关闭 Tab 将取消升级。是否继续？",
+                              "Upgrade in progress. Closing the tab will cancel. Continue?"),
     "Boot.FDRequired":       ("所选帧长需 CAN FD 模式，请在主界面勾选 CAN FD",
                               "Selected frame size requires CAN FD mode. Enable CAN FD on the main panel."),
-
-    # ---- upgrader 日志（plugin.py init 注册后 upgrader 通过 _() 获取）----
-    "Boot.Log.NotConnected":  ("CAN 未连接，无法开始升级",
-                                "CAN not connected, cannot start upgrade"),
-    "Boot.Log.NoFirmware":    ("未配置固件", "Firmware not configured"),
-    "Boot.Log.AlreadyActive": ("升级已在进行中", "Upgrade already in progress"),
-    "Boot.Log.UserCancel":    ("用户取消", "Cancelled by user"),
-    "Boot.Log.CancelSent":    ("→ CANCEL (用户取消)", "→ CANCEL (user cancel)"),
-    "Boot.Log.CancelOnFail": ("→ CANCEL (失败后释放节点)", "→ CANCEL (release node on failure)"),
-    "Boot.Log.NotConnectedSkip": ("未连接，跳过发送", "Not connected, skip send"),
-    "Boot.Log.EarlyNack":    ("← 早 NACK: cmd=0x{:02X}, err=0x{:02X}, idx={}",
-                              "← early NACK: cmd=0x{:02X}, err=0x{:02X}, idx={}"),
-    "Boot.Log.UnexpectedAck":("← 非预期 ACK: cmd=0x{:02X} (期望 0x{:02X})",
-                              "← unexpected ACK: cmd=0x{:02X} (expected 0x{:02X})"),
-    "Boot.Log.AckTimeout":   ("等待 ACK 超时 (cmd={})",
-                              "ACK wait timeout (cmd={})"),
-    "Boot.Log.GlobalTimeout":("全局会话超时 (6s 无响应)",
-                              "Global session timeout (6s no response)"),
-    "Boot.Log.AckStart":     ("← ACK(START), 分区已擦除", "← ACK(START), partition erased"),
-    "Boot.Log.AckMetadata":  ("← ACK(METADATA)", "← ACK(METADATA)"),
-    "Boot.Log.AckDataStart": ("← ACK(DATA_START, block={})",
-                              "← ACK(DATA_START, block={})"),
-    "Boot.Log.AckDataEnd":   ("← ACK(DATA_END, block={})",
-                              "← ACK(DATA_END, block={})"),
-    "Boot.Log.AckVerify":    ("← ACK(VERIFY), 整包校验通过",
-                              "← ACK(VERIFY), checksum passed"),
-    "Boot.Log.AckReboot":    ("← ACK(REBOOT), 节点将复位",
-                              "← ACK(REBOOT), node will reset"),
-    "Boot.Log.AckCancel":    ("← ACK(CANCEL), 节点已退回 IDLE",
-                              "← ACK(CANCEL), node back to IDLE"),
-    "Boot.Log.NackBlockMismatch": ("← NACK(BLOCK_INDEX_MISMATCH, expected={})",
-                                    "← NACK(BLOCK_INDEX_MISMATCH, expected={})"),
-    "Boot.Log.NackBlockChecksum": ("← NACK(BLOCK_CHECKSUM, block={})",
-                                    "← NACK(BLOCK_CHECKSUM, block={})"),
-    "Boot.Log.StartFailed":  ("START 失败: err=0x{:02X} ({})",
-                              "START failed: err=0x{:02X} ({})"),
-    "Boot.Log.MetadataFailed": ("METADATA 失败: err=0x{:02X} ({})",
-                                "METADATA failed: err=0x{:02X} ({})"),
-    "Boot.Log.VerifyFailed": ("VERIFY 失败: err=0x{:02X} ({})",
-                              "VERIFY failed: err=0x{:02X} ({})"),
-    "Boot.Log.BlockRetryExceeded": ("块 {} 重试 {} 次仍失败",
-                                     "Block {} retry {} times still failed"),
-    "Boot.Log.BlockJumpExceeded": ("块号跳转重试 {} 次仍无法对齐",
-                                    "Block index jump retry {} times still not aligned"),
-    "Boot.Log.DataStartFailed": ("DATA_START 失败: err=0x{:02X}",
-                                  "DATA_START failed: err=0x{:02X}"),
-    "Boot.Log.DataEndFailed": ("DATA_END 失败: err=0x{:02X}",
-                                "DATA_END failed: err=0x{:02X}"),
-    "Boot.Log.BlockFailed":  ("块 {}: {}", "Block {}: {}"),
-    "Boot.Log.Finished":     ("升级完成，等待节点重启",
-                              "Upgrade complete, waiting for node reset"),
-    "Boot.Log.Cancelled":    ("已取消", "Cancelled"),
-    "Boot.Log.NotConnectedFinished": ("CAN not connected", "CAN not connected"),
-    "Boot.Log.SendStart":    ("→ START: fw_size={}, hw_id=0x{:04X}, frame={}",
-                                "→ START: fw_size={}, hw_id=0x{:04X}, frame={}"),
-    "Boot.Log.SendMetadata": ("→ METADATA: checksum=0x{:08X}, version=0x{:04X}",
-                                "→ METADATA: checksum=0x{:08X}, version=0x{:04X}"),
-    "Boot.Log.SendDataStart": ("→ DATA_START: block={}", "→ DATA_START: block={}"),
-    "Boot.Log.SendDataEnd":  ("→ DATA_END: seq={}, checksum=0x{:04X}, block={}, frames={}",
-                                "→ DATA_END: seq={}, checksum=0x{:04X}, block={}, frames={}"),
-    "Boot.Log.SendVerify":   ("→ VERIFY", "→ VERIFY"),
-    "Boot.Log.SendReboot":   ("→ REBOOT", "→ REBOOT"),
+    "Boot.Cancelling":       ("取消中…", "Cancelling…"),
+    "Boot.ClearLog":         ("清空日志", "Clear Log"),
 }
 
 
-# --------------------------------------------------------------------- #
-#  配置持久化（统一存到主 settings.json，命名空间 plugin.boot_upgrade.*）
-# --------------------------------------------------------------------- #
 class _ConfigStore:
-    """插件配置薄包装。复用 PluginContext 的 settings 读写能力。
-
-    key 命名约定：`plugin.<plugin_name>.<field>`，由 PluginContext 自动加前缀。
-    这里再叠一层 `boot_upgrade.` 前缀，避免与其他插件冲突。
-
-    优点：
-    - 与主程序设置统一落盘机制（2s 防抖、退出时立即写）
-    - settings.json 一处管理全部状态，便于备份/迁移
-    """
-
     PLUGIN_NAME = "boot_upgrade"
 
     DEFAULTS = {
@@ -160,7 +104,6 @@ class _ConfigStore:
     def get(self, key: str):
         default = self.DEFAULTS.get(key)
         v = self._ctx.get_setting(f"{self.PLUGIN_NAME}.{key}", default)
-        # 类型校正：json 反序列化后 int 可能丢失
         if isinstance(default, int) and isinstance(v, (int, float)):
             return int(v)
         if isinstance(default, str) and not isinstance(v, str):
@@ -171,7 +114,6 @@ class _ConfigStore:
         self._ctx.set_setting(f"{self.PLUGIN_NAME}.{key}", value)
 
 
-# 状态显示文本
 _STATE_TEXT_ZH = {
     BootState.IDLE:       "空闲",
     BootState.HANDSHAKE:  "握手中",
@@ -202,15 +144,11 @@ class BootUpgradePanel(QWidget):
         super().__init__(parent)
         self._ctx = ctx
         self._cfg = _ConfigStore(ctx)
-        self._upgrader = Upgrader(ctx)
-        self._upgrader.state_changed.connect(self._on_state)
-        self._upgrader.progress.connect(self._on_progress)
-        self._upgrader.block_progress.connect(self._on_block_progress)
-        self._upgrader.log.connect(self._on_log)
-        self._upgrader.finished.connect(self._on_finished)
+        self._task: Optional[UpgradeTask] = None
+        self._signals: Optional[UpgradeSignals] = None
+        self._current_state = BootState.IDLE
         self._build_ui()
         self._load_config_to_ui()
-        # 加载完成后再绑信号，避免初始化时的 setValue 触发保存覆盖磁盘配置
         self._wire_config_save()
         self._refresh_state(BootState.IDLE)
 
@@ -221,7 +159,6 @@ class BootUpgradePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # --- 配置区 ---
         self._cfg_box = QGroupBox(self._tr("Boot.Config"))
         cfg_layout = QFormLayout(self._cfg_box)
 
@@ -232,8 +169,6 @@ class BootUpgradePanel(QWidget):
         file_row = QHBoxLayout()
         file_row.addWidget(self._file_edit, 1)
         file_row.addWidget(self._browse_btn)
-        # 显式 QLabel 以便 refresh_language 时更新文本
-        # （QFormLayout.addRow(str, ...) 内部包成 QLabel 但无法外部访问）
         self._lbl_firmware_file = QLabel(self._tr("Boot.FirmwareFile"))
         cfg_layout.addRow(self._lbl_firmware_file, file_row)
 
@@ -263,9 +198,7 @@ class BootUpgradePanel(QWidget):
 
         self._frame_size_combo = QComboBox()
         self._rebuild_frame_size_combo()
-        # 默认 64B（CAN FD）
-        self._frame_size_combo.setCurrentIndex(
-            self._frame_size_combo.findData(64))
+        self._frame_size_combo.setCurrentIndex(self._frame_size_combo.findData(64))
         self._lbl_frame_size = QLabel(self._tr("Boot.FrameSize"))
         cfg_layout.addRow(self._lbl_frame_size, self._frame_size_combo)
 
@@ -315,6 +248,12 @@ class BootUpgradePanel(QWidget):
         font.setStyleHint(QFont.StyleHint.TypeWriter)
         self._log_view.setFont(font)
         log_layout.addWidget(self._log_view)
+        clear_row = QHBoxLayout()
+        clear_row.addStretch(1)
+        self._clear_log_btn = QPushButton(self._tr("Boot.ClearLog"))
+        self._clear_log_btn.clicked.connect(self._log_view.clear)
+        clear_row.addWidget(self._clear_log_btn)
+        log_layout.addLayout(clear_row)
         layout.addWidget(self._log_box, 1)
 
     # ------------------------------------------------------------------ #
@@ -330,9 +269,6 @@ class BootUpgradePanel(QWidget):
         return table.get(state, state)
 
     def _rebuild_frame_size_combo(self) -> None:
-        """重建帧长度下拉项（语言切换后调用）。
-        保留当前选中项。
-        """
         current_data = self._frame_size_combo.currentData() if hasattr(self, "_frame_size_combo") else 64
         self._frame_size_combo.blockSignals(True)
         self._frame_size_combo.clear()
@@ -348,7 +284,6 @@ class BootUpgradePanel(QWidget):
     #  配置持久化
     # ------------------------------------------------------------------ #
     def _load_config_to_ui(self) -> None:
-        """从 _ConfigStore 恢复 UI 控件值。"""
         self._file_edit.setText(self._cfg.get("fw_path"))
         self._host_id_spin.setValue(int(self._cfg.get("host_id")))
         self._hw_id_spin.setValue(int(self._cfg.get("hw_id")))
@@ -358,7 +293,6 @@ class BootUpgradePanel(QWidget):
             self._frame_size_combo.setCurrentIndex(idx)
 
     def _wire_config_save(self) -> None:
-        """控件值变化时自动保存到 config.json（防抖 500ms）。"""
         self._host_id_spin.valueChanged.connect(
             lambda v: self._cfg.set("host_id", v))
         self._hw_id_spin.valueChanged.connect(
@@ -368,7 +302,6 @@ class BootUpgradePanel(QWidget):
         self._frame_size_combo.currentIndexChanged.connect(
             lambda i: self._cfg.set("frame_size",
                                      self._frame_size_combo.itemData(i)))
-        # fw_path 在选择文件时保存（见 _on_browse）
 
     # ------------------------------------------------------------------ #
     #  按钮事件
@@ -399,9 +332,7 @@ class BootUpgradePanel(QWidget):
                                  self._tr("Boot.LoadFailed").format(e))
             return
 
-        # 固件大小不在此校验：由节点侧 START 帧校验并回 NACK(FW_TOO_BIG)
         frame_size = self._frame_size_combo.currentData()
-        # FD 帧长需主界面启用 CAN FD
         if frame_size > 8 and not self._ctx.is_fd_mode():
             QMessageBox.warning(self, self._tr("Boot.Start"),
                                 self._tr("Boot.FDRequired"))
@@ -420,33 +351,44 @@ class BootUpgradePanel(QWidget):
         self._log_view.clear()
         self._block_bar.setValue(0)
         self._overall_bar.setValue(0)
-        try:
-            self._upgrader.configure(fw, version, hw_id, frame_size, host_id)
-        except Exception as e:
-            QMessageBox.critical(self, self._tr("Boot.Start"), str(e))
-            return
-        self._upgrader.start()
+
+        config = BootConfig(
+            fw=fw, fw_version=version, hw_id=hw_id,
+            max_frame_size=frame_size, host_id=host_id,
+        )
+
+        self._signals = UpgradeSignals()
+        self._signals.state_changed.connect(self._on_state)
+        self._signals.progress.connect(self._on_progress)
+        self._signals.block_progress.connect(self._on_block_progress)
+        self._signals.log.connect(self._on_log)
+        self._signals.finished.connect(self._on_finished)
+
+        self._task = UpgradeTask(config, self._signals)
+        self._ctx.start_upgrade(self._task)
 
     def _on_cancel(self):
-        if not self._upgrader.is_active:
+        if self._task is None:
             return
         if QMessageBox.question(self, self._tr("Boot.Cancel"),
                                 self._tr("Boot.CancelConfirm")) != \
                 QMessageBox.StandardButton.Yes:
             return
-        self._upgrader.cancel()
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText(self._tr("Boot.Cancelling"))
+        self._task.cancel()
 
     # ------------------------------------------------------------------ #
-    #  Upgrader 信号处理
+    #  信号处理
     # ------------------------------------------------------------------ #
     def _on_state(self, state: str):
+        self._current_state = state
         self._state_label.setText(
             f"{self._tr('Boot.State')}: {self._state_text(state)}")
         self._refresh_state(state)
 
     def _refresh_state(self, state: str):
-        busy = state in (BootState.HANDSHAKE, BootState.TRANSFER,
-                         BootState.VERIFY, BootState.REBOOT)
+        busy = state in ACTIVE_STATES
         self._start_btn.setEnabled(not busy)
         self._cancel_btn.setEnabled(busy)
         self._browse_btn.setEnabled(not busy)
@@ -473,46 +415,45 @@ class BootUpgradePanel(QWidget):
         else:
             self._log_view.appendPlainText(f"\n✗ {msg}")
 
+        self._task = None
+        self._signals = None
+        self._cancel_btn.setText(self._tr("Boot.Cancel"))
+        self._refresh_state(BootState.DONE if success else BootState.FAILED)
+
     # ------------------------------------------------------------------ #
-    #  插件回调（由 plugin.py 转发）
+    #  插件回调
     # ------------------------------------------------------------------ #
     def on_connect(self):
         pass
 
     def on_disconnect(self):
-        if self._upgrader.is_active:
-            self._upgrader.cancel()
+        pass
 
     def on_frames(self, frames):
-        for f in frames:
-            self._upgrader.on_frame(f)
+        pass  # Upgrader 在 worker 线程直接收发，不依赖宿主派发
 
     def refresh_language(self):
-        # 重新设置所有可见文本
         self._cfg_box.setTitle(self._tr("Boot.Config"))
         self._prog_box.setTitle(self._tr("Boot.Progress"))
         self._log_box.setTitle(self._tr("Boot.Log"))
         self._browse_btn.setText(self._tr("Boot.Browse"))
         self._start_btn.setText(self._tr("Boot.Start"))
-        self._cancel_btn.setText(self._tr("Boot.Cancel"))
-        # 表单行标签（需要 refresh 时刷新）
+        if self._task is None:
+            self._cancel_btn.setText(self._tr("Boot.Cancel"))
         self._lbl_firmware_file.setText(self._tr("Boot.FirmwareFile"))
         self._lbl_host_can_id.setText(self._tr("Boot.HostCanID"))
         self._lbl_hardware_id.setText(self._tr("Boot.HardwareID"))
         self._lbl_firmware_version.setText(self._tr("Boot.FirmwareVersion"))
         self._lbl_frame_size.setText(self._tr("Boot.FrameSize"))
-        # 进度区子标签
         self._block_label.setText(self._tr("Boot.BlockProgress"))
         self._overall_label.setText(self._tr("Boot.OverallProgress"))
-        # 帧长度下拉项
+        self._clear_log_btn.setText(self._tr("Boot.ClearLog"))
         self._rebuild_frame_size_combo()
-        # 状态标签
         self._state_label.setText(
-            f"{self._tr('Boot.State')}: {self._state_text(self._upgrader.state)}")
+            f"{self._tr('Boot.State')}: {self._state_text(self._current_state)}")
 
     def confirm_close(self) -> bool:
-        """Tab 关闭前确认。返回 False 表示阻止关闭。"""
-        if not self._upgrader.is_active:
+        if self._task is None:
             return True
         ret = QMessageBox.question(self, self._tr("Boot.Cancel"),
                                    self._tr("Boot.CloseConfirm"))

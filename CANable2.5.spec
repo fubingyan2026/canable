@@ -3,6 +3,8 @@
 #   upx=False — UPX 运行时解压会显著拖慢启动
 #   排除所有未使用的 Qt 模块 — 减小体积
 
+from PyInstaller.building.datastruct import Tree
+
 a = Analysis(
     ['cangui.py'],
     pathex=[],
@@ -21,6 +23,13 @@ a = Analysis(
     hiddenimports=[
         'usb.backend.libusb1',
         'PySide6.QtXml',
+        # boot_upgrade 插件 (动态导入，PyInstaller 无法自动检测)
+        'plugins',
+        'plugins.boot_upgrade',
+        'plugins.boot_upgrade.plugin',
+        'plugins.boot_upgrade.protocol',
+        'plugins.boot_upgrade.upgrader',
+        'plugins.boot_upgrade.widget',
     ],
     hookspath=[],
     hooksconfig={},
@@ -87,6 +96,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# 插件目录：Tree 递归收集所有文件，排除 __pycache__
+a.datas += Tree('plugins', prefix='plugins', excludes=['__pycache__'])
 pyz = PYZ(a.pure)
 
 exe = EXE(

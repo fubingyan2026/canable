@@ -1,5 +1,5 @@
 name,can_id,extended,rtr,fd,brs,dlc,data,period_ms,enabled
-哈哈哈,0x100,False,False,True,True,12,00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00,100.0,False
-rerer,0x100,False,False,True,True,8,00 00 00 00 00 00 00 00,200.0,False
-222,0x100,False,False,True,True,8,00 00 00 00 00 00 00 00,1.0,False
-trrr,0x103,False,False,True,True,8,00 00 00 00 00 00 00 00,100.0,False
+开始,0x1,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
+允许充电,0x2,False,False,False,False,8,EA D1 01 04 FF 1B E0 F5,100.0,False
+结束,0x3,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
+电压请求,0x2,False,False,False,False,8,EA D1 01 04 FF 02 F9 F5,100.0,False
