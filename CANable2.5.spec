@@ -30,6 +30,11 @@ a = Analysis(
         'plugins.boot_upgrade.protocol',
         'plugins.boot_upgrade.upgrader',
         'plugins.boot_upgrade.widget',
+        # power_monitor 插件
+        'plugins.power_monitor',
+        'plugins.power_monitor.plugin',
+        'plugins.power_monitor.protocol',
+        'plugins.power_monitor.widget',
     ],
     hookspath=[],
     hooksconfig={},

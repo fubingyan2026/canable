@@ -4,7 +4,7 @@
     ┌─────────────────────────────────────────────┐
     │ 配置区  (固件文件 / CAN ID / HW ID / 版本 / 帧长)│
     ├─────────────────────────────────────────────┤
-    │ 进度区  (块进度条 / 总进度条 / 当前状态)         │
+    │ 进度区  (总进度条 / 当前状态)                   │
     ├─────────────────────────────────────────────┤
     │ 操作区  (开始 / 取消)                          │
     ├─────────────────────────────────────────────┤
@@ -59,7 +59,6 @@ _I18N_KEYS = {
     "Boot.FirmwareVersion":  ("固件版本",          "Firmware Version"),
     "Boot.FrameSize":        ("帧长度",           "Frame Size"),
     "Boot.Progress":         ("进度",             "Progress"),
-    "Boot.BlockProgress":    ("当前块进度",        "Block Progress"),
     "Boot.OverallProgress":  ("总进度",           "Overall"),
     "Boot.State":            ("状态",             "State"),
     "Boot.Start":            ("开始升级",          "Start Upgrade"),
@@ -208,12 +207,6 @@ class BootUpgradePanel(QWidget):
         self._prog_box = QGroupBox(self._tr("Boot.Progress"))
         prog_layout = QVBoxLayout(self._prog_box)
 
-        self._block_bar = QProgressBar()
-        self._block_bar.setRange(0, 100)
-        self._block_label = QLabel(self._tr("Boot.BlockProgress"))
-        prog_layout.addWidget(self._block_label)
-        prog_layout.addWidget(self._block_bar)
-
         self._overall_bar = QProgressBar()
         self._overall_bar.setRange(0, 100)
         self._overall_label = QLabel(self._tr("Boot.OverallProgress"))
@@ -349,7 +342,6 @@ class BootUpgradePanel(QWidget):
             return
 
         self._log_view.clear()
-        self._block_bar.setValue(0)
         self._overall_bar.setValue(0)
 
         config = BootConfig(
@@ -360,7 +352,6 @@ class BootUpgradePanel(QWidget):
         self._signals = UpgradeSignals()
         self._signals.state_changed.connect(self._on_state)
         self._signals.progress.connect(self._on_progress)
-        self._signals.block_progress.connect(self._on_block_progress)
         self._signals.log.connect(self._on_log)
         self._signals.finished.connect(self._on_finished)
 
@@ -400,10 +391,6 @@ class BootUpgradePanel(QWidget):
     def _on_progress(self, block: int, total: int):
         pct = int(block * 100 / total) if total > 0 else 0
         self._overall_bar.setValue(pct)
-
-    def _on_block_progress(self, frame: int, total: int):
-        pct = int(frame * 100 / total) if total > 0 else 0
-        self._block_bar.setValue(pct)
 
     def _on_log(self, level: str, msg: str):
         prefix = {"info": "", "warn": "⚠ ", "error": "✗ "}.get(level, "")
@@ -445,7 +432,6 @@ class BootUpgradePanel(QWidget):
         self._lbl_hardware_id.setText(self._tr("Boot.HardwareID"))
         self._lbl_firmware_version.setText(self._tr("Boot.FirmwareVersion"))
         self._lbl_frame_size.setText(self._tr("Boot.FrameSize"))
-        self._block_label.setText(self._tr("Boot.BlockProgress"))
         self._overall_label.setText(self._tr("Boot.OverallProgress"))
         self._clear_log_btn.setText(self._tr("Boot.ClearLog"))
         self._rebuild_frame_size_combo()
