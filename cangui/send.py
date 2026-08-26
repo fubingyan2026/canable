@@ -372,12 +372,13 @@ class SendPanel(QWidget):
         self._refresh_all()
 
     def pause_all_timers(self):
-        """暂停所有周期发送定时器，但保留 enabled 状态。
-        用于 CAN 断开连接场景，重连后可调 resume_timers() 恢复。
+        """断开连接时停止所有周期发送并清除 enabled 状态。
+        重连后不会自动恢复发送，需用户手动重新启动。
         """
         for e in self.entries:
             if e.timer and e.timer.isActive():
                 e.timer.stop()
+            e.enabled = False
         self._refresh_all()
 
     def resume_timers(self):
@@ -533,7 +534,7 @@ class SendPanel(QWidget):
                 dlc=d.get("dlc", 8),
                 data=bytes.fromhex(d["data"]),
                 period_ms=d.get("period_ms", 100.0),
-                enabled=d.get("enabled", True),
+                enabled=False,  # 启动时不自动恢复发送，需用户手动启用
             )
             self.entries.append(e)
         self._refresh_all()
@@ -568,7 +569,7 @@ class SendPanel(QWidget):
                     dlc=int(row["dlc"]),
                     data=bytes.fromhex(row["data"].replace(" ", "")),
                     period_ms=float(row["period_ms"]),
-                    enabled=_parse_bool(row["enabled"]),
+                    enabled=False,  # 启动时不自动恢复发送，需用户手动启用
                 ))
             self._refresh_all()
         self._sync_timers()

@@ -161,15 +161,18 @@ eFeedback can_open(uint32_t mode)
     can_handle.Init.NominalSyncJumpWidth  = can_bitrate_nominal.Sjw;
 
     // Data baudrate is optional (only required for CAN FD)
-    // data baudrate == nominal baudrate --> CAN FD
-    // data baudrate  > nominal baudrate --> CAN FD + BRS
+    // 只要启用了 CAN FD 就一律以 FDCAN_FRAME_FD_BRS 打开：
+    // 1) HAL 只在 FD_BRS 模式下写 DBTP（数据相位时序寄存器），FD_NO_BRS 会残留复位值
+    // 2) CCCR.BRSE=0 时无法正确接收总线上 BRS=1 的帧（会报 form error）
+    // 3) 发送侧是否置 BRS 由 can_send_packet() 按帧独立控制，不受 CCCR.BRSE 影响
+    //    数据波特率 == 标称波特率 时，BRS=1 帧的数据段按标称速率采样，行为正确
     // NOTE:
     // The samplepoint for high data rates is critical.
     // 8 M baud does not work with 75%, but it works with 50%.
     // But strangely 10 M baud works with 50% and with 75% !
     if (can_using_FD())
     {
-        can_handle.Init.FrameFormat       = can_using_BRS() ? FDCAN_FRAME_FD_BRS : FDCAN_FRAME_FD_NO_BRS;
+        can_handle.Init.FrameFormat       = FDCAN_FRAME_FD_BRS;
         can_handle.Init.DataPrescaler     = can_bitrate_data.Brp;
         can_handle.Init.DataTimeSeg1      = can_bitrate_data.Seg1;
         can_handle.Init.DataTimeSeg2      = can_bitrate_data.Seg2;
@@ -183,7 +186,7 @@ eFeedback can_open(uint32_t mode)
     uint32_t clock_MHz = system_get_can_clock() / 1000000; // 160
     nom_bit_len_ns  = 1 + can_bitrate_nominal.Seg1 + can_bitrate_nominal.Seg2; // time quantums
     nom_bit_len_ns *= can_bitrate_nominal.Brp; // clock prescaler
-    nom_bit_len_ns *= 1000;                    // �s -> ns
+    nom_bit_len_ns *= 1000;                    // �s -> ns
     nom_bit_len_ns /= clock_MHz;
 
     busload_ppm  = 0;
@@ -303,10 +306,9 @@ void can_close()
 // Check HAL_FDCAN_GetTxFifoFreeLevel() and can_is_tx_allowed() before calling this function.
 bool can_send_packet(FDCAN_TxHeaderTypeDef* tx_header, uint8_t* tx_data)
 {
-    // Sending a message with BRS flag, but nominal and data baudrate are the same --> reset flag and send without BRS.
-    if (tx_header->BitRateSwitch == FDCAN_BRS_ON && !can_using_BRS())
-        tx_header->BitRateSwitch =  FDCAN_BRS_OFF;
-
+    // BRS 由主机的帧标志决定：即使数据波特率 == 标称波特率，
+    // 控制器也已以 FDCAN_FRAME_FD_BRS 打开（BRSE=1），保留 BRS 发送不会出错，
+    // 同时保证对端 BRS=1 的帧也能正常回 ACK。
     HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(&can_handle, tx_header, tx_data);
     if (status != HAL_OK) // may be busy (state = HAL_FDCAN_STATE_BUSY)
     {
@@ -335,7 +337,7 @@ void can_process(uint32_t tick_now)
     uint8_t can_data_buf[64] = {0};
     char    dbg_msg_buf[100];
 
-    // This was competely wrong in the original Candlelight firmware (fixed by Elm�soft).
+    // This was competely wrong in the original Candlelight firmware (fixed by Elm�soft).
     // Instead of sending a Tx Event to the host in the moment when the processor has really sent the packet to the CAN bus
     // they have sent a fake event immediately after dispatching the packet, no matter if it really was sent or not.
     FDCAN_TxEventFifoTypeDef tx_event;

@@ -369,10 +369,11 @@ class ZDTCanable:
 
     def _calc_bitrate_params(self, bitrate: int, data_phase: bool = False,
                              sample_point: float | None = None):
-        # STM32G4 FDCAN 数据相限制：TSEG1≤15, TSEG2≤15, SJW≤15
-        # 标称相限制较宽：TSEG1≤32, TSEG2≤16
+        # STM32G4 FDCAN 数据相限制：TSEG1≤15, TSEG2≤15, SJW≤15, BRP≤32 (DBRP 5位)
+        # 标称相限制较宽：TSEG1≤32, TSEG2≤16, BRP≤512 (NBRP 9位)
         seg1_max = 15 if data_phase else 32
         seg2_max = 15 if data_phase else 16
+        brp_max  = 32 if data_phase else 512
         clock = 160_000_000
 
         if sample_point is None:
@@ -381,7 +382,7 @@ class ZDTCanable:
             for seg1 in range(1, seg1_max + 1):
                 for seg2 in range(1, min(seg1 + 1, seg2_max + 1)):
                     total = 1 + seg1 + seg2
-                    for brp in range(1, 513):
+                    for brp in range(1, brp_max + 1):
                         calc = clock / brp / total
                         err = abs(calc - bitrate) / bitrate
                         if err < best_err:
@@ -402,7 +403,7 @@ class ZDTCanable:
             for seg2 in range(1, seg2_max + 1):
                 total = 1 + seg1 + seg2
                 brp = int(round(clock / (total * bitrate)))
-                if brp < 1 or brp > 512:
+                if brp < 1 or brp > brp_max:
                     continue
                 calc = clock / (brp * total)
                 rate_err = abs(calc - bitrate) / bitrate

@@ -12,6 +12,18 @@
 
 #pragma once
 
+#include <stdint.h>
+
+// GCC 兼容的紧凑结构体属性宏
+// HAL 头(stm32g4xx_hal_def.h)只定义了 __packed，未定义 __aligned；
+// 此处自包含定义，避免依赖 HAL 头链的包含顺序
+#ifndef __packed
+#define __packed __attribute__((__packed__))
+#endif
+#ifndef __aligned
+#define __aligned(x) __attribute__((aligned(x)))
+#endif
+
 /**
  * @brief 主机通过 SETUP 请求发送的命令（8 位传输）
  */

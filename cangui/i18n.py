@@ -119,12 +119,12 @@ _TR.update({
 
     # Left panel
     "Left.Bus":              {"zh": "总线",            "en": "Bus"},
-    "Left.Bitrate":          {"zh": "比特率:",         "en": "Bitrate:"},
+    "Left.Bitrate":          {"zh": "标称比特率:",     "en": "Nominal Bitrate:"},
     "Left.CANFD":            {"zh": "CAN FD",           "en": "CAN FD"},
     "Left.CANMode":          {"zh": "CAN模式:",        "en": "CAN Mode:"},
     "Left.BPS":              {"zh": "bps",              "en": "bps"},
     "Left.DataBitrate":      {"zh": "数据比特率:",     "en": "Data Bitrate:"},
-    "Left.SamplePoint":      {"zh": "采样点:",         "en": "Sample Point:"},
+    "Left.SamplePoint":      {"zh": "标称采样点:",     "en": "Nominal Sample Point:"},
     "Left.DataSamplePoint":  {"zh": "数据段采样点:",   "en": "Data Sample Point:"},
     "Left.Sample87":         {"zh": "87.5% (默认)",    "en": "87.5% (default)"},
     "Left.Sample75":         {"zh": "75.0%",          "en": "75.0%"},

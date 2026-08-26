@@ -366,6 +366,7 @@ class MainWindow(QMainWindow):
         # 采样点变化 → 重新下发位时序
         self.sample_combo.currentIndexChanged.connect(self._on_sample_combo_changed)
         self.data_sample_combo.currentIndexChanged.connect(self._on_data_sample_combo_changed)
+        self.data_bitrate_combo.currentIndexChanged.connect(self._on_data_bitrate_combo_changed)
 
     # ------------------------------------------------------ 插件宿主辅助
     # 这些方法由 PluginContext / PluginHost 调用，避免插件直接操作内部控件
@@ -457,10 +458,24 @@ class MainWindow(QMainWindow):
     def _on_fd_toggle(self, enabled: bool):
         self.data_bitrate_combo.setEnabled(enabled)
         self._lbl_data_bitrate.setEnabled(enabled)
-        self.data_sample_combo.setEnabled(enabled)
-        self._lbl_data_sample.setEnabled(enabled)
+        self._update_data_sample_state()
         # 通知 send 面板更新 DLC 范围
         self.send_panel.set_fd_mode(enabled)
+
+    def _update_data_sample_state(self):
+        """8Mbps 数据段固件强制 50% 采样点，此时禁用采样点下拉框。"""
+        is_8m = self.data_bitrate_combo.currentData() == 8_000_000
+        fd_on = self.fd_chk.isChecked()
+        enabled = fd_on and not is_8m
+        self.data_sample_combo.setEnabled(enabled)
+        self._lbl_data_sample.setEnabled(enabled)
+        if is_8m and self.data_sample_combo.currentData() != 0.50:
+            # 切到 50% 选项（静默，避免触发重复下发）
+            self.data_sample_combo.blockSignals(True)
+            idx = self.data_sample_combo.findData(0.50)
+            if idx >= 0:
+                self.data_sample_combo.setCurrentIndex(idx)
+            self.data_sample_combo.blockSignals(False)
 
     # ----------------------------------------------------------- 连接
     @Slot()
@@ -578,8 +593,7 @@ class MainWindow(QMainWindow):
         logger.info("状态变更: connected=%s msg=%s", connected, msg)
         if connected:
             self._update_connect_ui(True, msg)
-            # 恢复之前暂停的周期发送（保留用户的 enabled 配置）
-            self.send_panel.resume_timers()
+            # 不自动恢复周期发送：重连后需用户手动启动，避免意外发送
         else:
             self._update_connect_ui(False, msg)
         # 通知所有 active 插件连接状态变化
@@ -656,6 +670,15 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_data_sample_combo_changed(self, idx: int):
+        if self._worker is not None:
+            self._worker.data_sample_point = self.data_sample_combo.currentData()
+            if self._connected:
+                self._worker.set_data_bitrate_slot(self.data_bitrate_combo.currentData())
+
+    @Slot(int)
+    def _on_data_bitrate_combo_changed(self, idx: int):
+        # 8Mbps 时采样点强制 50%（固件要求），先更新下拉框状态再下发
+        self._update_data_sample_state()
         if self._worker is not None:
             self._worker.data_sample_point = self.data_sample_combo.currentData()
             if self._connected:
@@ -765,6 +788,8 @@ class MainWindow(QMainWindow):
             self.data_bitrate_combo.setCurrentIndex(idx)
         self.sample_combo.setCurrentIndex(s.get("sample_point", 0))
         self.data_sample_combo.setCurrentIndex(s.get("data_sample_point", 0))
+        # 同步 8Mbps 采样点强制 50% 的 UI 状态（覆盖上方恢复的非法值）
+        self._update_data_sample_state()
         self.trace_panel.autoscroll_chk.setChecked(s.get("autoscroll", True))
         if s.get("collapse", False):
             self.trace_panel.collapse_chk.setChecked(True)
@@ -916,6 +941,8 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.data_sample_combo.setCurrentIndex(idx)
             self.data_sample_combo.blockSignals(False)
+        # 语言切换重建下拉框后，同步 8Mbps 强制 50% 的 UI 状态
+        self._update_data_sample_state()
         # 通知插件刷新语言
         if hasattr(self, "plugins"):
             self.plugins.refresh_language()
