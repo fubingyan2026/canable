@@ -52,7 +52,9 @@ class ZDTCanable:
         self._running    = False
         self._fd_mode    = False
         self._bitrate:   Optional[int] = None
+        self._sample_point: Optional[float] = None
         self._data_bitrate: Optional[int] = None
+        self._data_sample_point: Optional[float] = None
         self._capabilities: int = 0
         self._capabilities_fd: int = 0
         self._protocol:  Optional[str] = None
@@ -315,9 +317,9 @@ class ZDTCanable:
             pass
 
         if self._bitrate:
-            self.set_bitrate(self._bitrate)
+            self.set_bitrate(self._bitrate, sample_point=self._sample_point)
         if self._fd_mode and self._data_bitrate:
-            self.set_data_bitrate(self._data_bitrate)
+            self.set_data_bitrate(self._data_bitrate, sample_point=self._data_sample_point)
 
         self.start(loopback=self._loopback)
         self._tx_blocked_until = time.time() + 0.3
@@ -326,52 +328,94 @@ class ZDTCanable:
     # ================================================================
     #  Bit timing configuration
     # ================================================================
-    def set_bitrate(self, bitrate: int):
-        if bitrate not in NOMINAL_BITTIMING:
-            brp, seg1, seg2, sjw = self._calc_bitrate_params(bitrate)
+    def set_bitrate(self, bitrate: int, sample_point: float | None = None):
+        if sample_point is None:
+            if bitrate not in NOMINAL_BITTIMING:
+                brp, seg1, seg2, sjw = self._calc_bitrate_params(bitrate)
+            else:
+                brp, seg1, seg2, sjw = NOMINAL_BITTIMING[bitrate]
         else:
-            brp, seg1, seg2, sjw = NOMINAL_BITTIMING[bitrate]
+            brp, seg1, seg2, sjw = self._calc_bitrate_params(
+                bitrate, sample_point=sample_point)
 
         prop = 0
         payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
         self._ctrl_out_checked(GS_ReqSetBitTiming, data=payload)
         self._bitrate = bitrate
-        logger.info("nominal bitrate set: %d bps (brp=%d seg1=%d seg2=%d sjw=%d)",
-                    bitrate, brp, seg1, seg2, sjw)
+        self._sample_point = sample_point
+        sample_pct = (1 + seg1) / (1 + seg1 + seg2) * 100
+        logger.info("nominal bitrate set: %d bps (brp=%d seg1=%d seg2=%d sjw=%d sample=%.1f%%)",
+                    bitrate, brp, seg1, seg2, sjw, sample_pct)
 
-    def set_data_bitrate(self, data_bitrate: int):
-        if data_bitrate not in DATA_BITTIMING:
-            brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate, data_phase=True)
+    def set_data_bitrate(self, data_bitrate: int, sample_point: float | None = None):
+        # 8Mbps 数据段固件要求固定 50% 采样点，不参与可调
+        if sample_point is None or data_bitrate == 8_000_000:
+            if data_bitrate not in DATA_BITTIMING:
+                brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate, data_phase=True)
+            else:
+                brp, seg1, seg2, sjw = DATA_BITTIMING[data_bitrate]
         else:
-            brp, seg1, seg2, sjw = DATA_BITTIMING[data_bitrate]
+            brp, seg1, seg2, sjw = self._calc_bitrate_params(
+                data_bitrate, data_phase=True, sample_point=sample_point)
 
         prop = 0
         payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
         self._ctrl_out_checked(GS_ReqSetBitTimingFD, data=payload)
         self._data_bitrate = data_bitrate
-        logger.info("data bitrate set: %d bps", data_bitrate)
+        self._data_sample_point = sample_point
+        sample_pct = (1 + seg1) / (1 + seg1 + seg2) * 100
+        logger.info("data bitrate set: %d bps (brp=%d seg1=%d seg2=%d sjw=%d sample=%.1f%%)",
+                    data_bitrate, brp, seg1, seg2, sjw, sample_pct)
 
-    def _calc_bitrate_params(self, bitrate: int, data_phase: bool = False):
+    def _calc_bitrate_params(self, bitrate: int, data_phase: bool = False,
+                             sample_point: float | None = None):
         # STM32G4 FDCAN 数据相限制：TSEG1≤15, TSEG2≤15, SJW≤15
         # 标称相限制较宽：TSEG1≤32, TSEG2≤16
         seg1_max = 15 if data_phase else 32
         seg2_max = 15 if data_phase else 16
         clock = 160_000_000
-        best_err = float('inf')
+
+        if sample_point is None:
+            best_err = float('inf')
+            best = None
+            for seg1 in range(1, seg1_max + 1):
+                for seg2 in range(1, min(seg1 + 1, seg2_max + 1)):
+                    total = 1 + seg1 + seg2
+                    for brp in range(1, 513):
+                        calc = clock / brp / total
+                        err = abs(calc - bitrate) / bitrate
+                        if err < best_err:
+                            best_err = err
+                            best = (brp, seg1, seg2, min(seg2, 4))
+                        if err < 0.001:
+                            return best
+            if best_err > 0.05:
+                raise ValueError(f"cannot compute bit timing for {bitrate} bps (error {best_err:.1%})")
+            return best
+
+        # 指定采样点：在 TSEG1/TSEG2 限制内搜索最接近 (波特率, 采样点) 的时序
+        # 同等精度下优先更大的 time quanta 总数，时序更稳健
+        best_err = (float('inf'), float('inf'))
+        best_total = -1
         best = None
         for seg1 in range(1, seg1_max + 1):
-            for seg2 in range(1, min(seg1 + 1, seg2_max + 1)):
+            for seg2 in range(1, seg2_max + 1):
                 total = 1 + seg1 + seg2
-                for brp in range(1, 513):
-                    calc = clock / brp / total
-                    err = abs(calc - bitrate) / bitrate
-                    if err < best_err:
-                        best_err = err
-                        best = (brp, seg1, seg2, min(seg2, 4))
-                    if err < 0.001:
-                        return best
-        if best_err > 0.05:
-            raise ValueError(f"cannot compute bit timing for {bitrate} bps (error {best_err:.1%})")
+                brp = int(round(clock / (total * bitrate)))
+                if brp < 1 or brp > 512:
+                    continue
+                calc = clock / (brp * total)
+                rate_err = abs(calc - bitrate) / bitrate
+                if rate_err > 0.01:
+                    continue
+                sample_err = abs((1 + seg1) / total - sample_point)
+                key = (rate_err, sample_err)
+                if key < best_err or (key == best_err and total > best_total):
+                    best_err = key
+                    best_total = total
+                    best = (brp, seg1, seg2, min(seg2, 4))
+        if best is None:
+            raise ValueError(f"cannot compute bit timing for {bitrate} bps")
         return best
 
     # ================================================================

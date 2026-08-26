@@ -35,6 +35,11 @@ a = Analysis(
         'plugins.power_monitor.plugin',
         'plugins.power_monitor.protocol',
         'plugins.power_monitor.widget',
+        # juxie_motor 插件
+        'plugins.juxie_motor',
+        'plugins.juxie_motor.plugin',
+        'plugins.juxie_motor.protocol',
+        'plugins.juxie_motor.widget',
     ],
     hookspath=[],
     hooksconfig={},

@@ -53,7 +53,7 @@ EndBSPDependencies */
 
 #include "usb_class.h"
 #include "usb_ctrlreq.h"
-#include "usb_interface.h" 
+#include "usb_interface.h"
 
 static uint8_t  USBD_CDC_Init(USBD_HandleTypeDef *pdev,  uint8_t cfgidx);
 static uint8_t  USBD_CDC_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx);
@@ -63,349 +63,369 @@ static uint8_t  USBD_CDC_DataOut(USBD_HandleTypeDef *pdev,  uint8_t epnum);
 static uint8_t  USBD_CDC_EP0_RxReady(USBD_HandleTypeDef *pdev);
 static uint8_t* USBD_CDC_GetFSCfgDesc(uint16_t *length);
 
-/*
-// not used for Full speed USB device
+#if !USB_DEVICE_FULL_SPEED
 static uint8_t  *USBD_CDC_GetHSCfgDesc(uint16_t *length);
 static uint8_t  *USBD_CDC_GetOtherSpeedCfgDesc(uint16_t *length);
 static uint8_t  *USBD_CDC_GetDeviceQualifierDescriptor(uint16_t *length);
-*/
+#endif
 
+/** @brief CDC 类句柄（全局，4 字节对齐） */
 USBD_CDC_HandleTypeDef __aligned(4) USBD_CDC_Handle;
 
-// CDC class callbacks structure
-// These functions are called over usb_core and usb_lowlevel from PCD_EP_ISR_Handler() interrupts
+/**
+ * @brief CDC 类回调结构体
+ * @details 这些函数由 usb_core 和 usb_lowlevel 从 PCD_EP_ISR_Handler() 中断调用
+ */
 USBD_ClassTypeDef  USBD_ClassCallbacks =
 {
   .Init                          = USBD_CDC_Init,
   .DeInit                        = USBD_CDC_DeInit,
   .Setup                         = USBD_CDC_Setup,
-  .EP0_TxSent                    = NULL,  
+  .EP0_TxSent                    = NULL,
   .EP0_RxReady                   = USBD_CDC_EP0_RxReady,
   .DataIn                        = USBD_CDC_DataIn,
   .DataOut                       = USBD_CDC_DataOut,
   .SOF                           = NULL,
   .IsoINIncomplete               = NULL,
   .IsoOUTIncomplete              = NULL,
-  .GetHSConfigDescriptor         = NULL, // not used for FULL speed USB devices
+#if !USB_DEVICE_FULL_SPEED
+  .GetHSConfigDescriptor         = USBD_CDC_GetHSCfgDesc,
+#else
+  .GetHSConfigDescriptor         = NULL, // 全速设备：不使用高速配置描述符
+#endif
   .GetFSConfigDescriptor         = USBD_CDC_GetFSCfgDesc,
-  .GetOtherSpeedConfigDescriptor = NULL, // not used for FULL speed USB devices
-  .GetDeviceQualifierDescriptor  = NULL, // not used for FULL speed USB devices
+#if !USB_DEVICE_FULL_SPEED
+  .GetOtherSpeedConfigDescriptor = USBD_CDC_GetOtherSpeedCfgDesc,
+  .GetDeviceQualifierDescriptor  = USBD_CDC_GetDeviceQualifierDescriptor,
+#else
+  .GetOtherSpeedConfigDescriptor = NULL, // 全速设备：不使用其它速率描述符
+  .GetDeviceQualifierDescriptor  = NULL,
+#endif
 };
 
-// Device descriptor CDC
+/**
+ * @brief CDC 设备描述符
+ * @details VID 0x16D0（MCS）/ PID 0x117E（CANable Slcan），bDeviceClass 为 CDC（虚拟串口）
+ */
 __ALIGN_BEGIN uint8_t USBD_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
 {
-    0x12,                              // bLength 
-    USB_DESC_TYPE_DEVICE,              // bDescriptorType = Device Descriptor
-    0x00,                              // bcdUSB version
-    0x02,                              // bcdUSB version  = 2.0
-    0x02,                              // bDeviceClass    = CDC Control (virtual COM port)
-    0x02,                              // bDeviceSubClass = Abstract Control Model
+    0x12,                              // bLength
+    USB_DESC_TYPE_DEVICE,              // bDescriptorType = 设备描述符
+    0x00,                              // bcdUSB 版本低字节
+    0x02,                              // bcdUSB 版本 = 2.0
+    0x02,                              // bDeviceClass    = CDC 控制类（虚拟串口）
+    0x02,                              // bDeviceSubClass = 抽象控制模型（ACM）
     0x00,                              // bDeviceProtocol
-    USB_MAX_EP0_SIZE,                  // bMaxPacketSize  = 64 bytes
-    LOBYTE(0x16D0),                    // idVendor  MCS
-    HIBYTE(0x16D0),                    // idVendor  MCS
-    LOBYTE(0x117E),                    // idProduct CANable Slcan
-    HIBYTE(0x117E),                    // idProduct CANable Slcan 
-    LOBYTE(FIRMWARE_VERSION_BCD >> 8), // bcdDevice firmware version   see settings.h
-    HIBYTE(FIRMWARE_VERSION_BCD >> 8), // bcdDevice firmware version   see settings.h
-    USBD_IDX_MFC_STR,                  // Index of manufacturer  string
-    USBD_IDX_PRODUCT_STR,              // Index of product string
-    USBD_IDX_SERIAL_STR,               // Index of serial number string
+    USB_MAX_EP0_SIZE,                  // bMaxPacketSize  = 64 字节
+    LOBYTE(0x16D0),                    // idVendor  厂商 ID MCS
+    HIBYTE(0x16D0),                    // idVendor  厂商 ID MCS
+    LOBYTE(0x117E),                    // idProduct 产品 ID CANable Slcan
+    HIBYTE(0x117E),                    // idProduct 产品 ID CANable Slcan
+    LOBYTE(FIRMWARE_VERSION_BCD >> 8), // bcdDevice 固件版本，见 settings.h
+    HIBYTE(FIRMWARE_VERSION_BCD >> 8), // bcdDevice 固件版本，见 settings.h
+    USBD_IDX_MFC_STR,                  // 厂商字符串描述符索引
+    USBD_IDX_PRODUCT_STR,              // 产品字符串描述符索引
+    USBD_IDX_SERIAL_STR,               // 序列号字符串描述符索引
     USBD_MAX_NUM_CONFIGURATION         // bNumConfigurations
 };
 
-/*
-// USB CDC Device High Speed Configuration Descriptor
-// Not used for Full speed devices
+#if !USB_DEVICE_FULL_SPEED
+/**
+ * @brief USB CDC 设备高速配置描述符（仅高速设备编译）
+ * @details 内容与全速配置描述符一致，仅 wMaxPacketSize/bInterval 等按高速参数
+ */
 __ALIGN_BEGIN uint8_t USBD_CDC_CfgHSDesc[USB_CDC_CONFIG_DESC_SIZ] __ALIGN_END =
 {
-  // Configuration Descriptor
-  0x09,   // bLength: Configuration Descriptor size 
-  USB_DESC_TYPE_CONFIGURATION,      // bDescriptorType: Configuration 
-  USB_CDC_CONFIG_DESC_SIZ,                // wTotalLength:no of returned bytes 
+  /* 配置描述符 */
+  0x09,   /* bLength: 配置描述符大小 */
+  USB_DESC_TYPE_CONFIGURATION,      /* bDescriptorType: 配置 */
+  USB_CDC_CONFIG_DESC_SIZ,                /* wTotalLength: 返回字节数 */
   0x00,
-  0x02,   // bNumInterfaces: 2 interface 
-  0x01,   // bConfigurationValue: Configuration value 
-  0x00,   // iConfiguration: Index of string descriptor describing the configuration 
-  0x80,   // bmAttributes: bus powered 
-  0x4B,   // MaxPower 150 mA 
+  0x02,   /* bNumInterfaces: 2 个接口 */
+  0x01,   /* bConfigurationValue: 配置值 */
+  0x00,   /* iConfiguration: 配置字符串描述符索引 */
+  0x80,   /* bmAttributes: 总线供电 */
+  0x4B,   /* MaxPower 150 mA */
 
-  // ---------------------------------------------------------------------------
+  /* --------------------------------------------------------------------------- */
 
-  // Interface Descriptor 
-  0x09,   // bLength: Interface Descriptor size 
-  USB_DESC_TYPE_INTERFACE,  // bDescriptorType: Interface 
-  // Interface descriptor type 
-  0x00,   // bInterfaceNumber: Number of Interface 
-  0x00,   // bAlternateSetting: Alternate setting 
-  0x01,   // bNumEndpoints: One endpoints used 
-  0x02,   // bInterfaceClass: Communication Interface Class 
-  0x02,   // bInterfaceSubClass: Abstract Control Model 
-  0x01,   // bInterfaceProtocol: Common AT commands 
-  0x00,   // iInterface: 
+  /* 通信类接口描述符 */
+  0x09,   /* bLength: 接口描述符大小 */
+  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: 接口 */
+  0x00,   /* bInterfaceNumber: 接口号 0 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x01,   /* bNumEndpoints: 使用 1 个端点 */
+  0x02,   /* bInterfaceClass: 通信接口类 */
+  0x02,   /* bInterfaceSubClass: 抽象控制模型 */
+  0x01,   /* bInterfaceProtocol: 通用 AT 命令 */
+  0x00,   /* iInterface: */
 
-  // Header Functional Descriptor
-  0x05,   // bLength: Endpoint Descriptor size 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x00,   // bDescriptorSubtype: Header Func Desc 
-  0x10,   // bcdCDC: spec release number 
+  /* 头部功能描述符 */
+  0x05,   /* bLength: 端点描述符大小 */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x00,   /* bDescriptorSubtype: 头部功能描述符 */
+  0x10,   /* bcdCDC: 规范版本号 */
   0x01,
 
-  // Call Management Functional Descriptor
-  0x05,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x01,   // bDescriptorSubtype: Call Management Func Desc 
-  0x00,   // bmCapabilities: D0+D1 
-  0x01,   // bDataInterface: 1 
+  /* 呼叫管理功能描述符 */
+  0x05,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x01,   /* bDescriptorSubtype: 呼叫管理功能描述符 */
+  0x00,   /* bmCapabilities: D0+D1 */
+  0x01,   /* bDataInterface: 1 */
 
-  // ACM Functional Descriptor
-  0x04,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x02,   // bDescriptorSubtype: Abstract Control Management desc 
-  0x02,   // bmCapabilities 
+  /* ACM 功能描述符 */
+  0x04,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x02,   /* bDescriptorSubtype: 抽象控制管理描述符 */
+  0x02,   /* bmCapabilities */
 
-  // Union Functional Descriptor
-  0x05,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x06,   // bDescriptorSubtype: Union func desc 
-  0x00,   // bMasterInterface: Communication class interface 
-  0x01,   // bSlaveInterface0: Data Class Interface 
+  /* 联合功能描述符 */
+  0x05,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x06,   /* bDescriptorSubtype: 联合功能描述符 */
+  0x00,   /* bMasterInterface: 通信类接口 */
+  0x01,   /* bSlaveInterface0: 数据类接口 */
 
-  // Endpoint 2 Descriptor
-  0x07,                           // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,   // bDescriptorType: Endpoint 
-  CDC_CMD_EP,                     // bEndpointAddress 
-  0x03,                           // bmAttributes: Interrupt 
-  LOBYTE(CDC_CMD_PACKET_SIZE),     // wMaxPacketSize: 
+  /* 端点 2 描述符（命令端点） */
+  0x07,                           /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,   /* bDescriptorType: 端点 */
+  CDC_CMD_EP,                     /* bEndpointAddress */
+  0x03,                           /* bmAttributes: 中断传输 */
+  LOBYTE(CDC_CMD_PACKET_SIZE),     /* wMaxPacketSize: */
   HIBYTE(CDC_CMD_PACKET_SIZE),
-  CDC_HS_BINTERVAL,                           // bInterval: 
-  // ---------------------------------------------------------------------------
+  CDC_HS_BINTERVAL,                           /* bInterval: */
+  /* --------------------------------------------------------------------------- */
 
-  // Data class interface descriptor
-  0x09,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_INTERFACE,  // bDescriptorType: 
-  0x01,   // bInterfaceNumber: Number of Interface 
-  0x00,   // bAlternateSetting: Alternate setting 
-  0x02,   // bNumEndpoints: Two endpoints used 
-  0x0A,   // bInterfaceClass: CDC 
-  0x00,   // bInterfaceSubClass: 
-  0x00,   // bInterfaceProtocol: 
-  0x00,   // iInterface: 
+  /* 数据类接口描述符 */
+  0x09,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: */
+  0x01,   /* bInterfaceNumber: 接口号 1 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x02,   /* bNumEndpoints: 使用 2 个端点 */
+  0x0A,   /* bInterfaceClass: CDC 数据类 */
+  0x00,   /* bInterfaceSubClass: */
+  0x00,   /* bInterfaceProtocol: */
+  0x00,   /* iInterface: */
 
-  // Endpoint OUT Descriptor
-  0x07,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,      // bDescriptorType: Endpoint 
-  CDC_OUT_EP,                        // bEndpointAddress 
-  0x02,                              // bmAttributes: Bulk 
-  LOBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),  // wMaxPacketSize: 
+  /* 端点 OUT 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: 端点 */
+  CDC_OUT_EP,                        /* bEndpointAddress */
+  0x02,                              /* bmAttributes: 批量传输 */
+  LOBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),  /* wMaxPacketSize: */
   HIBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),
-  0x00,                              // bInterval: ignore for Bulk transfer 
+  0x00,                              /* bInterval: 批量传输忽略 */
 
-  // Endpoint IN Descriptor
-  0x07,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,      // bDescriptorType: Endpoint 
-  CDC_IN_EP,                         // bEndpointAddress 
-  0x02,                              // bmAttributes: Bulk 
-  LOBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),  // wMaxPacketSize: 
+  /* 端点 IN 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: 端点 */
+  CDC_IN_EP,                         /* bEndpointAddress */
+  0x02,                              /* bmAttributes: 批量传输 */
+  LOBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),  /* wMaxPacketSize: */
   HIBYTE(CDC_DATA_HS_MAX_PACKET_SIZE),
-  0x00                               // bInterval: ignore for Bulk transfer 
+  0x00                               /* bInterval: 批量传输忽略 */
 } ;
-*/
+#endif
 
-// USB CDC Full Speed Device Configuration Descriptor 
+/**
+ * @brief USB CDC 全速配置描述符（含通信类接口 + 数据类接口，共 67 字节）
+ */
 __ALIGN_BEGIN uint8_t USBD_CDC_CfgFSDesc[USB_CDC_CONFIG_DESC_SIZ] __ALIGN_END =
 {
-  /*Configuration Descriptor*/
-  0x09,   /* bLength: Configuration Descriptor size */
-  USB_DESC_TYPE_CONFIGURATION,      /* bDescriptorType: Configuration */
-  USB_CDC_CONFIG_DESC_SIZ,                /* wTotalLength:no of returned bytes */
+  /* 配置描述符 */
+  0x09,   /* bLength: 配置描述符大小 */
+  USB_DESC_TYPE_CONFIGURATION,      /* bDescriptorType: 配置 */
+  USB_CDC_CONFIG_DESC_SIZ,                /* wTotalLength: 返回字节数 */
   0x00,
-  0x02,   /* bNumInterfaces: 2 interface */
-  0x01,   /* bConfigurationValue: Configuration value */
-  0x00,   /* iConfiguration: Index of string descriptor describing the configuration */
-  0x80,   /* bmAttributes: bus powered */
+  0x02,   /* bNumInterfaces: 2 个接口 */
+  0x01,   /* bConfigurationValue: 配置值 */
+  0x00,   /* iConfiguration: 配置字符串描述符索引 */
+  0x80,   /* bmAttributes: 总线供电 */
   0x4B,   /* MaxPower 150 mA */
 
   /*---------------------------------------------------------------------------*/
 
-  /*Interface Descriptor */
-  0x09,   /* bLength: Interface Descriptor size */
-  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: Interface */
+  /* 通信类接口描述符 */
+  0x09,   /* bLength: 接口描述符大小 */
+  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: 接口 */
   /* Interface descriptor type */
-  0x00,   /* bInterfaceNumber: Number of Interface */
-  0x00,   /* bAlternateSetting: Alternate setting */
-  0x01,   /* bNumEndpoints: One endpoints used */
-  0x02,   /* bInterfaceClass: Communication Interface Class */
-  0x02,   /* bInterfaceSubClass: Abstract Control Model */
-  0x01,   /* bInterfaceProtocol: Common AT commands */
+  0x00,   /* bInterfaceNumber: 接口号 0 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x01,   /* bNumEndpoints: 使用 1 个端点 */
+  0x02,   /* bInterfaceClass: 通信接口类 */
+  0x02,   /* bInterfaceSubClass: 抽象控制模型 */
+  0x01,   /* bInterfaceProtocol: 通用 AT 命令 */
   0x00,   /* iInterface: */
 
-  /*Header Functional Descriptor*/
-  0x05,   /* bLength: Endpoint Descriptor size */
+  /* 头部功能描述符 */
+  0x05,   /* bLength: 端点描述符大小 */
   0x24,   /* bDescriptorType: CS_INTERFACE */
-  0x00,   /* bDescriptorSubtype: Header Func Desc */
-  0x10,   /* bcdCDC: spec release number */
+  0x00,   /* bDescriptorSubtype: 头部功能描述符 */
+  0x10,   /* bcdCDC: 规范版本号 */
   0x01,
 
-  /*Call Management Functional Descriptor*/
+  /* 呼叫管理功能描述符 */
   0x05,   /* bFunctionLength */
   0x24,   /* bDescriptorType: CS_INTERFACE */
-  0x01,   /* bDescriptorSubtype: Call Management Func Desc */
+  0x01,   /* bDescriptorSubtype: 呼叫管理功能描述符 */
   0x00,   /* bmCapabilities: D0+D1 */
   0x01,   /* bDataInterface: 1 */
 
-  /*ACM Functional Descriptor*/
+  /* ACM 功能描述符 */
   0x04,   /* bFunctionLength */
   0x24,   /* bDescriptorType: CS_INTERFACE */
-  0x02,   /* bDescriptorSubtype: Abstract Control Management desc */
+  0x02,   /* bDescriptorSubtype: 抽象控制管理描述符 */
   0x02,   /* bmCapabilities */
 
-  /*Union Functional Descriptor*/
+  /* 联合功能描述符 */
   0x05,   /* bFunctionLength */
   0x24,   /* bDescriptorType: CS_INTERFACE */
-  0x06,   /* bDescriptorSubtype: Union func desc */
-  0x00,   /* bMasterInterface: Communication class interface */
-  0x01,   /* bSlaveInterface0: Data Class Interface */
+  0x06,   /* bDescriptorSubtype: 联合功能描述符 */
+  0x00,   /* bMasterInterface: 通信类接口 */
+  0x01,   /* bSlaveInterface0: 数据类接口 */
 
-  /*Endpoint 2 Descriptor*/
-  0x07,                           /* bLength: Endpoint Descriptor size */
-  USB_DESC_TYPE_ENDPOINT,   /* bDescriptorType: Endpoint */
+  /* 端点 2 描述符（命令端点） */
+  0x07,                           /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,   /* bDescriptorType: 端点 */
   CDC_CMD_EP,                     /* bEndpointAddress */
-  0x03,                           /* bmAttributes: Interrupt */
+  0x03,                           /* bmAttributes: 中断传输 */
   LOBYTE(CDC_CMD_PACKET_SIZE),     /* wMaxPacketSize: */
   HIBYTE(CDC_CMD_PACKET_SIZE),
   CDC_FS_BINTERVAL,                           /* bInterval: */
   /*---------------------------------------------------------------------------*/
 
-  /*Data class interface descriptor*/
-  0x09,   /* bLength: Endpoint Descriptor size */
+  /* 数据类接口描述符 */
+  0x09,   /* bLength: 端点描述符大小 */
   USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: */
-  0x01,   /* bInterfaceNumber: Number of Interface */
-  0x00,   /* bAlternateSetting: Alternate setting */
-  0x02,   /* bNumEndpoints: Two endpoints used */
-  0x0A,   /* bInterfaceClass: CDC */
+  0x01,   /* bInterfaceNumber: 接口号 1 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x02,   /* bNumEndpoints: 使用 2 个端点 */
+  0x0A,   /* bInterfaceClass: CDC 数据类 */
   0x00,   /* bInterfaceSubClass: */
   0x00,   /* bInterfaceProtocol: */
   0x00,   /* iInterface: */
 
-  /*Endpoint OUT Descriptor*/
-  0x07,   /* bLength: Endpoint Descriptor size */
-  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: Endpoint */
+  /* 端点 OUT 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: 端点 */
   CDC_OUT_EP,                        /* bEndpointAddress */
-  0x02,                              /* bmAttributes: Bulk */
+  0x02,                              /* bmAttributes: 批量传输 */
   LOBYTE(CDC_DATA_FS_MAX_PACKET_SIZE),  /* wMaxPacketSize: */
   HIBYTE(CDC_DATA_FS_MAX_PACKET_SIZE),
-  0x00,                              /* bInterval: ignore for Bulk transfer */
+  0x00,                              /* bInterval: 批量传输忽略 */
 
-  /*Endpoint IN Descriptor*/
-  0x07,   /* bLength: Endpoint Descriptor size */
-  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: Endpoint */
+  /* 端点 IN 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: 端点 */
   CDC_IN_EP,                         /* bEndpointAddress */
-  0x02,                              /* bmAttributes: Bulk */
+  0x02,                              /* bmAttributes: 批量传输 */
   LOBYTE(CDC_DATA_FS_MAX_PACKET_SIZE),  /* wMaxPacketSize: */
   HIBYTE(CDC_DATA_FS_MAX_PACKET_SIZE),
-  0x00                               /* bInterval: ignore for Bulk transfer */
+  0x00                               /* bInterval: 批量传输忽略 */
 } ;
 
-/*
-// not used for Full Speed device
+#if !USB_DEVICE_FULL_SPEED
+/**
+ * @brief USB CDC 其它速率配置描述符（仅高速设备编译）
+ */
 __ALIGN_BEGIN uint8_t USBD_CDC_OtherSpeedCfgDesc[USB_CDC_CONFIG_DESC_SIZ] __ALIGN_END =
 {
-  0x09,   // bLength: Configuation Descriptor size 
+  /* 配置描述符 */
+  0x09,   /* bLength: 配置描述符大小 */
   USB_DESC_TYPE_OTHER_SPEED_CONFIGURATION,
   USB_CDC_CONFIG_DESC_SIZ,
   0x00,
-  0x02,   // bNumInterfaces: 2 interfaces 
-  0x01,   // bConfigurationValue: 
-  0x04,   // iConfiguration: 
-  0x80,   // bmAttributes: bus powered 
-  0x4B,   // MaxPower 150 mA 
+  0x02,   /* bNumInterfaces: 2 个接口 */
+  0x01,   /* bConfigurationValue: */
+  0x04,   /* iConfiguration: */
+  0x80,   /* bmAttributes: 总线供电 */
+  0x4B,   /* MaxPower 150 mA */
 
-  //Interface Descriptor 
-  0x09,   // bLength: Interface Descriptor size 
-  USB_DESC_TYPE_INTERFACE,  // bDescriptorType: Interface 
-  // Interface descriptor type 
-  0x00,   // bInterfaceNumber: Number of Interface 
-  0x00,   // bAlternateSetting: Alternate setting 
-  0x01,   // bNumEndpoints: One endpoints used 
-  0x02,   // bInterfaceClass: Communication Interface Class 
-  0x02,   // bInterfaceSubClass: Abstract Control Model 
-  0x01,   // bInterfaceProtocol: Common AT commands 
-  0x00,   // iInterface: 
+  /* 通信类接口描述符 */
+  0x09,   /* bLength: 接口描述符大小 */
+  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: 接口 */
+  0x00,   /* bInterfaceNumber: 接口号 0 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x01,   /* bNumEndpoints: 使用 1 个端点 */
+  0x02,   /* bInterfaceClass: 通信接口类 */
+  0x02,   /* bInterfaceSubClass: 抽象控制模型 */
+  0x01,   /* bInterfaceProtocol: 通用 AT 命令 */
+  0x00,   /* iInterface: */
 
-  //Header Functional Descriptor
-  0x05,   // bLength: Endpoint Descriptor size 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x00,   // bDescriptorSubtype: Header Func Desc 
-  0x10,   // bcdCDC: spec release number 
+  /* 头部功能描述符 */
+  0x05,   /* bLength: 端点描述符大小 */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x00,   /* bDescriptorSubtype: 头部功能描述符 */
+  0x10,   /* bcdCDC: 规范版本号 */
   0x01,
 
-  //Call Management Functional Descriptor
-  0x05,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x01,   // bDescriptorSubtype: Call Management Func Desc 
-  0x00,   // bmCapabilities: D0+D1 
-  0x01,   // bDataInterface: 1 
+  /* 呼叫管理功能描述符 */
+  0x05,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x01,   /* bDescriptorSubtype: 呼叫管理功能描述符 */
+  0x00,   /* bmCapabilities: D0+D1 */
+  0x01,   /* bDataInterface: 1 */
 
-  //ACM Functional Descriptor
-  0x04,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x02,   // bDescriptorSubtype: Abstract Control Management desc 
-  0x02,   // bmCapabilities 
+  /* ACM 功能描述符 */
+  0x04,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x02,   /* bDescriptorSubtype: 抽象控制管理描述符 */
+  0x02,   /* bmCapabilities */
 
-  //Union Functional Descriptor
-  0x05,   // bFunctionLength 
-  0x24,   // bDescriptorType: CS_INTERFACE 
-  0x06,   // bDescriptorSubtype: Union func desc 
-  0x00,   // bMasterInterface: Communication class interface 
-  0x01,   // bSlaveInterface0: Data Class Interface 
+  /* 联合功能描述符 */
+  0x05,   /* bFunctionLength */
+  0x24,   /* bDescriptorType: CS_INTERFACE */
+  0x06,   /* bDescriptorSubtype: 联合功能描述符 */
+  0x00,   /* bMasterInterface: 通信类接口 */
+  0x01,   /* bSlaveInterface0: 数据类接口 */
 
-  //Endpoint 2 Descriptor
-  0x07,                           // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,         // bDescriptorType: Endpoint 
-  CDC_CMD_EP,                     // bEndpointAddress 
-  0x03,                           // bmAttributes: Interrupt 
-  LOBYTE(CDC_CMD_PACKET_SIZE),     // wMaxPacketSize: 
+  /* 端点 2 描述符（命令端点） */
+  0x07,                           /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,         /* bDescriptorType: 端点 */
+  CDC_CMD_EP,                     /* bEndpointAddress */
+  0x03,                           /* bmAttributes: 中断传输 */
+  LOBYTE(CDC_CMD_PACKET_SIZE),     /* wMaxPacketSize: */
   HIBYTE(CDC_CMD_PACKET_SIZE),
-  CDC_FS_BINTERVAL,                           // bInterval: 
+  CDC_FS_BINTERVAL,                           /* bInterval: */
 
-  //---------------------------------------------------------------------------
+  /*---------------------------------------------------------------------------*/
 
-  //Data class interface descriptor
-  0x09,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_INTERFACE,  // bDescriptorType: 
-  0x01,   // bInterfaceNumber: Number of Interface 
-  0x00,   // bAlternateSetting: Alternate setting 
-  0x02,   // bNumEndpoints: Two endpoints used 
-  0x0A,   // bInterfaceClass: CDC 
-  0x00,   // bInterfaceSubClass: 
-  0x00,   // bInterfaceProtocol: 
-  0x00,   // iInterface: 
+  /* 数据类接口描述符 */
+  0x09,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_INTERFACE,  /* bDescriptorType: */
+  0x01,   /* bInterfaceNumber: 接口号 1 */
+  0x00,   /* bAlternateSetting: 备用设置 */
+  0x02,   /* bNumEndpoints: 使用 2 个端点 */
+  0x0A,   /* bInterfaceClass: CDC 数据类 */
+  0x00,   /* bInterfaceSubClass: */
+  0x00,   /* bInterfaceProtocol: */
+  0x00,   /* iInterface: */
 
-  //Endpoint OUT Descriptor
-  0x07,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,      // bDescriptorType: Endpoint 
-  CDC_OUT_EP,                        // bEndpointAddress 
-  0x02,                              // bmAttributes: Bulk 
-  0x40,                              // wMaxPacketSize: 
+  /* 端点 OUT 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,      /* bDescriptorType: 端点 */
+  CDC_OUT_EP,                        /* bEndpointAddress */
+  0x02,                              /* bmAttributes: 批量传输 */
+  0x40,                              /* wMaxPacketSize: */
   0x00,
-  0x00,                              // bInterval: ignore for Bulk transfer 
+  0x00,                              /* bInterval: 批量传输忽略 */
 
-  //Endpoint IN Descriptor
-  0x07,   // bLength: Endpoint Descriptor size 
-  USB_DESC_TYPE_ENDPOINT,     // bDescriptorType: Endpoint 
-  CDC_IN_EP,                        // bEndpointAddress 
-  0x02,                             // bmAttributes: Bulk 
-  0x40,                             // wMaxPacketSize: 
+  /* 端点 IN 描述符 */
+  0x07,   /* bLength: 端点描述符大小 */
+  USB_DESC_TYPE_ENDPOINT,     /* bDescriptorType: 端点 */
+  CDC_IN_EP,                        /* bEndpointAddress */
+  0x02,                             /* bmAttributes: 批量传输 */
+  0x40,                             /* wMaxPacketSize: */
   0x00,
-  0x00                              // bInterval 
+  0x00                              /* bInterval */
 };
-*/
+#endif
 
-/*
-// USB Device Qualifier Descriptor 
-// not used for Full speed device
+#if !USB_DEVICE_FULL_SPEED
+/**
+ * @brief USB 设备限定符描述符（仅高速设备编译）
+ */
 __ALIGN_BEGIN static uint8_t USBD_CDC_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIER_DESC] __ALIGN_END =
 {
   USB_LEN_DEV_QUALIFIER_DESC,
@@ -419,111 +439,115 @@ __ALIGN_BEGIN static uint8_t USBD_CDC_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIER_
   0x01,
   0x00,
 };
-*/
+#endif
 
 // ============================================================================================================
 
-// Called from USBD_LL_Init()
+/**
+ * @brief 配置所有端点的 PMA（包内存区）
+ * @param[in] pdev USB 设备句柄
+ * @details 在 USBD_LL_Init() 初始化期间调用
+ */
 void USBD_ConfigureEndpoints(USBD_HandleTypeDef *pdev)
 {
-    // Configue Packet Memory Area (PMA) for all endpoints
-    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x00, PCD_SNG_BUF, 0x18);  // EP 0 OUT (SETUP,                 max packet size = 64 bytes)
-    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x80, PCD_SNG_BUF, 0x58);  // EP 0 IN  (SETUP,                 max packet size = 64 bytes)
-    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x81, PCD_SNG_BUF, 0xC0);  // EP 1 IN  (CDC Data Interface,    max packet size = 64 bytes)
-    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x82, PCD_SNG_BUF, 0x100); // EP 2 IN  (CDC Control Interface, max packet size =  8 bytes)    
-    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x01, PCD_SNG_BUF, 0x110); // EP 1 OUT (CDC Data Interface,    max packet size = 64 bytes)
+    // 为所有端点配置包内存区（PMA）
+    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x00, PCD_SNG_BUF, 0x18);  // EP 0 OUT（SETUP，最大包大小 = 64 字节）
+    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x80, PCD_SNG_BUF, 0x58);  // EP 0 IN （SETUP，最大包大小 = 64 字节）
+    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x81, PCD_SNG_BUF, 0xC0);  // EP 1 IN （数据接口，最大包大小 = 64 字节）
+    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x82, PCD_SNG_BUF, 0x100); // EP 2 IN （控制接口，最大包大小 = 8 字节）
+    HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData, 0x01, PCD_SNG_BUF, 0x110); // EP 1 OUT（数据接口，最大包大小 = 64 字节）
 }
 
 // ============================================================================================================
 
 /**
-  * @brief  Initialize the CDC interface
-  * @param  pdev: device instance
-  * @param  cfgidx: Configuration index
-  * @retval status
+  * @brief  初始化 CDC 接口
+  * @param  pdev: 设备实例
+  * @param  cfgidx: 配置索引
+  * @retval 状态
   */
 static uint8_t USBD_CDC_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
     pdev->pClassData = &USBD_CDC_Handle;
-    
-    /*
+
+#if !USB_DEVICE_FULL_SPEED
     if (pdev->dev_speed == USBD_SPEED_HIGH)
     {
-        // Open EP IN 
+        // 高速：打开数据 IN 端点（HS 包大小）
         USBD_LL_OpenEP(pdev, CDC_IN_EP, USBD_EP_TYPE_BULK, CDC_DATA_HS_IN_PACKET_SIZE);
 
         pdev->ep_in[CDC_IN_EP & 0xFU].is_used = 1U;
 
-        // Open EP OUT 
+        // 高速：打开数据 OUT 端点（HS 包大小）
         USBD_LL_OpenEP(pdev, CDC_OUT_EP, USBD_EP_TYPE_BULK, CDC_DATA_HS_OUT_PACKET_SIZE);
 
         pdev->ep_out[CDC_OUT_EP & 0xFU].is_used = 1U;
     }
-    else // USBD_SPEED_FULL
-    */
+    else
+#endif
     {
-        /* Open EP IN */
+        /* 打开数据 IN 端点 */
         USBD_LL_OpenEP(pdev, CDC_IN_EP, USBD_EP_TYPE_BULK, CDC_DATA_FS_IN_PACKET_SIZE);
 
         pdev->ep_in[CDC_IN_EP & 0xFU].is_used = 1U;
 
-        /* Open EP OUT */
+        /* 打开数据 OUT 端点 */
         USBD_LL_OpenEP(pdev, CDC_OUT_EP, USBD_EP_TYPE_BULK, CDC_DATA_FS_OUT_PACKET_SIZE);
 
         pdev->ep_out[CDC_OUT_EP & 0xFU].is_used = 1U;
     }
-    
-    /* Open Command IN EP */
+
+    /* 打开命令 IN 端点（中断传输） */
     USBD_LL_OpenEP(pdev, CDC_CMD_EP, USBD_EP_TYPE_INTR, CDC_CMD_PACKET_SIZE);
     pdev->ep_in[CDC_CMD_EP & 0xFU].is_used = 1U;
 
     USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef *) pdev->pClassData;
 
-    /* Init  physical Interface components */
+    /* 初始化物理接口组件 */
     USBD_InterfaceCallbacks.Init();
 
-    /* Init Xfer states */
+    /* 初始化传输状态 */
     hcdc->TxState = 0U;
     hcdc->RxState = 0U;
 
-    /*
+#if !USB_DEVICE_FULL_SPEED
     if (pdev->dev_speed == USBD_SPEED_HIGH)
     {
-      // Prepare Out endpoint to receive next packet 
+      // 高速：准备 OUT 端点接收下一包（HS 包大小）
       USBD_LL_PrepareReceive(pdev, CDC_OUT_EP, hcdc->RxBuffer, CDC_DATA_HS_OUT_PACKET_SIZE);
     }
-    else // USBD_SPEED_FULL
-    */
+    else
+#endif
     {
-      // Prepare Out endpoint to receive next packet 
+      // 准备 OUT 端点接收下一包
       USBD_LL_PrepareReceive(pdev, CDC_OUT_EP, hcdc->RxBuffer, CDC_DATA_FS_OUT_PACKET_SIZE);
     }
     return 0;
 }
 
 /**
-  * @brief  DeInitialize the CDC layer
-  * @param  pdev: device instance
-  * @param  cfgidx: Configuration index
-  * @retval status
+  * @brief  反初始化 CDC 层
+  * @param  pdev: 设备实例
+  * @param  cfgidx: 配置索引
+  * @retval 状态
   */
 static uint8_t  USBD_CDC_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   uint8_t ret = 0U;
 
-  /* Close EP IN */
+  /* 关闭数据 IN 端点 */
   USBD_LL_CloseEP(pdev, CDC_IN_EP);
   pdev->ep_in[CDC_IN_EP & 0xFU].is_used = 0U;
 
-  /* Close EP OUT */
+  /* 关闭数据 OUT 端点 */
   USBD_LL_CloseEP(pdev, CDC_OUT_EP);
   pdev->ep_out[CDC_OUT_EP & 0xFU].is_used = 0U;
 
-  /* Close Command IN EP */
+  /* 关闭命令 IN 端点 */
   USBD_LL_CloseEP(pdev, CDC_CMD_EP);
   pdev->ep_in[CDC_CMD_EP & 0xFU].is_used = 0U;
 
-  /* DeInit  physical Interface components */
+  /* 反初始化物理接口组件 */
   if (pdev->pClassData != NULL)
   {
       USBD_InterfaceCallbacks.DeInit();
@@ -533,10 +557,10 @@ static uint8_t  USBD_CDC_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 }
 
 /**
-  * @brief  Handle the CDC specific requests
-  * @param  pdev: instance
-  * @param  req: usb requests
-  * @retval status
+  * @brief  处理 CDC 特定请求
+  * @param  pdev: 设备实例
+  * @param  req: USB 请求
+  * @retval 状态
   */
 static uint8_t USBD_CDC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
 {
@@ -552,12 +576,14 @@ static uint8_t USBD_CDC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *re
       {
         if (req->bmRequest & 0x80U)
         {
+          // 设备 -> 主机：调 Control 回调填充应答后经端点 0 返回
           USBD_InterfaceCallbacks.Control(req->bRequest, (uint8_t *)(void *)hcdc->data, req->wLength);
 
           USBD_CtlSendData(pdev, (uint8_t *)(void *)hcdc->data, req->wLength);
         }
         else
         {
+          // 主机 -> 设备：保存命令码，准备接收 OUT 数据
           hcdc->CmdOpCode = req->bRequest;
           hcdc->CmdLength = (uint8_t)req->wLength;
 
@@ -621,10 +647,10 @@ static uint8_t USBD_CDC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *re
 }
 
 /**
-  * @brief  Data sent on non-control IN endpoint
-  * @param  pdev: device instance
-  * @param  epnum: endpoint number
-  * @retval status
+  * @brief  非控制 IN 端点数据已发送
+  * @param  pdev: 设备实例
+  * @param  epnum: 端点号
+  * @retval 状态
   */
 static uint8_t USBD_CDC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
@@ -633,17 +659,14 @@ static uint8_t USBD_CDC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 
   if (pdev->pClassData != NULL)
   {
+    // 发送长度恰为最大包大小的整数倍时，需补发零长度包（ZLP）
+    // 以标识传输结束，否则主机会继续等待数据
     if ((pdev->ep_in[epnum].total_length > 0U) && ((pdev->ep_in[epnum].total_length % hpcd->IN_ep[epnum].maxpacket) == 0U))
     {
-      // Reset the packet total length
+      // 复位包总长度
       pdev->ep_in[epnum].total_length = 0U;
 
-      // Send ZLP
-      // A ZLP is a USB packet that contains no data payload. It's length is zero.
-      // ZLP's are important to signal the end of a data transfer when the last packet sent 
-      // is exactly the maximum packet size (e.g. 64 bytes for full-speed USB).
-      // Otherwise, if the last packet in a transfer is exactly wMaxPacketSize, the host cannot tell if more data is coming.
-      // If the ZLP is missing the host will expect another packet to come. 
+      // 发送 ZLP
       USBD_LL_Transmit(pdev, epnum, NULL, 0U);
     }
     else
@@ -656,20 +679,19 @@ static uint8_t USBD_CDC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 }
 
 /**
-  * @brief  Data received on non-control Out endpoint
-  * @param  pdev: device instance
-  * @param  epnum: endpoint number
-  * @retval status
+  * @brief  非控制 OUT 端点收到数据
+  * @param  pdev: 设备实例
+  * @param  epnum: 端点号
+  * @retval 状态
   */
 static uint8_t  USBD_CDC_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
   USBD_CDC_HandleTypeDef* hcdc = (USBD_CDC_HandleTypeDef *) pdev->pClassData;
 
-  /* Get the received data length */
+  /* 获取接收数据长度 */
   hcdc->RxLength = USBD_LL_GetRxDataSize(pdev, epnum);
 
-  /* USB data will be immediately processed, this allow next USB traffic being
-  NAKed till the end of the application Xfer */
+  /* USB 数据立即处理，以在应用传输结束前 NAK 后续 USB 流量 */
   if (pdev->pClassData != NULL)
   {
     USBD_InterfaceCallbacks.Receive(hcdc->RxBuffer, &hcdc->RxLength);
@@ -679,9 +701,9 @@ static uint8_t  USBD_CDC_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 }
 
 /**
-  * @brief  Handle EP0 Rx Ready event
-  * @param  pdev: device instance
-  * @retval status
+  * @brief  处理端点 0 就绪事件
+  * @param  pdev: 设备实例
+  * @retval 状态
   */
 static uint8_t  USBD_CDC_EP0_RxReady(USBD_HandleTypeDef *pdev)
 {
@@ -696,10 +718,9 @@ static uint8_t  USBD_CDC_EP0_RxReady(USBD_HandleTypeDef *pdev)
 }
 
 /**
-  * @brief  Return full speed configuration descriptor
-  * @param  speed : current device speed
-  * @param  length : pointer data length
-  * @retval pointer to descriptor buffer
+  * @brief  返回全速配置描述符
+  * @param  length: 数据长度指针
+  * @retval 描述符缓冲区指针
   */
 static uint8_t  *USBD_CDC_GetFSCfgDesc(uint16_t *length)
 {
@@ -708,53 +729,51 @@ static uint8_t  *USBD_CDC_GetFSCfgDesc(uint16_t *length)
 }
 
 /**
-  * @brief  Return high speed configuration descriptor
-  * @param  speed : current device speed
-  * @param  length : pointer data length
-  * @retval pointer to descriptor buffer
+  * @brief  返回高速配置描述符
+  * @param  length: 数据长度指针
+  * @retval 描述符缓冲区指针
   */
-  
-/* not used for FULL speed device
+
+#if !USB_DEVICE_FULL_SPEED
 static uint8_t  *USBD_CDC_GetHSCfgDesc(uint16_t *length)
 {
   *length = sizeof(USBD_CDC_CfgHSDesc);
   return USBD_CDC_CfgHSDesc;
 }
-*/
+#endif
 
 /**
-  * @brief  Return configuration descriptor
-  * @param  speed : current device speed
-  * @param  length : pointer data length
-  * @retval pointer to descriptor buffer
+  * @brief  返回其它速率配置描述符
+  * @param  length: 数据长度指针
+  * @retval 描述符缓冲区指针
   */
-/*
-// not used for Full speed device
+#if !USB_DEVICE_FULL_SPEED
 static uint8_t  *USBD_CDC_GetOtherSpeedCfgDesc(uint16_t *length)
 {
   *length = sizeof(USBD_CDC_OtherSpeedCfgDesc);
   return USBD_CDC_OtherSpeedCfgDesc;
 }
-*/
+#endif
 
 /**
-* @brief  return Device Qualifier descriptor
-* @param  length : pointer data length
-* @retval pointer to descriptor buffer
+* @brief  返回设备限定符描述符
+* @param  length: 数据长度指针
+* @retval 描述符缓冲区指针
 */
-/*
-// not used for Full speed device
+#if !USB_DEVICE_FULL_SPEED
 uint8_t  *USBD_CDC_GetDeviceQualifierDescriptor(uint16_t *length)
 {
   *length = sizeof(USBD_CDC_DeviceQualifierDesc);
   return USBD_CDC_DeviceQualifierDesc;
 }
-*/
+#endif
 
 /**
-  * @param  pdev: device instance
-  * @param  pbuff: Tx Buffer
-  * @retval status
+  * @brief  设置发送缓冲与长度
+  * @param  pdev: 设备实例
+  * @param  pbuff: 发送缓冲
+  * @param  length: 数据长度
+  * @retval 状态
   */
 uint8_t  USBD_CDC_SetTxBuffer(USBD_HandleTypeDef* pdev, uint8_t *pbuff, uint16_t length)
 {
@@ -765,9 +784,10 @@ uint8_t  USBD_CDC_SetTxBuffer(USBD_HandleTypeDef* pdev, uint8_t *pbuff, uint16_t
 }
 
 /**
-  * @param  pdev: device instance
-  * @param  pbuff: Rx Buffer
-  * @retval status
+  * @brief  设置接收缓冲
+  * @param  pdev: 设备实例
+  * @param  pbuff: 接收缓冲
+  * @retval 状态
   */
 uint8_t USBD_CDC_SetRxBuffer(USBD_HandleTypeDef* pdev, uint8_t  *pbuff)
 {
@@ -777,9 +797,9 @@ uint8_t USBD_CDC_SetRxBuffer(USBD_HandleTypeDef* pdev, uint8_t  *pbuff)
 }
 
 /**
-  * @brief  Transmit packet on IN endpoint
-  * @param  pdev: device instance
-  * @retval status
+  * @brief  在 IN 端点发送数据包
+  * @param  pdev: 设备实例
+  * @retval 状态（上一次传输未完成返回 USBD_BUSY）
   */
 uint8_t USBD_CDC_TransmitPacket(USBD_HandleTypeDef *pdev)
 {
@@ -789,13 +809,13 @@ uint8_t USBD_CDC_TransmitPacket(USBD_HandleTypeDef *pdev)
   {
     if (hcdc->TxState == 0U)
     {
-      /* Tx Transfer in progress */
+      /* 标记传输进行中 */
       hcdc->TxState = 1U;
 
-      /* Update the packet total length */
+      /* 更新包总长度 */
       pdev->ep_in[CDC_IN_EP & 0xFU].total_length = hcdc->TxLength;
 
-      /* Transmit next packet */
+      /* 发送数据包 */
       USBD_LL_Transmit(pdev, CDC_IN_EP, hcdc->TxBuffer, (uint16_t)hcdc->TxLength);
       return USBD_OK;
     }
@@ -805,27 +825,27 @@ uint8_t USBD_CDC_TransmitPacket(USBD_HandleTypeDef *pdev)
 }
 
 /**
-  * @brief  prepare OUT Endpoint for reception
-  * @param  pdev: device instance
-  * @retval status
+  * @brief  准备 OUT 端点接收数据
+  * @param  pdev: 设备实例
+  * @retval 状态
   */
 uint8_t USBD_CDC_ReceivePacket(USBD_HandleTypeDef *pdev)
 {
   USBD_CDC_HandleTypeDef   *hcdc = (USBD_CDC_HandleTypeDef *) pdev->pClassData;
 
-  /* Suspend or Resume USB Out process */
+  /* 挂起或恢复 USB 输出过程 */
   if (pdev->pClassData != NULL)
   {
-    /*
+#if !USB_DEVICE_FULL_SPEED
     if (pdev->dev_speed == USBD_SPEED_HIGH)
     {
-      // Prepare Out endpoint to receive next packet
+      // 高速：准备 OUT 端点接收下一包（HS 包大小）
       USBD_LL_PrepareReceive(pdev, CDC_OUT_EP, hcdc->RxBuffer, CDC_DATA_HS_OUT_PACKET_SIZE);
     }
-    else // USBD_SPEED_FULL
-    */
+    else
+#endif
     {
-      // Prepare Out endpoint to receive next packet
+      // 准备 OUT 端点接收下一包
       USBD_LL_PrepareReceive(pdev, CDC_OUT_EP, hcdc->RxBuffer, CDC_DATA_FS_OUT_PACKET_SIZE);
     }
     return USBD_OK;
@@ -833,9 +853,12 @@ uint8_t USBD_CDC_ReceivePacket(USBD_HandleTypeDef *pdev)
   else return USBD_FAIL;
 }
 
-// Called from lowlevel.c
-// return true if handled
-// not used for Slcan
+/**
+ * @brief 处理 SETUP 阶段请求
+ * @param[in] hpcd PCD 句柄
+ * @return true 已处理
+ * @details 从 lowlevel.c 调用；Slcan 未使用，恒返回 false
+ */
 bool USBD_SetupStageRequest(PCD_HandleTypeDef *hpcd)
 {
     return false;

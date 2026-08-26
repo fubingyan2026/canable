@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
+This is a **monorepo** with two halves: the CANable 2.5 **GUI** (described below) and the **device firmware** itself, which lives in `CANable-2.5-firmware-Slcan-and-Candlelight-main/` (see [Firmware (STM32G431 Candlelight/Slcan)](#firmware-stm32g431-candlelightslcan)). The GUI talks to that firmware over USB and can re-flash it in DFU mode via the `boot_upgrade` plugin.
+
 CANable 2.5 GUI — a PySide6/Qt6 desktop application for the CANable 2.5 USB-CAN adapter (ElmueSoft Candlelight firmware). Supports Classic CAN and CAN FD with a bilingual UI (Chinese/English). Styling deliberately uses Qt's native look — a custom theme/frameless-window system was removed and is not coming back.
 
 Two Python packages:
@@ -30,6 +32,47 @@ pyinstaller --clean --noconfirm CANable2.5.spec
 ```
 
 There are no test suites, linters, or CI pipelines in this repository.
+
+## Firmware (STM32G431 Candlelight/Slcan)
+
+`CANable-2.5-firmware-Slcan-and-Candlelight-main/` holds the on-device firmware: the ElmueSoft STM32G431 codebase that combines the **Slcan** and **Candlelight** firmwares into one source tree (CAN FD capable, tested to 10 Mbaud, backward compatible with legacy firmware). Everything else in this file describes the GUI; the firmware is a self-contained sub-project. The bootloader/protocol documents `CANABLE_PROTOCOL_SPEC.md`, `protocol_master.md`, and `boot_protocol_spec.md` sit at the repo root.
+
+### Firmware build
+
+Two firmware variants × two boards, each a thin makefile setting `TARGET_FIRMWARE`/`TARGET_BOARD`/`TARGET_FILE` then including `Make_Rules.mk`:
+
+- Variants: `Candlelight` (raw USB candleLight protocol, what the GUI's pyusb SDK speaks) and `Slcan` (USB CDC virtual serial, ASCII SLCAN)
+- Boards: `MksMakerbase`, `Openlightlabs` (makefile names use `OpenlightLabs`)
+- Makefiles: `Make_G431_<Candle|Slcan>_<Board>`
+
+```bash
+# Linux / Git Bash wrapper (default Candlelight/MksMakerbase; same for build_slcan.sh)
+./build.sh [-b MksMakerbase|Openlightlabs] [-f Candlelight|Slcan] [--flash] [--clean]
+
+# Direct make (what the wrapper and the .cmd files run)
+make -s -f Make_G431_Candle_MksMakerbase
+```
+
+Windows: run `Build_Candlelight.cmd` / `Build_Slcan.cmd` — requires MinGW and the STM32 Cube CLT. `Make_Rules.mk` needs an `mmkdir` binary on Windows (rename MinGW's `mkdir.exe` to `mmkdir.exe`).
+
+Toolchain: `arm-none-eabi-gcc`. Output lands in `Build_STM32G431xx_<Firmware>_<Board>/STM32G431_<Firmware>2.5_<Board>.{bin,hex,elf}`.
+
+Flash in DFU mode (hold BOOT while plugging in):
+
+```bash
+dfu-util -w -d 0483:df11 -c 1 -i 0 -a 0 -s 0x08000000:leave -D \
+  Build_STM32G431xx_Candlelight_MksMakerbase/STM32G431_Candlelight2.5_MksMakerbase.bin
+```
+
+### Firmware structure
+
+- `Source/` — shared core: `main.c` (superloop, ~100 iterations/ms), `can.c`, `usb_core.c`/`usb_lowlevel.c`, `system.c`, `dfu.c`, `led.c`
+- `Source/Candlelight/` and `Source/Slcan/` — per-firmware USB class/control/buffer logic; `Make_Rules.mk` adds `-ISource/$(TARGET_FIRMWARE)` so only the selected variant compiles
+- `STM32/` — HAL driver, CMSIS, and `STM32G431xx_Config/` (linker script `STM32G431xx.ld`, `startup_STM32G431xx.s`, `system_stm32g4xx.c`, `stm32g4xx_hal_conf.h`)
+- `Documentation/` — ElmueSoft manuals plus CAN FD timing references (Bosch, CiA, ST AN5348 FDCAN peripheral guide)
+- `SampleApplication C++/` — WinUSB host demo (CANableDemo, Visual Studio solution)
+
+The Candlelight build exposes a **DFU USB interface** alongside the CAN interface; the GUI's `boot_upgrade` plugin drives that bootloader (per `boot_protocol_spec.md`) in worker exclusive mode to flash the `.bin` files above.
 
 ## Architecture
 

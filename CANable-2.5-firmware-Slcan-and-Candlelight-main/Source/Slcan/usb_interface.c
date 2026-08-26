@@ -26,6 +26,7 @@ static int8_t CDC_DeInit_FS(void);
 static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length);
 static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 
+/** @brief CDC 接口回调集（注册到 USB 类驱动） */
 USBD_CDC_ItfTypeDef USBD_InterfaceCallbacks =
 {
     CDC_Init_FS,
@@ -34,7 +35,11 @@ USBD_CDC_ItfTypeDef USBD_InterfaceCallbacks =
     CDC_Receive_FS
 };
 
-// Initializes the CDC media low layer over the FS USB IP
+/**
+ * @brief 初始化 CDC 介质低层（全速 USB）
+ * @return USB 状态
+ * @details 把发送/接收缓冲分别指向 CDC 发送/接收环形缓冲的当前槽
+ */
 static int8_t CDC_Init_FS(void)
 {
     USBD_CDC_SetTxBuffer(&USB_Device, (uint8_t *)buf_cdc_tx.data[buf_cdc_tx.tail], 0);
@@ -42,18 +47,21 @@ static int8_t CDC_Init_FS(void)
     return (USBD_OK);
 }
 
-// DeInitializes the CDC media low layer
+/**
+ * @brief 反初始化 CDC 介质低层
+ * @return USB 状态
+ */
 static int8_t CDC_DeInit_FS(void)
 {
     return (USBD_OK);
 }
 
 /**
-  * @brief  Manage the CDC class requests
-  * @param  cmd: Command code
-  * @param  pbuf: Buffer containing command data (request parameters)
-  * @param  length: Number of data to be sent (in bytes)
-  * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
+  * @brief  管理 CDC 类请求（线路编码等，Slcan 仅应答 GET_LINE_CODING）
+  * @param  cmd: 命令码
+  * @param  pbuf: 存放命令数据的缓冲（请求参数）
+  * @param  length: 要发送的数据字节数
+  * @retval 操作结果：USBD_OK 成功，否则 USBD_FAIL
   */
 static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 {
@@ -75,37 +83,38 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
             break;
 
   /*******************************************************************************/
-  /* Line Coding Structure                                                       */
+  /* 线路编码结构                                                               */
   /*-----------------------------------------------------------------------------*/
-  /* Offset | Field       | Size | Value  | Description                          */
-  /* 0      | dwDTERate   |   4  | Number |Data terminal rate, in bits per second*/
-  /* 4      | bCharFormat |   1  | Number | Stop bits                            */
-  /*                                        0 - 1 Stop bit                       */
-  /*                                        1 - 1.5 Stop bits                    */
-  /*                                        2 - 2 Stop bits                      */
-  /* 5      | bParityType |  1   | Number | Parity                               */
-  /*                                        0 - None                             */
-  /*                                        1 - Odd                              */
-  /*                                        2 - Even                             */
-  /*                                        3 - Mark                             */
-  /*                                        4 - Space                            */
-  /* 6      | bDataBits  |   1   | Number Data bits (5, 6, 7, 8 or 16).          */
+  /* 偏移 | 字段        | 大小 | 值    | 说明                                   */
+  /* 0    | dwDTERate   |  4  | 数值  | 数据终端速率（bit/s）                    */
+  /* 4    | bCharFormat |  1  | 数值  | 停止位                                  */
+  /*                                        0 - 1 个停止位                       */
+  /*                                        1 - 1.5 个停止位                     */
+  /*                                        2 - 2 个停止位                       */
+  /* 5    | bParityType |  1  | 数值  | 校验                                   */
+  /*                                        0 - 无                                */
+  /*                                        1 - 奇校验                            */
+  /*                                        2 - 偶校验                            */
+  /*                                        3 - 标记                              */
+  /*                                        4 - 空格                              */
+  /* 6    | bDataBits   |  1  | 数值  | 数据位（5、6、7、8 或 16）                */
   /*******************************************************************************/
         case CDC_SET_LINE_CODING:
             break;
 
         case CDC_GET_LINE_CODING:
+            // 应答固定为 115200/8/N/1（Slcan 不使用这些值，仅满足协议要求）
             pbuf[0] = (uint8_t)(115200);
             pbuf[1] = (uint8_t)(115200 >> 8);
             pbuf[2] = (uint8_t)(115200 >> 16);
             pbuf[3] = (uint8_t)(115200 >> 24);
-            pbuf[4] = 0; // stop bits (1)
-            pbuf[5] = 0; // parity (none)
-            pbuf[6] = 8; // number of bits (8)
+            pbuf[4] = 0; // 停止位（1）
+            pbuf[5] = 0; // 校验（无）
+            pbuf[6] = 8; // 数据位（8）
             break;
 
         case CDC_SET_CONTROL_LINE_STATE:
-            // The hosts sets the lines DTR or RTS.
+            // 主机设置 DTR 或 RTS 线，此处无需处理
             break;
 
         case CDC_SEND_BREAK:
@@ -116,45 +125,46 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 }
 
 /**
-  * @brief  Data received over USB OUT endpoint are sent over CDC interface
-  *         through this function.
-  *
-  *         @note
-  *         This function will block any OUT packet reception on USB endpoint
-  *         until exiting this function. If you exit this function before transfer
-  *         is complete on CDC interface (ie. using DMA controller) it will result
-  *         in receiving more data while previous ones are still not sent.
-  *
-  * @param  Buf: Buffer of data to be received
-  * @param  Len: Number of data received (in bytes)
-  * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
+  * @brief  通过 USB OUT 端点收到的数据经此函数交给 CDC 接口处理
+  * @param  Buf: 收到的数据缓冲
+  * @param  Len: 收到的数据字节数
+  * @retval 操作结果：USBD_OK 成功，否则 USBD_FAIL
+  * @note   本函数返回前会阻塞 OUT 端点接收；若在 CDC 传输完成前返回
+  *         （如使用 DMA），可能导致上一批数据尚未发出又收到新数据
   */
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
-    // Check for overflow!
+    // 检查接收环形缓冲是否已满
     uint32_t new_head = (buf_cdc_rx.head + 1) % BUF_CDC_RX_NUM_BUFS;
     if (new_head == buf_cdc_rx.tail)
     {
         error_assert(APP_CanTxOverflow, false);
 
-        // Listen again on the same buffer. Old data will be overwritten.
+        // 仍在同一缓冲上监听，旧数据将被覆盖
         USBD_CDC_SetRxBuffer(&USB_Device, (uint8_t *)buf_cdc_rx.data[buf_cdc_rx.head]);
         USBD_CDC_ReceivePacket(&USB_Device);
         return HAL_ERROR;
     }
     else
     {
-        // Save off length
+        // 保存数据长度并前移写指针
         buf_cdc_rx.msglen[buf_cdc_rx.head] = *Len;
         buf_cdc_rx.head = new_head;
 
-        // Start listening on next buffer. Previous buffer will be processed in main loop.
+        // 在下一个缓冲上监听，上一个缓冲由主循环处理
         USBD_CDC_SetRxBuffer(&USB_Device, (uint8_t *)buf_cdc_rx.data[buf_cdc_rx.head]);
         USBD_CDC_ReceivePacket(&USB_Device);
         return (USBD_OK);
     }
 }
 
+/**
+ * @brief 通过 CDC 向主机发送数据
+ * @param[in] Buf 数据指针
+ * @param[in] Len 数据长度
+ * @return USBD_OK 成功；USBD_BUSY 上一次传输未完成
+ * @details 底层为 USBD_CDC_TransmitPacket()，发送期间返回 BUSY 供调用方重试
+ */
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
     uint8_t result = USBD_OK;

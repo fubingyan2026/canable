@@ -63,6 +63,8 @@ class CANWorker(QObject):
         self.bitrate = 500_000
         self.fd_mode = False
         self.data_bitrate: Optional[int] = None
+        self.sample_point: Optional[float] = None
+        self.data_sample_point: Optional[float] = None
         self._last_error_notify = 0.0    # 上次错误帧通知时间
         self._error_count = 0            # 连续错误帧计数
         self._last_error_time = 0.0      # 上次错误帧时间
@@ -104,7 +106,7 @@ class CANWorker(QObject):
             logger.info("打开设备: bitrate=%d fd=%s", self.bitrate, self.fd_mode)
             self._bus = ZDTCanable()
             self._bus.open()
-            self._bus.set_bitrate(self.bitrate)
+            self._bus.set_bitrate(self.bitrate, sample_point=self.sample_point)
 
             # 查询固件版本
             ver = self._bus.get_version()
@@ -123,7 +125,8 @@ class CANWorker(QObject):
                     self.fd_mode = False
                 else:
                     if self.data_bitrate:
-                        self._bus.set_data_bitrate(self.data_bitrate)
+                        self._bus.set_data_bitrate(
+                            self.data_bitrate, sample_point=self.data_sample_point)
                     # 仅在固件支持 FD 时才设置标志
                     self._bus.fd_mode = True
                     logger.info("启用 FD 模式: data_bitrate=%s", self.data_bitrate)
@@ -162,7 +165,7 @@ class CANWorker(QObject):
         was_running = self._running
         if self._bus is not None and self._connected:
             try:
-                self._bus.set_bitrate(bitrate)
+                self._bus.set_bitrate(bitrate, sample_point=self.sample_point)
                 self.bitrate = bitrate
                 if was_running:
                     self.state_changed.emit(True, f"{_('Status.ConnectedAt')} {bitrate:,} bps")
@@ -170,6 +173,18 @@ class CANWorker(QObject):
                 self.error.emit(f"{_('Error.BitrateFailed')}: {e}")
         else:
             self.bitrate = bitrate
+
+    @Slot(int)
+    def set_data_bitrate_slot(self, data_bitrate: int):
+        if self._bus is not None and self._connected and self.fd_mode:
+            try:
+                self._bus.set_data_bitrate(
+                    data_bitrate, sample_point=self.data_sample_point)
+                self.data_bitrate = data_bitrate
+            except Exception as e:
+                self.error.emit(f"{_('Error.BitrateFailed')}: {e}")
+        else:
+            self.data_bitrate = data_bitrate
 
     def _calc_bus_load(self, now: float, frame: CANFrame, fps: int) -> float:
         if fps == 0 or not self.bitrate:

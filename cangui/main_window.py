@@ -219,13 +219,21 @@ class MainWindow(QMainWindow):
         self._lbl_data_bitrate.setEnabled(False)
         bf.addRow(self._lbl_data_bitrate, self.data_bitrate_combo)
 
+        self.data_sample_combo = QComboBox()
+        self.data_sample_combo.addItem(_("Left.Sample75"), 0.75)
+        self.data_sample_combo.addItem(_("Left.Sample87"), 0.875)
+        self.data_sample_combo.addItem(_("Left.Sample67"), 0.667)
+        self.data_sample_combo.addItem(_("Left.Sample50"), 0.50)
+        self.data_sample_combo.setEnabled(False)
+        self._lbl_data_sample = QLabel(_("Left.DataSamplePoint"))
+        self._lbl_data_sample.setEnabled(False)
+        bf.addRow(self._lbl_data_sample, self.data_sample_combo)
+
         self.sample_combo = QComboBox()
-        self.sample_combo.addItems([
-            _("Left.Sample87"),
-            _("Left.Sample75"),
-            _("Left.Sample67"),
-            _("Left.Sample50"),
-        ])
+        self.sample_combo.addItem(_("Left.Sample87"), 0.875)
+        self.sample_combo.addItem(_("Left.Sample75"), 0.75)
+        self.sample_combo.addItem(_("Left.Sample67"), 0.667)
+        self.sample_combo.addItem(_("Left.Sample50"), 0.50)
         self._lbl_sample = QLabel(_("Left.SamplePoint"))
         bf.addRow(self._lbl_sample, self.sample_combo)
         layout.addWidget(self._bus_box)
@@ -355,6 +363,9 @@ class MainWindow(QMainWindow):
         self.filter_panel.filters_changed.connect(self._on_filters_changed)
         # Bitrate change in side panel
         self.bitrate_combo.currentIndexChanged.connect(self._on_bitrate_combo_changed)
+        # 采样点变化 → 重新下发位时序
+        self.sample_combo.currentIndexChanged.connect(self._on_sample_combo_changed)
+        self.data_sample_combo.currentIndexChanged.connect(self._on_data_sample_combo_changed)
 
     # ------------------------------------------------------ 插件宿主辅助
     # 这些方法由 PluginContext / PluginHost 调用，避免插件直接操作内部控件
@@ -446,6 +457,8 @@ class MainWindow(QMainWindow):
     def _on_fd_toggle(self, enabled: bool):
         self.data_bitrate_combo.setEnabled(enabled)
         self._lbl_data_bitrate.setEnabled(enabled)
+        self.data_sample_combo.setEnabled(enabled)
+        self._lbl_data_sample.setEnabled(enabled)
         # 通知 send 面板更新 DLC 范围
         self.send_panel.set_fd_mode(enabled)
 
@@ -476,6 +489,8 @@ class MainWindow(QMainWindow):
         # 注意：worker 不能有 parent，否则 moveToThread 会被拒绝
         self._worker = CANWorker()
         self._worker.bitrate = self.bitrate_combo.currentData()
+        self._worker.sample_point = self.sample_combo.currentData()
+        self._worker.data_sample_point = self.data_sample_combo.currentData()
         self._worker.fd_mode = self.fd_chk.isChecked()
         if self.fd_chk.isChecked():
             self._worker.data_bitrate = self.data_bitrate_combo.currentData()
@@ -632,6 +647,20 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             self._worker.set_bitrate_slot(br)
 
+    @Slot(int)
+    def _on_sample_combo_changed(self, idx: int):
+        if self._worker is not None:
+            self._worker.sample_point = self.sample_combo.currentData()
+            if self._connected:
+                self._worker.set_bitrate_slot(self.bitrate_combo.currentData())
+
+    @Slot(int)
+    def _on_data_sample_combo_changed(self, idx: int):
+        if self._worker is not None:
+            self._worker.data_sample_point = self.data_sample_combo.currentData()
+            if self._connected:
+                self._worker.set_data_bitrate_slot(self.data_bitrate_combo.currentData())
+
     @Slot(list)
     def _on_filters_changed(self, filters):
         if self._worker is not None:
@@ -735,6 +764,7 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.data_bitrate_combo.setCurrentIndex(idx)
         self.sample_combo.setCurrentIndex(s.get("sample_point", 0))
+        self.data_sample_combo.setCurrentIndex(s.get("data_sample_point", 0))
         self.trace_panel.autoscroll_chk.setChecked(s.get("autoscroll", True))
         if s.get("collapse", False):
             self.trace_panel.collapse_chk.setChecked(True)
@@ -866,16 +896,26 @@ class MainWindow(QMainWindow):
             current_text = self.sample_combo.currentText()
             self.sample_combo.blockSignals(True)
             self.sample_combo.clear()
-            self.sample_combo.addItems([
-                _("Left.Sample87"),
-                _("Left.Sample75"),
-                _("Left.Sample67"),
-                _("Left.Sample50"),
-            ])
+            self.sample_combo.addItem(_("Left.Sample87"), 0.875)
+            self.sample_combo.addItem(_("Left.Sample75"), 0.75)
+            self.sample_combo.addItem(_("Left.Sample67"), 0.667)
+            self.sample_combo.addItem(_("Left.Sample50"), 0.50)
             idx = self.sample_combo.findText(current_text)
             if idx >= 0:
                 self.sample_combo.setCurrentIndex(idx)
             self.sample_combo.blockSignals(False)
+        if hasattr(self, "data_sample_combo"):
+            current_text = self.data_sample_combo.currentText()
+            self.data_sample_combo.blockSignals(True)
+            self.data_sample_combo.clear()
+            self.data_sample_combo.addItem(_("Left.Sample75"), 0.75)
+            self.data_sample_combo.addItem(_("Left.Sample87"), 0.875)
+            self.data_sample_combo.addItem(_("Left.Sample67"), 0.667)
+            self.data_sample_combo.addItem(_("Left.Sample50"), 0.50)
+            idx = self.data_sample_combo.findText(current_text)
+            if idx >= 0:
+                self.data_sample_combo.setCurrentIndex(idx)
+            self.data_sample_combo.blockSignals(False)
         # 通知插件刷新语言
         if hasattr(self, "plugins"):
             self.plugins.refresh_language()
@@ -889,6 +929,7 @@ class MainWindow(QMainWindow):
         self._set("fd_mode", self.fd_chk.isChecked())
         self._set("data_bitrate", self.data_bitrate_combo.currentData())
         self._set("sample_point", self.sample_combo.currentIndex())
+        self._set("data_sample_point", self.data_sample_combo.currentIndex())
         self._set("autoscroll", self.trace_panel.autoscroll_chk.isChecked())
         self._set("collapse", self.trace_panel.collapse_chk.isChecked())
         self._set("language", get_language())

@@ -125,6 +125,7 @@ _TR.update({
     "Left.BPS":              {"zh": "bps",              "en": "bps"},
     "Left.DataBitrate":      {"zh": "数据比特率:",     "en": "Data Bitrate:"},
     "Left.SamplePoint":      {"zh": "采样点:",         "en": "Sample Point:"},
+    "Left.DataSamplePoint":  {"zh": "数据段采样点:",   "en": "Data Sample Point:"},
     "Left.Sample87":         {"zh": "87.5% (默认)",    "en": "87.5% (default)"},
     "Left.Sample75":         {"zh": "75.0%",          "en": "75.0%"},
     "Left.Sample67":         {"zh": "66.7%",          "en": "66.7%"},

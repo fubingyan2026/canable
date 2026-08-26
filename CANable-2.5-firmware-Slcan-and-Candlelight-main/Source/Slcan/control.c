@@ -1,3 +1,8 @@
+/**
+ * @file control.c
+ * @brief Slcan 命令解析与控制：SLCAN ASCII 命令的分发、执行与错误上报
+ */
+
 /*
     The MIT License
     Copyright (c) 2025 ElmueSoft / Nakanishi Kiyomaro / Normadotcom
@@ -15,19 +20,43 @@
 
 extern eUserFlags USER_Flags;
 
+/** @brief 打开适配器时使用的 FDCAN 模式（普通/静默/回环），可由命令修改 */
 uint32_t can_mode = FDCAN_MODE_NORMAL; // normal, silent, loopback modes
 
+/**
+ * @brief 解析并执行一条 SLCAN 命令
+ * @param[in] buf 命令字符串（不含结尾 '\r'）
+ * @param[in] len 命令长度
+ * @return eFeedback 执行结果
+ */
 eFeedback control_parse_str (char buf[], int len);
+
+/**
+ * @brief 解析过滤器设置命令（"F7E0,7FF;..."）
+ * @param[in] buf 命令字符串
+ * @param[in] len 命令长度
+ * @return eFeedback 执行结果
+ */
 eFeedback control_set_filter(char buf[], uint8_t len);
 
 // ==================================================================================================================
 
+/**
+ * @brief 初始化用户标志（Slcan 默认值）
+ */
 void control_init()
 {
     // all the other flags must be enabled by the user
     USER_Flags = USR_SlcanDefault;
 }
 
+/**
+ * @brief 解析并执行一条 SLCAN 命令，按反馈设置回送结果
+ * @param[in] buf 命令字符串
+ * @param[in] len 命令长度
+ * @details 反馈模式（USR_Feedback）开启时：成功回 "#\r"，失败回 "#<错误码>\r"，
+ *          FBK_RetString 表示命令已自行写入响应字符串
+ */
 void control_parse_command(char buf[], int len)
 {
     eFeedback e_Ret = control_parse_str(buf, len);
@@ -50,20 +79,25 @@ void control_parse_command(char buf[], int len)
     }
 }
 
-// Parse an incoming slcan command from the USB CDC port.
-// The termination '\r' has already been removed.
+/**
+ * @brief 解析一条来自 USB CDC 端口的 SLCAN 命令
+ * @param[in] buf 命令字符串（结尾 '\r' 已被移除）
+ * @param[in] len 命令长度
+ * @return eFeedback 执行结果
+ * @details 首字符决定命令类型：A/M/O/C/V/S/Y/s/y/F/f/L/* 为控制命令，
+ *          其余按发送帧命令解析（t/T/r/R/d/D/b/B）
+ */
 eFeedback control_parse_str(char buf[], int len)
 {
-    // Flash the blue LED very shortly if bus is closed
-    // ATTENTION: If the bus is closed the green LED is on, so this is not the same as blue flashing with bus open.
+    // 总线关闭时短闪蓝色 LED，提示设备未在运行
     if (!can_is_opened())
         led_flash_RX(); // flash 15 ms
 
-    // Reply OK to a blank command "\r"
+    // 空命令 "\r" 直接回 OK
     if (len == 0)
         return FBK_Success;
 
-    // IMPORTANT: Terminate the string with zero
+    // 在命令末尾补零，便于字符串操作
     buf[len] = 0;
 
     char tempbuf[200];
@@ -71,7 +105,7 @@ eFeedback control_parse_str(char buf[], int len)
     eFeedback e_Ret = FBK_InvalidParameter;
     switch (buf[0])
     {
-        // Set Auto Retransmit (legacy)
+        // ---------- 设置自动重传（旧版命令） ----------
         case 'A':
             if (len != 2)
                 return FBK_InvalidParameter;
@@ -81,53 +115,53 @@ eFeedback control_parse_str(char buf[], int len)
 
             switch (buf[1])
             {
-                case '0': USER_Flags &= ~USR_Retransmit; break; // "A0" (legacy command) enable one shot mode
-                case '1': USER_Flags |=  USR_Retransmit; break; // "A1" (legacy command) try 128 times to send a packet
+                case '0': USER_Flags &= ~USR_Retransmit; break; // "A0"（旧命令）启用单次发送
+                case '1': USER_Flags |=  USR_Retransmit; break; // "A1"（旧命令）重试 128 次发送
                 default:  return FBK_InvalidParameter;
             }
             return FBK_Success;
 
-        // Set Mode (example: "MEFS\r" --> enable error report, feeback and ESI report)
+        // ---------- 设置模式：例如 "MEFS" 启用错误报告、反馈与 ESI 报告 ----------
         case 'M':
             if (len < 2)
                 return FBK_InvalidParameter;
 
+            // 逐字符解析模式开关
             for (int i=1; i<len; i++)
             {
-                // NOTE:
-                // Transmitting timestamps is not imeplemented for Slcan as one timestamp would require 16 bytes to be transmitted.
-                // Timestamps should be generated in the host application instead of slowing down the USB traffic.
+                // NOTE: Slcan 未实现时间戳传输（一条时间戳需 16 字节，
+                // 应在主机端生成，以免拖慢 USB 流量）
                 switch (buf[i])
                 {
-                    case 'A':                                        // "MA"  Enable Auto re-transmit (same as legacy "A1")
+                    case 'A':                                        // "MA"  启用自动重传（同旧命令 "A1"）
                         if (can_is_opened()) return FBK_AdapterMustBeClosed;
-                        USER_Flags |=  USR_Retransmit; 
+                        USER_Flags |=  USR_Retransmit;
                         break;
-                    case 'a':                                        // "Ma"
+                    case 'a':                                        // "Ma"  禁用自动重传
                         if (can_is_opened()) return FBK_AdapterMustBeClosed;
-                        USER_Flags &= ~USR_Retransmit;  
+                        USER_Flags &= ~USR_Retransmit;
                         break;
-                    case 'D': USER_Flags |=  USR_DebugReport; break; // "MD"  Enable string debug messages
+                    case 'D': USER_Flags |=  USR_DebugReport; break; // "MD"  启用字符串调试消息
                     case 'd': USER_Flags &= ~USR_DebugReport; break; // "Md"
-                    case 'E': USER_Flags |=  USR_ErrorReport; break; // "ME"  Enable CAN bus error reports
+                    case 'E': USER_Flags |=  USR_ErrorReport; break; // "ME"  启用 CAN 总线错误报告
                     case 'e': USER_Flags &= ~USR_ErrorReport; break; // "Me"
-                    case 'F': USER_Flags |=  USR_Feedback;    break; // "MF"  Enable command execution Feedback mode
+                    case 'F': USER_Flags |=  USR_Feedback;    break; // "MF"  启用命令执行反馈模式
                     case 'f': USER_Flags &= ~USR_Feedback;    break; // "Mf"
-                    case 'M': USER_Flags |=  USR_ReportTX;    break; // "MT"  Enable Tx echo report with Marker
+                    case 'M': USER_Flags |=  USR_ReportTX;    break; // "MT"  启用带 Marker 的 Tx 回显报告
                     case 'm': USER_Flags &= ~USR_ReportTX;    break; // "Mt"
-                    case 'S': USER_Flags |=  USR_ReportESI;   break; // "MS"  Enable ESI report
+                    case 'S': USER_Flags |=  USR_ReportESI;   break; // "MS"  启用 ESI 报告
                     case 's': USER_Flags &= ~USR_ReportESI;   break; // "Ms"
                     // -----------------------------------------------------
-                    case 'I': led_blink_identify(true);       break; // "MI"  Identify device by blinking the LEDs
-                    case 'i': led_blink_identify(false);      break; // "Mi"  stop blinking
-                    case '0':                                        // "M0"  Use normal mode for Open (legacy command)
-                    case '1':                                        // "M1"  Use silent (bus monitoring) mode for Open (legacy command)
-                        if (can_is_opened()) 
+                    case 'I': led_blink_identify(true);       break; // "MI"  闪烁 LED 识别设备
+                    case 'i': led_blink_identify(false);      break; // "Mi"  停止闪烁
+                    case '0':                                        // "M0"  普通模式（旧命令）
+                    case '1':                                        // "M1"  静默/总线监控模式（旧命令）
+                        if (can_is_opened())
                             return FBK_AdapterMustBeClosed;
                         can_mode = (buf[i] == '1') ? FDCAN_MODE_BUS_MONITORING : FDCAN_MODE_NORMAL;
                         break;
-                    case 'R':                                        // "MR" (enable  120 Ohm Termination Resistor)
-                    case 'r':                                        // "Mr" (disable 120 Ohm Termination Resistor)
+                    case 'R':                                        // "MR"  启用 120Ω 终端电阻
+                    case 'r':                                        // "Mr"  禁用 120Ω 终端电阻
                         if (!can_set_termination(buf[i] == 'R'))
                             return FBK_UnsupportedFeature;
                         break;
@@ -139,16 +173,15 @@ eFeedback control_parse_str(char buf[], int len)
 
         // ----------------------------
 
-        // Open adapter
+        // ---------- 打开适配器 ----------
         case 'O':
         {
             if (len > 2)
                 return FBK_InvalidParameter;
 
+            // 只有发了 2 个字符才修改 can_mode（避免与 "M" 命令相互干扰）
             if (len == 2)
             {
-                // ATTENTION: can_mode is also set by command "M"
-                // It must be only modified here if 2 characters have been sent!
                 switch (buf[1])
                 {
                     case 'N': can_mode = FDCAN_MODE_NORMAL;            break; // "ON"
@@ -160,37 +193,38 @@ eFeedback control_parse_str(char buf[], int len)
             }
             return can_open(can_mode); // returns error if already open
         }
-        // Close adapter and reset variables (no error if already closed)
-        // ATTENTION: This command does not send feedback although it is enabled!
-        // This is by purpose. The application can execute this before command Open to assure that all variables are reset.
-        // In this state the application does not know if feedbacks are still enabled from the last usage or not.
+
+        // ---------- 关闭适配器并复位变量 ----------
+        // 注意：此命令即使反馈模式开启也不发送反馈，这是故意的——
+        // 应用程序可在 Open 前执行它以确保所有变量已复位，而此时
+        // 应用并不知道上次使用是否还残留反馈设置
         case 'C':
             if (len == 1)
             {
-                can_close(); // no error if already closed
+                can_close(); // 已关闭时无错误
 
-                // reset the variables to their default
+                // 复位变量为默认值
                 can_mode   = FDCAN_MODE_NORMAL;
                 USER_Flags = USR_SlcanDefault;
 
-                // Do not call buf_enqueue_cdc() here --> never send a response. 
-                // This is the only command that behaves the same way as the legacy command.
+                // 不调用 buf_enqueue_cdc() --> 绝不发送响应。
+                // 这是唯一与旧命令行为一致的命令
                 return FBK_RetString;
             }
             return e_Ret;
 
         // ----------------------------
 
-        // Get version number, processor, clock,...
+        // ---------- 获取版本、处理器、时钟等信息 ----------
         case 'V':
             if (len == 1)
             {
-                // The host application needs these limits to calculate the bitrates (commands 's' and 'y')
+                // 主机需要这些限制来计算波特率（命令 's' 和 'y'）
                 bitlimits* lim = utils_get_bit_limits();
 
-                // HAL_GetDEVID() returns a unique identifier (DBG_IDCODE) for each processor family.
-                // The STM32G0xx serie uses 0x460, 0x465, 0x476, 0x477 and STM32G4xx uses 0x468, 0x469, 0x479.
-                // String responses start with '+', all other command responses start with '#'
+                // HAL_GetDEVID() 返回各处理器家族唯一标识（DBG_IDCODE）。
+                // STM32G0xx 用 0x460/0x465/0x476/0x477，STM32G4xx 用 0x468/0x469/0x479。
+                // 字符串响应以 '+' 开头，其余命令响应以 '#' 开头
                 sprintf(tempbuf, "+Board: "      TARGET_BOARD            // MksMakerbase           (from MakeFile)
                                  "\tMCU: %s"                             // STM32G431              (from MakeFile)
                                  "\tDevID: %lu"                          // 0x468                  (from processor)
@@ -212,7 +246,7 @@ eFeedback control_parse_str(char buf[], int len)
 
         // ----------------------------
 
-        // Set baudrate (always samplepoint nominal: 87.5%, data: 75%)
+        // ---------- 按预置表设置波特率（采样点固定：标称 87.5%、数据 75%） ----------
         case 'S':
             if (len == 2) e_Ret = can_set_baudrate((can_nom_bitrate)(buf[1] - '0')); // "S1"
             return e_Ret;
@@ -220,12 +254,13 @@ eFeedback control_parse_str(char buf[], int len)
             if (len == 2) e_Ret = can_set_data_baudrate((can_data_bitrate)(buf[1] - '0')); // "Y2"
             return e_Ret;
 
-        // Set bitrate (any samplepoint is possible)
+        // ---------- 任意采样点设置位时序 ----------
         case 's':
         case 'y':
         {
             int pos = 1;
             uint32_t BRP, Seg1, Seg2, Sjw;
+            // 解析 "BRP,Seg1,Seg2,Sjw" 四个十进制数
             if (!utils_parse_next_decimal(buf, &pos, ',', &BRP)  ||
                 !utils_parse_next_decimal(buf, &pos, ',', &Seg1) ||
                 !utils_parse_next_decimal(buf, &pos, ',', &Seg2) ||
@@ -238,19 +273,19 @@ eFeedback control_parse_str(char buf[], int len)
 
         // ----------------------------
 
-        // Set CAN filter:
+        // ---------- 设置 CAN 过滤器 ----------
         case 'F':
             return control_set_filter(buf, len); // "F7E0,7FF"
-        // Clear all CAN filters:
+        // 清除所有 CAN 过滤器
         case 'f':
             if (len == 1) return can_clear_filters(); // "f"
             return e_Ret;
 
         // ----------------------------
 
-        // Enable bus load report in percent (the precision is approx +/- 10%)
-        // The firmware will send the current bus load in user defined intervals.
-        // Command "L7\r" --> send busload every 700 ms
+        // ---------- 使能总线负载上报（精度约 ±10%） ----------
+        // 固件按用户定义间隔上报当前总线负载。
+        // 命令 "L7\r" --> 每 700 ms 上报一次
         case 'L':
         {
             uint32_t interval;
@@ -263,33 +298,32 @@ eFeedback control_parse_str(char buf[], int len)
 
         // ----------------------------
 
-        // Special ASCII commands.
-        // These commands are by purpose somewhat longer than only 2 characters to avoid that they are executed accidentally.
+        // ---------- 特殊 ASCII 命令 ----------
+        // 这些命令故意超过 2 个字符，避免被误执行
         case '*':
         {
-            // Enable pin BOOT0 and then switch the processor into DFU (Device Firmware Upgrade) mode.
-            // The response will be received by the host because the bootloader is started with a delay of 300 ms.
+            // 使能 BOOT0 引脚后把处理器切到 DFU 模式。
+            // 引导加载程序延迟 300 ms 启动，因此主机仍能收到响应
             if (strcmp(buf, "*DFU") == 0)
                 return dfu_switch_to_bootloader(); // closes adapter
-                
-            // Set register OPTR, bit nSWBOOT0 = 0 --> Disable processor pin BOOT0 --> always boot into main flash memory 
-            // Read https://netcult.ch/elmue/CANable Firmware Update
-            // Enabling the pin needs not to be implemented here.
-            // The pin is automatically enabled when entering DFU mode in dfu_switch_to_bootloader()           
-            if (strcmp(buf, "*Boot0:Off") == 0) 
+
+            // 设置寄存器 OPTR，位 nSWBOOT0 = 0 --> 禁用 BOOT0 引脚 --> 总是从主 flash 启动
+            // 参考 https://netcult.ch/elmue/CANable Firmware Update
+            // "使能"无需在此实现：进入 DFU 时 dfu_switch_to_bootloader() 会自动使能
+            if (strcmp(buf, "*Boot0:Off") == 0)
                 return system_set_option_bytes(OPT_BOOT0_Disable);
 
-            // return if the pin BOOT0 is enabled or disabled
-            if (strcmp(buf, "*Boot0:?") == 0) 
+            // 查询 BOOT0 引脚当前是否使能
+            if (strcmp(buf, "*Boot0:?") == 0)
             {
-                // String responses start with '+', all other command responses start with '#'
+                // 字符串响应以 '+' 开头，其余命令响应以 '#' 开头
                 char* resp = system_is_option_enabled(OPT_BOOT0_Enable) ? "+1\r" : "+0\r";
                 buf_enqueue_cdc(resp, 3);
                 return FBK_RetString;
             }
             return FBK_InvalidParameter;
         }
-        // Debug command
+        // 调试命令
         case '?':
         {
             return FBK_InvalidCommand;
@@ -337,10 +371,10 @@ eFeedback control_parse_str(char buf[], int len)
         }
     }
 
-    // ================ Transmit Packet =================
+    // ================ 发送帧命令 =================
     // "t600801020304050607083A\r"
 
-    // Set default header. All values overridden below as needed.
+    // 预置默认帧头，下面按命令逐项覆盖
     FDCAN_TxHeaderTypeDef* tx_header = buf_get_can_dest_header();
     uint8_t*               tx_data   = buf_get_can_dest_data();
 
@@ -356,7 +390,7 @@ eFeedback control_parse_str(char buf[], int len)
 
     switch (buf[0])
     {
-        // Transmit remote frame command
+        // 发送远程帧
         case 'r':
             tx_header->TxFrameType   = FDCAN_REMOTE_FRAME;
             break;
@@ -365,14 +399,14 @@ eFeedback control_parse_str(char buf[], int len)
             tx_header->TxFrameType   = FDCAN_REMOTE_FRAME;
             break;
 
-        // Transmit data frame command
+        // 发送数据帧（经典 CAN）
         case 'T':
             tx_header->IdType        = FDCAN_EXTENDED_ID;
             break;
         case 't':
             break;
 
-        // CANFD transmit - no BRS
+        // CAN FD 发送 - 无 BRS
         case 'd':
             tx_header->FDFormat      = FDCAN_FD_CAN;
             break;
@@ -381,7 +415,7 @@ eFeedback control_parse_str(char buf[], int len)
             tx_header->IdType        = FDCAN_EXTENDED_ID;
             break;
 
-        // CANFD transmit - with BRS
+        // CAN FD 发送 - 带 BRS
         case 'b':
             tx_header->FDFormat      = FDCAN_FD_CAN;
             tx_header->BitRateSwitch = FDCAN_BRS_ON;
@@ -392,53 +426,51 @@ eFeedback control_parse_str(char buf[], int len)
             tx_header->IdType        = FDCAN_EXTENDED_ID;
             break;
 
-        // Invalid command
+        // 非法命令
         default:
             return FBK_InvalidCommand;
     }
-    
-    // Sending a message with FDF flag requires a data baudrate to be set.
-    // It is allowed that the data baudrate is the same as the nominal baudrate to send messages up to 64 bytes without BRS.
+
+    // 发送 FD 帧要求已设置数据波特率；数据波特率可与标称相同，
+    // 以无 BRS 方式发送最多 64 字节
     if (tx_header->FDFormat == FDCAN_FD_CAN && !can_using_FD())
         return FBK_BaudrateNotSet;
 
-    // Start parsing at second byte (skip command byte)
+    // 从第 2 字节开始解析（跳过命令字节）
     int parse_loc = 1;
 
-    // standard ID / extended ID
+    // 标准 3 位 / 扩展 8 位 ID
     uint8_t id_len = (tx_header->IdType == FDCAN_EXTENDED_ID) ? 8 : 3;
 
-    // parse CAN ID
+    // 解析 CAN ID
     if (!utils_parse_hex_value(buf, &parse_loc, id_len, &tx_header->Identifier))
         return FBK_InvalidParameter;
 
-    // check CAN ID
+    // 校验 CAN ID 范围
     if (tx_header->IdType == FDCAN_STANDARD_ID && tx_header->Identifier > 0x7FF)
         return FBK_InvalidParameter;
 
     if (tx_header->IdType == FDCAN_EXTENDED_ID && tx_header->Identifier > 0x1FFFFFFF)
         return FBK_InvalidParameter;
 
-    // parse DLC
+    // 解析 DLC
     uint32_t dlc_code;
     if (!utils_parse_hex_value(buf, &parse_loc, 1, &dlc_code))
         return FBK_InvalidParameter;
 
-    // classic frames allow a DLC of 0...8
+    // 经典帧 DLC 允许 0...8
     if (tx_header->FDFormat == FDCAN_CLASSIC_CAN && dlc_code > 8)
         return FBK_InvalidParameter;
-    
-    // remote frames have no data bytes
+
+    // 远程帧不含数据字节
     if (tx_header->TxFrameType == FDCAN_REMOTE_FRAME && dlc_code > 0)
         return FBK_InvalidParameter;
 
-    // Shift bits up for direct storage in FIFO register
-    // It is stupid that ST Microelectronics did not define a processor independent macro for this shift operation.
-    // Will other processors also need this to be shifted 16 bits up ??
+    // 左移 16 位以直接存入 FIFO 寄存器（ST 未提供处理器无关的移位宏）
     tx_header->DataLength = dlc_code << 16;
 
     int8_t byte_count = utils_dlc_to_byte_count(dlc_code);
-    // Parse data bytes
+    // 解析数据字节
     for (uint8_t i = 0; i < byte_count && parse_loc < len; i++)
     {
         uint32_t byte_val;
@@ -448,23 +480,30 @@ eFeedback control_parse_str(char buf[], int len)
         tx_data[i] = byte_val;
     }
 
-    // The host must generate a unique one-byte marker for each sent packet using a counter that increments with each Tx message.
-    // The Tx FIFO can store 3 packets and the buffer can store 64 waiting messages.
-    // So 3 + 64 different values are sufficient that each message that is waiting for an ACK has it's own unique marker.
+    // 主机须为每个发送报文生成唯一的一字节 marker（可用递增计数器）。
+    // Tx FIFO 存 3 个、缓冲队列存 64 个，3 + 64 种取值足以让每个等待
+    // ACK 的报文拥有唯一 marker
     if (USER_Flags & USR_ReportTX)
     {
         if (!utils_parse_hex_value(buf, &parse_loc, 2, &tx_header->MessageMarker))
             return FBK_InvalidParameter;
     }
 
-    // Store the message in the buffer
+    // 把报文写入发送队列
     return buf_comit_can_dest();
 }
 
 // ================================================================================================================
 
-// Command: "F7E0,7FF;1F005000,1FFFFFFF\r" --> set 11 bit filter: 0x7E0, mask: 0x7FF and 29 bit filter 0x1F005000.
-// see comment for can_set_filter()
+/**
+ * @brief 解析过滤器设置命令
+ * @param[in] buf 命令字符串
+ * @param[in] len 命令长度
+ * @return eFeedback 执行结果
+ * @details 格式：例如 "F7E0,7FF;1F005000,1FFFFFFF" -->
+ *          11 位过滤器 0x7E0/掩码 0x7FF 与 29 位过滤器 0x1F005000。
+ *          位数（3 或 8）决定是标准还是扩展过滤器，多组以 ';' 分隔
+ */
 eFeedback control_set_filter(char buf[], uint8_t len)
 {
     int  pos = 1;
@@ -485,6 +524,7 @@ eFeedback control_set_filter(char buf[], uint8_t len)
             else return FBK_InvalidParameter; // invalid character
         }
 
+        // 过滤器与掩码位数必须一致
         if (digitsF != digitsM)
             return FBK_InvalidParameter;
 
@@ -500,18 +540,21 @@ eFeedback control_set_filter(char buf[], uint8_t len)
     return FBK_Success;
 }
 
-// This function is called approx 100 times in one millisecond from the main loop
-// if the error state has changed, report it every 100 ms
-// if the error state did not change, report the same state only every 3000 ms.
+/**
+ * @brief 周期上报总线错误（主循环周期调用，约每毫秒 100 次）
+ * @param[in] tick_now 当前 1 µs 时基
+ * @details 错误状态变化时每 100 ms 上报一次；不变时每 3000 ms 报一次。
+ *          上报格式 "E%02X%02X%02X%02X\r"：总线状态+协议错误、应用标志、Tx/Rx 错误计数
+ */
 void control_process(uint32_t tick_now)
 {
     if (!error_is_report_due(tick_now))
         return;
 
-    // get errors that are still present after the last error_clear()
+    // 取自上次 error_clear() 后仍存在的错误
     kCanErrorState* state = error_get_state();
 
-    // Bus status and last protocol error (FDCAN_PROTOCOL_ERROR_ACK) have few values --> pack both into one byte
+    // 总线状态与最近协议错误（FDCAN_PROTOCOL_ERROR_ACK）取值少，合并进一个字节
     char tempbuf[20];
     sprintf(tempbuf, "E%02X%02X%02X%02X\r", (uint8_t)(state->bus_status | state->last_proto_err),
                                             (uint8_t)state->app_flags,
@@ -521,7 +564,10 @@ void control_process(uint32_t tick_now)
     error_clear();
 }
 
-// send the busload in percet to the host in the user defined interval
+/**
+ * @brief 按用户定义间隔把总线负载百分比发给主机
+ * @param[in] busload_percent 总线负载百分比
+ */
 void control_report_busload(uint8_t busload_percent)
 {
     char buf[10];
@@ -529,9 +575,12 @@ void control_report_busload(uint8_t busload_percent)
     buf_enqueue_cdc(buf, strlen(buf));
 }
 
-// Send a debug message. Maximum length is 80 characters.
-// The message may contain "\n" for multi-line output
-// You will see this message in the Trace pane of HUD ECU Hacker if USR_DebugReport is enabled.
+/**
+ * @brief 发送调试消息
+ * @param[in] message 调试消息，最多 80 字符，可含 '\n' 换行
+ * @return true 已发送；false 调试上报未启用
+ * @note 启用 USR_DebugReport 后，该消息会显示在 HUD ECU Hacker 的 Trace 窗格
+ */
 bool control_send_debug_mesg(const char* message)
 {
     if ((USER_Flags & USR_DebugReport) == 0)

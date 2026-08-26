@@ -3,3 +3,8 @@ name,can_id,extended,rtr,fd,brs,dlc,data,period_ms,enabled
 允许充电,0x2,False,False,False,False,8,EA D1 01 04 FF 1B E0 F5,100.0,False
 结束,0x3,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
 电压请求,0x2,False,False,False,False,8,EA D1 01 04 FF 02 F9 F5,100.0,False
+zero,0x601,False,False,True,True,8,23 31 25 00 01 00 00 00,100.0,False
+bound,0x601,False,False,True,True,8,23 40 25 00 03 00 00 00,100.0,False
+cx,0x80,False,False,True,True,8,00 00 00 00 00 00 00 00,100.0,False
+save,0x601,False,False,True,True,8,23 39 25 00 01 00 00 00,100.0,False
+rb,0x601,False,False,True,True,8,40 40 25 00 00 00 00 00,100.0,False
