@@ -40,6 +40,12 @@ a = Analysis(
         'plugins.juxie_motor.plugin',
         'plugins.juxie_motor.protocol',
         'plugins.juxie_motor.widget',
+        # torque_sensor 插件
+        'plugins.torque_sensor',
+        'plugins.torque_sensor.plugin',
+        'plugins.torque_sensor.protocol',
+        'plugins.torque_sensor.setid',
+        'plugins.torque_sensor.widget',
     ],
     hookspath=[],
     hooksconfig={},
