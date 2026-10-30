@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from itertools import islice
 from typing import List, Optional
 
 import usb.core
@@ -70,6 +71,7 @@ class CANWorker(QObject):
         self._last_error_time = 0.0      # 上次错误帧时间
         self._frame_buffer = deque(maxlen=10000)
         self._buffer_mutex = QMutex()
+        self._last_dropped = 0      # 上次 take_batch 因上限丢弃的帧数
         # 发送队列：主线程放入，子线程在 run() 中取出执行
         self._send_queue: deque = deque()
         self._send_mutex = QMutex()
@@ -83,11 +85,14 @@ class CANWorker(QObject):
             self._filters = list(filters)
 
     def _pass(self, frame: CANFrame) -> bool:
-        """返回 True 表示接收。错误帧始终放行。"""
+        """返回 True 表示接收。错误帧始终放行。
+
+        读取 _filters 引用不加锁：set_filters() 是整体替换列表，引用读取在
+        GIL 下原子，省掉每帧一次的互斥锁。
+        """
         if frame.is_error:
             return True
-        with QMutexLocker(self._mutex):
-            filters = self._filters
+        filters = self._filters
         if not filters:
             return True
         for f in filters:
@@ -154,10 +159,22 @@ class CANWorker(QObject):
             self.error.emit(f"{_('Error.ConnectFailed')}: {e}")
             self.state_changed.emit(False, _("Status.Disconnected"))
 
-    def take_batch(self):
+    def take_batch(self, max_frames: Optional[int] = None):
+        """取出并清空接收缓冲。
+
+        max_frames 非空时只保留**最后** max_frames 帧：与调用方拿全量后再截断
+        的可见结果完全一致，但避免构造超大列表（islice 只物化尾部）。
+        """
+        dropped = 0
         with QMutexLocker(self._buffer_mutex):
-            batch = list(self._frame_buffer)
+            n = len(self._frame_buffer)
+            if max_frames is not None and n > max_frames:
+                dropped = n - max_frames
+                batch = list(islice(self._frame_buffer, dropped, None))
+            else:
+                batch = list(self._frame_buffer)
             self._frame_buffer.clear()
+        self._last_dropped = dropped
         return batch
 
     @Slot(int)

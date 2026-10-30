@@ -5,6 +5,7 @@ import os
 import csv
 import json
 import logging
+import time
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QThread, Slot, QMutexLocker
@@ -56,6 +57,7 @@ class MainWindow(QMainWindow):
         self._worker: Optional[CANWorker] = None
         self._worker_thread: Optional[QThread] = None
         self._frame_count = 0
+        self._drop_log_ts = 0.0      # 批量截断日志节流
         self._last_load = 0.0
         self._last_fps = 0
         self._noack_warning = False
@@ -119,6 +121,9 @@ class MainWindow(QMainWindow):
         # 中心：Tab
         self.trace_panel  = TracePanel(self)
         self.trace_panel.view.setAlternatingRowColors(False)
+        # 暂停/继续状态即时持久化（2s 防抖），并在关闭时一并写入
+        self.trace_panel.pause_btn.toggled.connect(
+            lambda checked: self._set("paused", checked))
         center_tabs = QTabWidget()
         center_tabs.setTabsClosable(True)
         center_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
@@ -624,17 +629,24 @@ class MainWindow(QMainWindow):
     def _on_batch_frames(self):
         if self._worker is None:
             return
-        batch = self._worker.take_batch()
-        # throttle: limit frames per batch to prevent UI freeze
+        # throttle: 每批最多取 1000 帧（worker 内部只物化尾部，避免构造大列表）
         MAX_BATCH = 1000
-        if len(batch) > MAX_BATCH:
-            logger.warning("批量帧超限截断: %d -> %d", len(batch), MAX_BATCH)
-            batch = batch[-MAX_BATCH:]
-        for frame in batch:
-            self._frame_count += 1
-            self.trace_panel.append_frame(frame)
+        batch = self._worker.take_batch(MAX_BATCH)
+        if not batch:
+            return
+        dropped = getattr(self._worker, "_last_dropped", 0)
+        if dropped:
+            # 每秒最多提示一次，避免日志刷屏
+            now = time.monotonic()
+            if now - self._drop_log_ts >= 1.0:
+                logger.warning("批量帧超限截断: 丢弃 %d 帧（保留最后 %d）",
+                               dropped, len(batch))
+                self._drop_log_ts = now
+        self._frame_count += len(batch)
+        # 整批一次性写入模型（批量 begin/endInsertRows）
+        self.trace_panel.append_frames(batch)
         # 派发给所有 active 插件（回调式订阅）
-        if batch and hasattr(self, "plugins"):
+        if hasattr(self, "plugins"):
             self.plugins.dispatch_frames(batch)
 
     @Slot(float, int)
@@ -793,6 +805,8 @@ class MainWindow(QMainWindow):
         self.trace_panel.autoscroll_chk.setChecked(s.get("autoscroll", True))
         if s.get("collapse", False):
             self.trace_panel.collapse_chk.setChecked(True)
+        if s.get("paused", False):
+            self.trace_panel.pause_btn.setChecked(True)
         lang = s.get("language", "zh")
         QApplication.instance().setStyleSheet(get_qss())
         set_language(lang)
@@ -959,6 +973,7 @@ class MainWindow(QMainWindow):
         self._set("data_sample_point", self.data_sample_combo.currentIndex())
         self._set("autoscroll", self.trace_panel.autoscroll_chk.isChecked())
         self._set("collapse", self.trace_panel.collapse_chk.isChecked())
+        self._set("paused", self.trace_panel.pause_btn.isChecked())
         self._set("language", get_language())
         self._set("filters", self.filter_panel.to_dict_list())
         self._set("splitter", bytes(self.splitter.saveState().toHex()).decode())

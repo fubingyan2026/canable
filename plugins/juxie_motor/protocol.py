@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 SYNC_ID = 0x80
 MIT_SINGLE_BASE = 0x110
 FEEDBACK_ID_BASE = 0x300
+ZERO_ID_BASE = 0x600      # 标零：CANopen SDO 写请求
 
 # ── 控制字节位掩码 ──
 BIT_ENABLE = 0x80
@@ -21,8 +23,9 @@ MODE_MASK = 0x1E
 MODE_MIT = 0x06
 
 # ── MIT 参数固定量程 ──
-KP_MAX = 500.0
-KD_MAX = 5.0
+# 文档 docs/juxie_canfd_cmd.md §4.1（9 字节帧）的增益满量程
+KP_MAX = 500.0       # 12bit 无符号 ↔ 0..500
+KD_MAX = 5.0         # 12bit 无符号 ↔ 0..5
 
 
 def _clamp_int16(v: int) -> int:
@@ -57,19 +60,49 @@ def build_control_byte(enable: bool, brake: bool, clear_err: bool, mode: int) ->
 
 # ── 单位换算（标准单位 → 协议原始值）──
 
+def _lround(value: float) -> int:
+    """C 的 lroundf 语义：四舍五入，.5 远离 0（与固件 float_to_uint 一致）。"""
+    if value >= 0.0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
 def unit_to_u16(value: float, scale_max: float) -> int:
     """双极性量程 [-scale_max, +scale_max] → uint16 [0, 65535]。"""
-    return _clamp_uint16(int(round((value + scale_max) / (2.0 * scale_max) * 65535.0)))
+    return _clamp_uint16(_lround((value + scale_max) / (2.0 * scale_max) * 65535.0))
 
 
 def unit_to_12bit(value: float, scale_max: float) -> int:
     """双极性量程 [-scale_max, +scale_max] → 12bit [0, 4095]。"""
-    return _clamp_12bit(int(round((value + scale_max) / (2.0 * scale_max) * 4095.0)))
+    return _clamp_12bit(_lround((value + scale_max) / (2.0 * scale_max) * 4095.0))
 
 
 def unit_to_12bit_unipolar(value: float, scale_max: float) -> int:
     """单极性量程 [0, +scale_max] → 12bit [0, 4095]。"""
-    return _clamp_12bit(int(round(value / scale_max * 4095.0)))
+    return _clamp_12bit(_lround(value / scale_max * 4095.0))
+
+
+def torque_to_raw(torque_nm: float, torque_max: float,
+                  signed: bool = False) -> int:
+    """力矩 → 12bit。
+
+    默认「居中」映射：raw [0..4095] ↔ (-T_MAX..+T_MAX)，2048 为零点。
+    signed=True 为「有符号」映射：raw 按 12bit 二的补码解释，0 才是零力矩。
+    """
+    tmax = max(1e-9, float(torque_max))
+    if signed:
+        v = _lround(torque_nm / tmax * 2047.0)
+        return max(-2048, min(2047, v)) & 0x0FFF
+    return unit_to_12bit(torque_nm, tmax)
+
+
+def raw_to_torque(raw: int, torque_max: float, signed: bool = False) -> float:
+    """12bit → 力矩（Nm），与 torque_to_raw 互逆。"""
+    tmax = float(torque_max)
+    if signed:
+        v = raw - 4096 if raw >= 2048 else raw
+        return v / 2047.0 * tmax
+    return (raw / 4095.0 * 2.0 - 1.0) * tmax
 
 
 # ── MIT 单轴控制帧构造 ──
@@ -109,27 +142,44 @@ def build_mit_single_control(dev_id: int, enable: bool, brake: bool,
 def build_mit_control(dev_id: int, enable: bool, brake: bool,
                       clear_err: bool, pos_deg: float, vel_rpm: float,
                       kp: float, kd: float, torque_nm: float,
-                      pos_max: float, vel_max: float, torque_max: float) -> bytes:
-    """高层：标准单位 → 原始值 → 打包 MIT 单轴控制帧。
+                      pos_max: float, vel_max: float, torque_max: float,
+                      torque_raw: int | None = None,
+                      torque_signed: bool = False) -> bytes:
+    """高层：标准单位 → 原始值 → 打包 MIT 单轴控制帧（文档 §4.1，9 字节）。
 
     位置：°（±pos_max）→ uint16
     速度：RPM（±vel_max）→ 12bit
-    Kp：无单位 [0, 500] → 12bit
-    Kd：无单位 [0, 5]   → 12bit
-    力矩：Nm（±torque_max）→ 12bit
+    Kp：0..500 → 12bit
+    Kd：0..5 → 12bit
+    力矩：Nm（±torque_max）→ 12bit；torque_raw 非空时直接使用该 12bit 原始值；
+          torque_signed=True 时按有符号（0 为零点）映射
     """
+    tq_raw = (_clamp_12bit(torque_raw) if torque_raw is not None
+              else torque_to_raw(torque_nm, torque_max, torque_signed))
     return build_mit_single_control(
         dev_id, enable, brake, clear_err,
         unit_to_u16(pos_deg, pos_max),
         unit_to_12bit(vel_rpm, vel_max),
         unit_to_12bit_unipolar(kp, KP_MAX),
         unit_to_12bit_unipolar(kd, KD_MAX),
-        unit_to_12bit(torque_nm, torque_max),
+        tq_raw,
     )
 
 
 def build_mit_single_canid(dev_id: int) -> int:
     return MIT_SINGLE_BASE | _clamp_uint8(dev_id)
+
+
+# ── 电机标零（CANopen SDO 写 Index 0x2531 Sub0 = 1，当前角度置零）──
+# 依据 E1_Hand_G474 service/srv_juxie_motor.c: srv_juxie_motor_zero()
+#   CAN 0x600|Dev_ID，标准帧，FD+BRS，DLC 8
+#   数据 23 31 25 00 01 00 00 00 = SDO 下行(4B) 写 0x2531:00 = 0x00000001
+SDO_ZERO_DATA = bytes([0x23, 0x31, 0x25, 0x00, 0x01, 0x00, 0x00, 0x00])
+
+
+def build_zero_canid(dev_id: int) -> int:
+    """标零帧 CAN ID：0x600 | Dev_ID。"""
+    return ZERO_ID_BASE | _clamp_uint8(dev_id)
 
 
 # ── 反馈解析 ──

@@ -23,14 +23,16 @@ from datetime import datetime
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QCheckBox, QGridLayout, QGroupBox, QHBoxLayout,
-                                QLabel, QMessageBox, QPlainTextEdit, QPushButton,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QGridLayout,
+                                QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+                                QPlainTextEdit, QPushButton, QScrollArea,
                                 QSpinBox, QVBoxLayout, QWidget)
 
 from cangui.i18n import _
 from cangui import style
 
 from . import protocol as P
+from .scope import DEFAULT_WINDOW_S, WINDOW_CHOICES, TorqueScope
 from .setid import SetIdSignals, SetIdTask
 
 logger = logging.getLogger("plugin.torque_sensor")
@@ -111,6 +113,14 @@ _I18N_KEYS = {
     "Torque.Hint.Fd":           ("提示：该扭矩传感器为 Classic CAN，请关闭 CAN FD",
                                  "Hint: sensor is Classic CAN; disable CAN FD"),
 
+    # ── 扭矩波形 ──
+    "Torque.Scope.Title":       ("扭矩波形",                "Torque Waveform"),
+    "Torque.Scope.Window":      ("时间窗",                  "Time Window"),
+    "Torque.Scope.Pause":       ("暂停",                    "Pause"),
+    "Torque.Scope.Resume":      ("继续",                    "Resume"),
+    "Torque.Scope.Clear":       ("清除波形",                "Clear"),
+    "Torque.Scope.NoData":      ("无数据",                  "No data"),
+
     # ── 站号扫描 / 设置 ID ──
     "Torque.SetId.Title":       ("传感器 ID 设置",          "Sensor ID Settings"),
     "Torque.SetId.Warn":        ("仅连接一只传感器并先停止主动上报。请求 = 0x500 + ID×0x10，"
@@ -175,6 +185,7 @@ class _ConfigStore:
         "offset0": 0.0,
         "offset1": 0.0,
         "setid_target": 1,
+        "scope_window": float(DEFAULT_WINDOW_S),
     }
 
     def __init__(self, ctx):
@@ -262,9 +273,17 @@ class TorqueSensorPanel(QWidget):
         return box
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        # 内容可滚动：波形 + 通道 + 设置ID 在小窗口下不至于被裁剪
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        root = QVBoxLayout(inner)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
+
         root.addWidget(self._build_config_box())
 
         chan_row = QHBoxLayout()
@@ -272,8 +291,12 @@ class TorqueSensorPanel(QWidget):
         for i in range(P.NUM_CHANNELS):
             chan_row.addWidget(self._build_channel_box(i), 1)
         root.addLayout(chan_row)
+
+        root.addWidget(self._build_scope_box(), 1)
         root.addWidget(self._build_setid_box())
-        root.addStretch(1)
+
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
 
     def _build_config_box(self) -> QGroupBox:
         box = self._group("Torque.Config")
@@ -371,6 +394,66 @@ class TorqueSensorPanel(QWidget):
         self._auto_init_chk.blockSignals(True)
         self._auto_init_chk.setChecked(bool(self._cfg.get("auto_init")))
         self._auto_init_chk.blockSignals(False)
+
+    # ── 扭矩波形 ──
+    def _build_scope_box(self) -> QGroupBox:
+        box = self._group("Torque.Scope.Title")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.addWidget(self._label("Torque.Scope.Window"))
+        self._scope_window_combo = QComboBox()
+        for seconds in WINDOW_CHOICES:
+            self._scope_window_combo.addItem(f"{int(seconds)} s", float(seconds))
+        self._scope_window_combo.currentIndexChanged.connect(
+            self._on_scope_window_changed)
+        row.addWidget(self._scope_window_combo)
+        row.addSpacing(12)
+
+        self._scope_pause_btn = QPushButton(_("Torque.Scope.Pause"))
+        self._scope_pause_btn.setCheckable(True)
+        self._scope_pause_btn.toggled.connect(self._on_scope_pause_toggled)
+        row.addWidget(self._scope_pause_btn)
+        row.addWidget(self._btn("Torque.Scope.Clear", self._on_scope_clear))
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self._scope = TorqueScope(
+            names=[ch["name"] for ch in P.CHANNELS],
+            colors=[style.FG_ACCENT, style.LOAD_MID])
+        self._scope.set_no_data_text(_("Torque.Scope.NoData"))
+        for i, st in enumerate(self._st):
+            self._scope.set_offset(i, st.offset)
+
+        win = float(self._cfg.get("scope_window"))
+        idx = self._scope_window_combo.findData(win)
+        if idx < 0:
+            idx = self._scope_window_combo.findData(DEFAULT_WINDOW_S)
+        self._scope_window_combo.blockSignals(True)
+        self._scope_window_combo.setCurrentIndex(max(0, idx))
+        self._scope_window_combo.blockSignals(False)
+        self._scope.set_window(float(self._scope_window_combo.currentData()))
+
+        lay.addWidget(self._scope, 1)
+        return box
+
+    def _on_scope_window_changed(self, _index: int):
+        win = float(self._scope_window_combo.currentData())
+        self._cfg.set("scope_window", win)
+        self._scope.set_window(win)
+
+    def _on_scope_pause_toggled(self, checked: bool):
+        self._scope.set_paused(bool(checked))
+        self._update_scope_pause_text()
+
+    def _update_scope_pause_text(self):
+        self._scope_pause_btn.setText(
+            _("Torque.Scope.Resume") if self._scope.is_paused()
+            else _("Torque.Scope.Pause"))
+
+    def _on_scope_clear(self):
+        self._scope.clear()
 
     # ── 站号扫描 / 设置 ID ──
     def _build_setid_box(self) -> QGroupBox:
@@ -691,6 +774,7 @@ class TorqueSensorPanel(QWidget):
     def _set_offset(self, i: int, value: float):
         self._st[i].offset = float(value)
         self._cfg.set(f"offset{i}", float(value))
+        self._scope.set_offset(i, float(value))
         self._update_channel(i)
 
     def _on_hw_zero(self, i: int):
@@ -767,6 +851,8 @@ class TorqueSensorPanel(QWidget):
                 st.reporting = "on"
                 if st.pending_cmd == "start":
                     st.pending_cmd = None
+                self._scope.add_sample(res.channel,
+                                       getattr(f, "timestamp", 0.0), res.value)
             elif res.kind == "ack":
                 self._handle_ack(res.channel, res.ack)
             else:
@@ -865,9 +951,11 @@ class TorqueSensorPanel(QWidget):
     # ── 生命周期 ──
     def on_activated(self):
         self._stale_timer.start()
+        self._scope.start()
 
     def on_deactivating(self):
         self._stale_timer.stop()
+        self._scope.stop()
         self._init_timer.stop()
         self._hz_timer.stop()
         self._init_stage = None
@@ -883,6 +971,7 @@ class TorqueSensorPanel(QWidget):
     def on_connect(self):
         for st in self._st:
             st.reset()
+        self._scope.clear()
         self._init_stage = None
         self._hz_stage = None
         self._hz_target = None
@@ -915,6 +1004,7 @@ class TorqueSensorPanel(QWidget):
         self._setid_busy = False
         self._setid_buttons_enabled(True)
         self._set_setid_status("Torque.Status.Disconnected", _DIM)
+        self._scope.clear()
         for st in self._st:
             st.reset()
         self._update_status()
@@ -930,6 +1020,8 @@ class TorqueSensorPanel(QWidget):
             elif isinstance(widget, QLabel):
                 widget.setText(_(key))
         self._rate_spin.setSuffix(" " + _("Torque.Unit.Hz"))
+        self._scope.set_no_data_text(_("Torque.Scope.NoData"))
+        self._update_scope_pause_text()
         self._render_setid_status()
         self._render_setid_current()
         self._update_status()

@@ -1,19 +1,52 @@
 """捷电机 MIT 控制 UI 面板。"""
 from __future__ import annotations
 
+import csv
 import logging
+import math
+import os
+import random
+import sys
 import time
+from datetime import datetime
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QGridLayout,
-                                QGroupBox, QHBoxLayout, QLabel, QPushButton,
-                                QSlider, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
+                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                                QMessageBox, QPushButton, QScrollArea, QSlider,
+                                QSpinBox, QVBoxLayout, QWidget)
 
 from cangui.i18n import _
 from cangui import style
 from canable_sdk.frame import CANFrame
 
 from . import protocol as P
+
+class _WheelSpin:
+    """Mixin: mouse wheel always adjusts the value by singleStep.
+
+    Inside a scroll area an unfocused spin box would otherwise let the wheel
+    scroll the panel instead of editing the field.
+    """
+
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        if dy:
+            notches = int(dy / 120.0)
+            if notches == 0:
+                notches = 1 if dy > 0 else -1
+            self.stepBy(notches)
+        ev.accept()
+
+
+class _IntSpin(_WheelSpin, QSpinBox):
+    pass
+
+
+class _FloatSpin(_WheelSpin, QDoubleSpinBox):
+    pass
+
 
 logger = logging.getLogger("plugin.juxie_motor")
 
@@ -23,18 +56,66 @@ _ERR = style.LOAD_HIGH
 _DIM = style.FG_DIM
 _TEXT = style.FG_TEXT
 
+# 清除故障：以短促脉冲形式重复若干帧，确保控制器看到 0→1 跳变
+CLEAR_BURST_FRAMES = 5
+CLEAR_BURST_MS = 15
+CLEAR_WATCH_MS = 1500
+
+# 往复记录 CSV 表头（每个上限保持中点记录一行）
+WAVE_LOG_HEADER = ["cycle", "elapsed_s", "cmd_max_deg", "kp", "kd",
+                   "primary_fb_deg", "mirror_fb_deg",
+                   "primary_err_deg", "mirror_err_deg"]
+
+# 随机往复：每周期在上限角内随机取幅值，下限为上限的该比例（避免幅度过小看不出运动）
+WAVE_RAND_MIN_FRAC = 0.2
+
+# 力矩满量程默认值（±30 Nm ↔ raw 0..4095）与合法下限
+DEFAULT_TORQUE_MAX = 300.0
+MIN_TORQUE_MAX = 1.0
+
+
+def _base_dir() -> str:
+    """可执行文件所在目录（打包后）或工程根目录（源码运行）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+
 
 class _ConfigStore:
     PLUGIN_NAME = "juxie_motor"
     DEFAULTS = {
-        "dev_id": 0,
+        "dev_id": 1,
+        "mirror": True,
+        "mirror_id": 2,
+        "target_max": 35.0,
         "enable": True,
         "brake": True,
-        "clear_err": False,
         "auto_send": True,
+        "auto_request": True,
+        "req_interval": 100,
         "pos_max": 180.0,
-        "vel_max": 500.0,
-        "torque_max": 20.0,
+        "vel_max": 3000.0,
+        "torque_max": DEFAULT_TORQUE_MAX,
+        "kp": 6.0,
+        "kd": 0.1,
+        "target_pos": 0,
+        "target_vel": 0.0,
+        "target_torque": 0.0,
+        "tq_raw_enable": False,
+        "tq_raw": 2048,
+        "tq_zero_mode": "offset",
+        "mit_continuous": False,
+        "mit_interval": 20,
+        "slew_dps": 60.0,
+        "auto_clear": False,
+        "clear_interval": 10,
+        "wave_amp": 30.0,
+        "wave_period": 3.0,
+        "wave_hold_hi": 5.0,
+        "wave_hold_lo": 5.0,
+        "wave_interval": 10,
+        "wave_log": True,
     }
 
     def __init__(self, ctx):
@@ -58,48 +139,275 @@ class JuxieMotorPanel(QWidget):
         super().__init__(parent)
         self._ctx = ctx
         self._cfg = _ConfigStore(ctx)
-        self._feedback = None
-        self._last_rx = 0.0
+        # 两台电机反馈：[0]=主电机, [1]=镜像电机
+        self._fb: list = [None, None]
+        self._last_rx: list = [0.0, 0.0]
+
+        # 周期往复状态需在 _load_config() 之前就绪（_update_wave_info 会读取）
+        self._wave_on = False
+        self._wave_t0 = 0.0
+        self._wave_rand = False          # 随机幅值模式
+        self._wave_amp_cur = 0.0         # 本周期的实际幅值（随机模式下每周期重取）
+        self._wave_cur_idx = -1
+        self._wave_log_file = None
+        self._wave_log_rows = 0
+        self._wave_last_cycle = -1
+
+        # 清除故障脉冲
+        self._clear_burst_left = 0
+        self._clear_pending = False
 
         self._build_ui()
         self._load_config()
 
+        self._clear_burst_timer = QTimer(self)
+        self._clear_burst_timer.setInterval(CLEAR_BURST_MS)
+        self._clear_burst_timer.timeout.connect(self._send_clear_tick)
+        self._clear_watch_timer = QTimer(self)
+        self._clear_watch_timer.setSingleShot(True)
+        self._clear_watch_timer.timeout.connect(self._on_clear_watch_timeout)
+
+        # 定时请求反馈
+        self._req_timer = QTimer(self)
+        self._req_timer.setInterval(int(self._cfg.get("req_interval")))
+        self._req_timer.timeout.connect(self._on_req_tick)
+
+        # 连续 MIT 控制（位置斜坡限速，避免目标阶跃触发过载保护）
+        self._slew_pos: float | None = None
+        self._mit_timer = QTimer(self)
+        self._mit_timer.setInterval(int(self._cfg.get("mit_interval")))
+        self._mit_timer.timeout.connect(self._on_mit_tick)
+
+        # 周期清错（清错脉冲 + 释放帧，保证每次都有 0→1 跳变）
+        self._auto_clear_timer = QTimer(self)
+        self._auto_clear_timer.setInterval(int(self._cfg.get("clear_interval")))
+        self._auto_clear_timer.timeout.connect(self._on_auto_clear_tick)
+        self._clear_release_timer = QTimer(self)
+        self._clear_release_timer.setSingleShot(True)
+        self._clear_release_timer.setInterval(CLEAR_BURST_MS)
+        self._clear_release_timer.timeout.connect(self._on_clear_release)
+
+        # 周期往复（0° ↔ 上限角）
+        self._wave_timer = QTimer(self)
+        self._wave_timer.setInterval(int(self._cfg.get("wave_interval")))
+        self._wave_timer.timeout.connect(self._on_wave_tick)
+
     # ── UI 构建 ──
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        # 内容较多：放进滚动区，避免窗口偏小时目标设置等控件被裁剪到无法操作
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        root = QVBoxLayout(inner)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
         root.addWidget(self._build_dev_config())
         root.addWidget(self._build_mit_control())
+        root.addWidget(self._build_wave())
         root.addWidget(self._build_feedback())
         root.addStretch(1)
 
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+    def _unit_label(self, text: str, width: int = 46) -> QLabel:
+        """Fixed-width unit label shown next to a field (never inside it)."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {_DIM};")
+        lbl.setFixedWidth(width)
+        return lbl
+
+    def _grid_label(self, key: str) -> QLabel:
+        return QLabel(_(key))
+
     def _build_dev_config(self) -> QGroupBox:
         box = QGroupBox(_("Juxie.DevConfig"))
-        lay = QHBoxLayout(box)
+        g = QGridLayout(box)
+        g.setContentsMargins(8, 6, 8, 6)
+        g.setHorizontalSpacing(6)
+        g.setVerticalSpacing(4)
 
-        lay.addWidget(QLabel(_("Juxie.DevID")))
-        self._dev_id_spin = QSpinBox()
+        self._dev_id_label = QLabel(_("Juxie.DevID"))
+        g.addWidget(self._dev_id_label, 0, 0)
+        self._dev_id_spin = _IntSpin()
         self._dev_id_spin.setRange(0, 127)
-        self._dev_id_spin.setValue(0)
+        self._dev_id_spin.setValue(1)
         self._dev_id_spin.valueChanged.connect(self._on_dev_id_changed)
-        lay.addWidget(self._dev_id_spin)
+        g.addWidget(self._dev_id_spin, 0, 1)
+        g.addWidget(self._unit_label(""), 0, 2)
 
+        self._mirror_chk = QCheckBox(_("Juxie.Mirror"))
+        self._mirror_chk.toggled.connect(self._on_mirror_changed)
+        g.addWidget(self._mirror_chk, 0, 3)
+        self._mirror_id_label = QLabel(_("Juxie.MirrorID"))
+        g.addWidget(self._mirror_id_label, 0, 4)
+        self._mirror_id_spin = _IntSpin()
+        self._mirror_id_spin.setRange(0, 127)
+        self._mirror_id_spin.setValue(2)
+        self._mirror_id_spin.valueChanged.connect(self._on_mirror_id_changed)
+        g.addWidget(self._mirror_id_spin, 0, 5)
         self._id_label = QLabel()
         self._id_label.setStyleSheet(f"color: {_DIM};")
-        lay.addWidget(self._id_label)
-        lay.addStretch(1)
+        g.addWidget(self._id_label, 0, 6, 1, 2)
 
+        self._target_max_label = QLabel(_("Juxie.TargetMax"))
+        g.addWidget(self._target_max_label, 1, 0)
+        self._target_max_spin = _FloatSpin()
+        self._target_max_spin.setRange(0.1, 360.0)
+        self._target_max_spin.setDecimals(1)
+        self._target_max_spin.setSingleStep(1.0)
+        self._target_max_spin.setValue(35.0)
+        self._target_max_spin.valueChanged.connect(self._on_target_max_changed)
+        g.addWidget(self._target_max_spin, 1, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Deg")), 1, 2)
+
+        self._auto_req_chk = QCheckBox(_("Juxie.AutoRequest"))
+        self._auto_req_chk.toggled.connect(self._on_auto_req_changed)
+        g.addWidget(self._auto_req_chk, 1, 3)
+        self._req_label = QLabel(_("Juxie.ReqInterval"))
+        g.addWidget(self._req_label, 1, 4)
+        self._req_spin = _IntSpin()
+        self._req_spin.setRange(10, 5000)
+        self._req_spin.setSingleStep(10)
+        self._req_spin.setValue(100)
+        self._req_spin.valueChanged.connect(self._on_req_interval_changed)
+        g.addWidget(self._req_spin, 1, 5)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Ms")), 1, 6)
         self._sync_btn = QPushButton(_("Juxie.RequestFeedback"))
         self._sync_btn.clicked.connect(self._on_request_feedback)
-        lay.addWidget(self._sync_btn)
+        g.addWidget(self._sync_btn, 1, 7)
+        g.setColumnStretch(2, 1)
         return box
 
     def _build_mit_control(self) -> QGroupBox:
         box = QGroupBox(_("Juxie.MITControl"))
-        lay = QVBoxLayout(box)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        g = QGridLayout()
+        g.setHorizontalSpacing(6)
+        g.setVerticalSpacing(3)
+
+        # ---- scale limits: (label, spin, unit) x 2 per row ----
+        g.addWidget(self._grid_label("Juxie.PosMax"), 0, 0)
+        self._pos_max_spin = _FloatSpin()
+        self._pos_max_spin.setRange(1.0, 360.0)
+        self._pos_max_spin.setDecimals(1)
+        self._pos_max_spin.setSingleStep(1.0)
+        self._pos_max_spin.setValue(180.0)
+        self._pos_max_spin.valueChanged.connect(self._on_scale_changed)
+        g.addWidget(self._pos_max_spin, 0, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Deg")), 0, 2)
+
+        g.addWidget(self._grid_label("Juxie.VelMax"), 0, 3)
+        self._vel_max_spin = _FloatSpin()
+        self._vel_max_spin.setRange(1.0, 100000.0)
+        self._vel_max_spin.setDecimals(0)
+        self._vel_max_spin.setSingleStep(10.0)
+        self._vel_max_spin.setValue(3000.0)
+        self._vel_max_spin.valueChanged.connect(self._on_scale_changed)
+        g.addWidget(self._vel_max_spin, 0, 4)
+        g.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 0, 5)
+
+        g.addWidget(self._grid_label("Juxie.TorqueMax"), 1, 0)
+        self._torque_max_spin = _FloatSpin()
+        self._torque_max_spin.setRange(MIN_TORQUE_MAX, 1000.0)
+        self._torque_max_spin.setDecimals(1)
+        self._torque_max_spin.setSingleStep(1.0)
+        self._torque_max_spin.setValue(DEFAULT_TORQUE_MAX)
+        self._torque_max_spin.valueChanged.connect(self._on_scale_changed)
+        g.addWidget(self._torque_max_spin, 1, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 1, 2)
+
+        g.addWidget(self._grid_label("Juxie.TargetVel"), 1, 3)
+        self._vel_spin = _FloatSpin()
+        self._vel_spin.setRange(-500.0, 500.0)
+        self._vel_spin.setDecimals(1)
+        self._vel_spin.setSingleStep(10.0)
+        self._vel_spin.setValue(0.0)
+        g.addWidget(self._vel_spin, 1, 4)
+        g.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 1, 5)
+
+        g.addWidget(self._grid_label("Juxie.Kp"), 2, 0)
+        self._kp_spin = _FloatSpin()
+        self._kp_spin.setRange(0.0, P.KP_MAX)
+        self._kp_spin.setDecimals(1)
+        self._kp_spin.setSingleStep(1.0)
+        self._kp_spin.setValue(6.0)
+        g.addWidget(self._kp_spin, 2, 1)
+        self._kp_unit = self._unit_label("", 70)
+        g.addWidget(self._kp_unit, 2, 2)
+
+        g.addWidget(self._grid_label("Juxie.Kd"), 2, 3)
+        self._kd_spin = _FloatSpin()
+        self._kd_spin.setRange(0.0, P.KD_MAX)
+        self._kd_spin.setDecimals(2)
+        self._kd_spin.setSingleStep(0.01)
+        self._kd_spin.setValue(0.1)
+        g.addWidget(self._kd_spin, 2, 4)
+        self._kd_unit = self._unit_label("", 70)
+        g.addWidget(self._kd_unit, 2, 5)
+
+        # ---- feedforward torque: wheel step 0.1 Nm ----
+        self._torque_label = QLabel(_("Juxie.TargetTorque"))
+        g.addWidget(self._torque_label, 3, 0)
+        self._torque_spin = _FloatSpin()
+        self._torque_spin.setRange(-DEFAULT_TORQUE_MAX, DEFAULT_TORQUE_MAX)
+        self._torque_spin.setDecimals(2)
+        self._torque_spin.setSingleStep(0.1)
+        self._torque_spin.setValue(0.0)
+        g.addWidget(self._torque_spin, 3, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 3, 2)
+
+        self._tq_raw_chk = QCheckBox(_("Juxie.TorqueRaw"))
+        self._tq_raw_chk.setToolTip(_("Juxie.TorqueRawTip"))
+        self._tq_raw_chk.toggled.connect(self._on_tq_raw_changed)
+        g.addWidget(self._tq_raw_chk, 3, 3)
+        self._tq_raw_spin = _IntSpin()
+        self._tq_raw_spin.setRange(0, 4095)
+        self._tq_raw_spin.setValue(2048)
+        self._tq_raw_spin.setToolTip(_("Juxie.TorqueRawTip"))
+        self._tq_raw_spin.valueChanged.connect(self._on_tq_raw_changed)
+        g.addWidget(self._tq_raw_spin, 3, 4)
+        g.addWidget(self._unit_label(""), 3, 5)
+
+        g.addWidget(self._grid_label("Juxie.TorqueZero"), 4, 0)
+        self._tq_zero_combo = QComboBox()
+        self._tq_zero_combo.addItem(_("Juxie.TorqueZeroOffset"), "offset")
+        self._tq_zero_combo.addItem(_("Juxie.TorqueZeroSigned"), "signed")
+        self._tq_zero_combo.setToolTip(_("Juxie.TorqueZeroTip"))
+        self._tq_zero_combo.currentIndexChanged.connect(self._on_tq_zero_changed)
+        g.addWidget(self._tq_zero_combo, 4, 1, 1, 5)
+
+        for spin in (self._vel_spin, self._kp_spin, self._kd_spin,
+                     self._torque_spin):
+            spin.valueChanged.connect(self._on_target_params_changed)
+
+        # ---- target position (widest row) ----
+        g.addWidget(self._grid_label("Juxie.TargetPos"), 5, 0)
+        self._pos_slider = QSlider(Qt.Horizontal)
+        self._pos_slider.setRange(-1800, 1800)
+        self._pos_slider.setSingleStep(5)
+        self._pos_slider.setPageStep(50)
+        self._pos_slider.setValue(0)
+        self._pos_slider.valueChanged.connect(self._on_pos_changed)
+        g.addWidget(self._pos_slider, 5, 1, 1, 3)
+        self._pos_label = QLabel("+0.0" + _("Juxie.Unit.Deg"))
+        self._pos_label.setFixedWidth(58)
+        self._pos_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._pos_label.setStyleSheet(f"color: {_DIM};")
+        g.addWidget(self._pos_label, 5, 4)
+        self._mirror_target_label = QLabel("")
+        self._mirror_target_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._mirror_target_label.setStyleSheet(f"color: {_DIM};")
+        g.addWidget(self._mirror_target_label, 5, 5)
+        g.setColumnStretch(6, 1)
+        outer.addLayout(g)
 
         ctl_row = QHBoxLayout()
         self._enable_chk = QCheckBox(_("Juxie.Enable"))
@@ -108,97 +416,164 @@ class JuxieMotorPanel(QWidget):
         self._brake_chk = QCheckBox(_("Juxie.Brake"))
         self._brake_chk.toggled.connect(self._on_ctl_changed)
         ctl_row.addWidget(self._brake_chk)
-        self._clear_err_chk = QCheckBox(_("Juxie.ClearError"))
-        self._clear_err_chk.toggled.connect(self._on_ctl_changed)
-        ctl_row.addWidget(self._clear_err_chk)
+        self._clear_err_btn = QPushButton(_("Juxie.ClearError"))
+        self._clear_err_btn.clicked.connect(self._on_clear_error)
+        ctl_row.addWidget(self._clear_err_btn)
+        self._zero_btn = QPushButton(_("Juxie.Zero"))
+        self._zero_btn.clicked.connect(self._on_zero)
+        ctl_row.addWidget(self._zero_btn)
         self._auto_send_chk = QCheckBox(_("Juxie.AutoSend"))
         self._auto_send_chk.setChecked(True)
         self._auto_send_chk.toggled.connect(self._on_auto_send_changed)
         ctl_row.addWidget(self._auto_send_chk)
         ctl_row.addStretch(1)
-        lay.addLayout(ctl_row)
+        outer.addLayout(ctl_row)
 
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel(_("Juxie.PosMax")))
-        self._pos_max_spin = QDoubleSpinBox()
-        self._pos_max_spin.setRange(1.0, 360.0)
-        self._pos_max_spin.setDecimals(1)
-        self._pos_max_spin.setValue(180.0)
-        self._pos_max_spin.setSuffix(" °")
-        self._pos_max_spin.valueChanged.connect(self._on_scale_changed)
-        scale_row.addWidget(self._pos_max_spin)
+        cont_row = QHBoxLayout()
+        self._mit_cont_chk = QCheckBox(_("Juxie.Continuous"))
+        self._mit_cont_chk.toggled.connect(self._on_mit_cont_changed)
+        cont_row.addWidget(self._mit_cont_chk)
+        self._mit_int_label = QLabel(_("Juxie.MitInterval"))
+        cont_row.addWidget(self._mit_int_label)
+        self._mit_interval_spin = _IntSpin()
+        self._mit_interval_spin.setRange(5, 200)
+        self._mit_interval_spin.setSingleStep(5)
+        self._mit_interval_spin.setValue(20)
+        self._mit_interval_spin.valueChanged.connect(self._on_mit_interval_changed)
+        cont_row.addWidget(self._mit_interval_spin)
+        cont_row.addWidget(self._unit_label(_("Juxie.Unit.Ms")))
+        self._slew_label = QLabel(_("Juxie.SlewRate"))
+        cont_row.addWidget(self._slew_label)
+        self._slew_spin = _FloatSpin()
+        self._slew_spin.setRange(0.0, 720.0)
+        self._slew_spin.setDecimals(0)
+        self._slew_spin.setSingleStep(5.0)
+        self._slew_spin.setValue(60.0)
+        self._slew_spin.valueChanged.connect(self._on_slew_changed)
+        cont_row.addWidget(self._slew_spin)
+        cont_row.addWidget(self._unit_label(_("Juxie.Unit.DegS"), 54))
+        cont_row.addStretch(1)
+        outer.addLayout(cont_row)
 
-        scale_row.addWidget(QLabel(_("Juxie.VelMax")))
-        self._vel_max_spin = QDoubleSpinBox()
-        self._vel_max_spin.setRange(1.0, 100000.0)
-        self._vel_max_spin.setDecimals(0)
-        self._vel_max_spin.setValue(500.0)
-        self._vel_max_spin.setSuffix(" RPM")
-        self._vel_max_spin.valueChanged.connect(self._on_scale_changed)
-        scale_row.addWidget(self._vel_max_spin)
-
-        scale_row.addWidget(QLabel(_("Juxie.TorqueMax")))
-        self._torque_max_spin = QDoubleSpinBox()
-        self._torque_max_spin.setRange(0.1, 1000.0)
-        self._torque_max_spin.setDecimals(1)
-        self._torque_max_spin.setValue(20.0)
-        self._torque_max_spin.setSuffix(" Nm")
-        self._torque_max_spin.valueChanged.connect(self._on_scale_changed)
-        scale_row.addWidget(self._torque_max_spin)
-        scale_row.addStretch(1)
-        lay.addLayout(scale_row)
-
-        pos_row = QHBoxLayout()
-        pos_row.addWidget(QLabel(_("Juxie.TargetPos")))
-        self._pos_slider = QSlider(Qt.Horizontal)
-        self._pos_slider.setRange(-1800, 1800)
-        self._pos_slider.setSingleStep(5)
-        self._pos_slider.setPageStep(50)
-        self._pos_slider.setValue(0)
-        self._pos_slider.valueChanged.connect(self._on_pos_changed)
-        pos_row.addWidget(self._pos_slider, 1)
-        self._pos_label = QLabel("+0.0°")
-        self._pos_label.setFixedWidth(56)
-        self._pos_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._pos_label.setStyleSheet(f"color: {_DIM};")
-        pos_row.addWidget(self._pos_label)
-        lay.addLayout(pos_row)
-
-        grid = QGridLayout()
-        grid.addWidget(QLabel(_("Juxie.TargetVel")), 0, 0)
-        self._vel_spin = QDoubleSpinBox()
-        self._vel_spin.setRange(-500.0, 500.0)
-        self._vel_spin.setDecimals(1)
-        self._vel_spin.setValue(0.0)
-        self._vel_spin.setSuffix(" RPM")
-        grid.addWidget(self._vel_spin, 0, 1)
-
-        grid.addWidget(QLabel(_("Juxie.Kp")), 0, 2)
-        self._kp_spin = QDoubleSpinBox()
-        self._kp_spin.setRange(0.0, 500.0)
-        self._kp_spin.setDecimals(1)
-        self._kp_spin.setValue(0.0)
-        grid.addWidget(self._kp_spin, 0, 3)
-
-        grid.addWidget(QLabel(_("Juxie.Kd")), 1, 0)
-        self._kd_spin = QDoubleSpinBox()
-        self._kd_spin.setRange(0.0, 5.0)
-        self._kd_spin.setDecimals(2)
-        self._kd_spin.setValue(0.0)
-        grid.addWidget(self._kd_spin, 1, 1)
-
-        grid.addWidget(QLabel(_("Juxie.TargetTorque")), 1, 2)
-        self._torque_spin = QDoubleSpinBox()
-        self._torque_spin.setRange(-20.0, 20.0)
-        self._torque_spin.setDecimals(2)
-        self._torque_spin.setValue(0.0)
-        self._torque_spin.setSuffix(" Nm")
-        grid.addWidget(self._torque_spin, 1, 3)
-        lay.addLayout(grid)
+        clear_row = QHBoxLayout()
+        self._auto_clear_chk = QCheckBox(_("Juxie.AutoClear"))
+        self._auto_clear_chk.toggled.connect(self._on_auto_clear_changed)
+        clear_row.addWidget(self._auto_clear_chk)
+        self._auto_clear_label = QLabel(_("Juxie.ClearInterval"))
+        clear_row.addWidget(self._auto_clear_label)
+        self._clear_interval_spin = _IntSpin()
+        self._clear_interval_spin.setRange(1, 2147483647)
+        self._clear_interval_spin.setSingleStep(1)
+        self._clear_interval_spin.setValue(10)
+        self._clear_interval_spin.valueChanged.connect(
+            self._on_clear_interval_changed)
+        clear_row.addWidget(self._clear_interval_spin)
+        clear_row.addWidget(self._unit_label(_("Juxie.Unit.Ms")))
+        clear_row.addStretch(1)
+        outer.addLayout(clear_row)
 
         self._send_btn = QPushButton(_("Juxie.SendMIT"))
         self._send_btn.clicked.connect(self._on_send_mit)
-        lay.addWidget(self._send_btn)
+        outer.addWidget(self._send_btn)
+
+        self._frame_label = QLabel("")
+        self._frame_label.setStyleSheet(f"color: {_DIM};")
+        self._frame_label.setToolTip(_("Juxie.FrameTip"))
+        outer.addWidget(self._frame_label)
+        return box
+
+    def _build_wave(self) -> QGroupBox:
+        box = QGroupBox(_("Juxie.Wave"))
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        g = QGridLayout()
+        g.setHorizontalSpacing(6)
+        g.setVerticalSpacing(3)
+
+        self._wave_amp_label = self._grid_label("Juxie.WaveAmp")
+        g.addWidget(self._wave_amp_label, 0, 0)
+        self._wave_amp_spin = _FloatSpin()
+        self._wave_amp_spin.setRange(0.1, 360.0)
+        self._wave_amp_spin.setDecimals(1)
+        self._wave_amp_spin.setSingleStep(1.0)
+        self._wave_amp_spin.setValue(30.0)
+        self._wave_amp_spin.valueChanged.connect(self._on_wave_param_changed)
+        g.addWidget(self._wave_amp_spin, 0, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Deg")), 0, 2)
+
+        self._wave_period_label = self._grid_label("Juxie.WavePeriod")
+        g.addWidget(self._wave_period_label, 0, 3)
+        self._wave_period_spin = _FloatSpin()
+        self._wave_period_spin.setRange(0.1, 600.0)
+        self._wave_period_spin.setDecimals(2)
+        self._wave_period_spin.setSingleStep(0.1)
+        self._wave_period_spin.setValue(3.0)
+        self._wave_period_spin.valueChanged.connect(self._on_wave_param_changed)
+        g.addWidget(self._wave_period_spin, 0, 4)
+        g.addWidget(self._unit_label(_("Juxie.Unit.S")), 0, 5)
+
+        self._wave_iv_label = self._grid_label("Juxie.WaveInterval")
+        g.addWidget(self._wave_iv_label, 0, 6)
+        self._wave_iv_spin = _IntSpin()
+        self._wave_iv_spin.setRange(2, 1000)
+        self._wave_iv_spin.setSingleStep(1)
+        self._wave_iv_spin.setValue(10)
+        self._wave_iv_spin.valueChanged.connect(self._on_wave_interval_changed)
+        g.addWidget(self._wave_iv_spin, 0, 7)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Ms")), 0, 8)
+
+        self._wave_hold_hi_label = self._grid_label("Juxie.WaveHoldHi")
+        g.addWidget(self._wave_hold_hi_label, 1, 0)
+        self._wave_hold_hi_spin = _FloatSpin()
+        self._wave_hold_hi_spin.setRange(0.0, 600.0)
+        self._wave_hold_hi_spin.setDecimals(2)
+        self._wave_hold_hi_spin.setSingleStep(0.5)
+        self._wave_hold_hi_spin.setValue(5.0)
+        self._wave_hold_hi_spin.valueChanged.connect(self._on_wave_param_changed)
+        g.addWidget(self._wave_hold_hi_spin, 1, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.S")), 1, 2)
+
+        self._wave_hold_lo_label = self._grid_label("Juxie.WaveHoldLo")
+        g.addWidget(self._wave_hold_lo_label, 1, 3)
+        self._wave_hold_lo_spin = _FloatSpin()
+        self._wave_hold_lo_spin.setRange(0.0, 600.0)
+        self._wave_hold_lo_spin.setDecimals(2)
+        self._wave_hold_lo_spin.setSingleStep(0.5)
+        self._wave_hold_lo_spin.setValue(5.0)
+        self._wave_hold_lo_spin.valueChanged.connect(self._on_wave_param_changed)
+        g.addWidget(self._wave_hold_lo_spin, 1, 4)
+        g.addWidget(self._unit_label(_("Juxie.Unit.S")), 1, 5)
+
+        wrow = QHBoxLayout()
+        self._wave_btn = QPushButton(_("Juxie.WaveStart"))
+        self._wave_btn.clicked.connect(self._on_wave_toggle)
+        wrow.addWidget(self._wave_btn)
+        self._wave_rnd_btn = QPushButton(_("Juxie.WaveRandStart"))
+        self._wave_rnd_btn.clicked.connect(self._on_wave_rand_toggle)
+        wrow.addWidget(self._wave_rnd_btn)
+        wrow.addStretch(1)
+        g.addLayout(wrow, 1, 6, 1, 3)
+
+        self._wave_log_chk = QCheckBox(_("Juxie.WaveLog"))
+        self._wave_log_chk.setChecked(True)
+        self._wave_log_chk.toggled.connect(self._on_wave_log_changed)
+        g.addWidget(self._wave_log_chk, 2, 0, 1, 2)
+        self._wave_log_path_label = QLabel("")
+        self._wave_log_path_label.setStyleSheet(f"color: {_DIM};")
+        g.addWidget(self._wave_log_path_label, 2, 2, 1, 3)
+        self._wave_open_btn = QPushButton(_("Juxie.WaveOpenCsv"))
+        self._wave_open_btn.clicked.connect(self._on_wave_open_csv)
+        g.addWidget(self._wave_open_btn, 2, 5)
+        self._wave_cur_label = QLabel("")
+        self._wave_cur_label.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+        self._wave_cur_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        g.addWidget(self._wave_cur_label, 2, 6, 1, 3)
+
+        self._wave_info = QLabel("")
+        self._wave_info.setStyleSheet(f"color: {_DIM};")
+        g.addWidget(self._wave_info, 3, 0, 1, 9)
+        outer.addLayout(g)
         return box
 
     def _build_feedback(self) -> QGroupBox:
@@ -206,41 +581,59 @@ class JuxieMotorPanel(QWidget):
         lay = QGridLayout(box)
         lay.setContentsMargins(8, 8, 8, 8)
 
-        self._fb_labels: dict[str, QLabel] = {}
+        # 两台电机并排：0=主电机，1=镜像电机
+        self._fb_labels: list = [{}, {}]
+        self._fb_head: list = []
+        self._fb_status: list = []
+        self._fb_update: list = []
+        self._fb_field_labels: list = []
+
         fields = [
-            ("position", _("Juxie.Position"), _("Juxie.Unit.Deg")),
-            ("speed", _("Juxie.Speed"), _("Juxie.Unit.RPM")),
-            ("current", _("Juxie.Current"), _("Juxie.Unit.mA")),
-            ("temperature", _("Juxie.Temperature"), _("Juxie.Unit.Celsius")),
-            ("torque", _("Juxie.Torque"), _("Juxie.Unit.Nm")),
-            ("error_code", _("Juxie.ErrorCode"), ""),
-            ("mode_feedback", _("Juxie.ModeFeedback"), ""),
+            ("position", "Juxie.Position", "Juxie.Unit.Deg"),
+            ("speed", "Juxie.Speed", "Juxie.Unit.RPM"),
+            ("current", "Juxie.Current", "Juxie.Unit.mA"),
+            ("temperature", "Juxie.Temperature", "Juxie.Unit.Celsius"),
+            ("torque", "Juxie.Torque", "Juxie.Unit.Nm"),
+            ("error_code", "Juxie.ErrorCode", ""),
+            ("mode_feedback", "Juxie.ModeFeedback", ""),
         ]
 
-        for row_idx, (key, label_key, unit_key) in enumerate(fields):
-            r, c = row_idx // 2, (row_idx % 2) * 3
-            lay.addWidget(QLabel(_(label_key)), r, c)
-            val_lbl = QLabel(_("Juxie.NoData"))
-            val_lbl.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
-            lay.addWidget(val_lbl, r, c + 1)
-            if unit_key:
-                lay.addWidget(QLabel(_(unit_key)), r, c + 2)
-            self._fb_labels[key] = val_lbl
+        for m in (0, 1):
+            col = m * 3
+            head = QLabel("")
+            head.setStyleSheet(f"color: {_TEXT}; font-weight: 700;")
+            self._fb_head.append(head)
+            lay.addWidget(head, 0, col, 1, 3)
 
-        status_row = QHBoxLayout()
-        status_row.addWidget(QLabel(_("Juxie.Status")))
-        self._fb_status = QLabel("")
-        self._fb_status.setStyleSheet(f"color: {_DIM};")
-        status_row.addWidget(self._fb_status)
-        status_row.addStretch(1)
-        lay.addLayout(status_row, (len(fields) + 1) // 2, 0, 1, 6)
+            for r, (key, label_key, unit_key) in enumerate(fields, start=1):
+                name_lbl = QLabel(_(label_key))
+                lay.addWidget(name_lbl, r, col)
+                self._fb_field_labels.append((name_lbl, label_key))
+                val_lbl = QLabel(_("Juxie.NoData"))
+                val_lbl.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+                lay.addWidget(val_lbl, r, col + 1)
+                if unit_key:
+                    unit_lbl = QLabel(_(unit_key))
+                    lay.addWidget(unit_lbl, r, col + 2)
+                    self._fb_field_labels.append((unit_lbl, unit_key))
+                self._fb_labels[m][key] = val_lbl
 
-        update_row = QHBoxLayout()
-        self._fb_update = QLabel("")
-        self._fb_update.setStyleSheet(f"color: {_DIM};")
-        update_row.addWidget(self._fb_update)
-        update_row.addStretch(1)
-        lay.addLayout(update_row, (len(fields) + 1) // 2 + 1, 0, 1, 6)
+            status_row = QHBoxLayout()
+            status_row.addWidget(QLabel(_("Juxie.Status")))
+            st = QLabel("")
+            st.setStyleSheet(f"color: {_OK};")
+            status_row.addWidget(st)
+            status_row.addStretch(1)
+            self._fb_status.append(st)
+            lay.addLayout(status_row, len(fields) + 1, col, 1, 3)
+
+            update_row = QHBoxLayout()
+            up = QLabel("")
+            up.setStyleSheet(f"color: {_DIM};")
+            update_row.addWidget(up)
+            update_row.addStretch(1)
+            self._fb_update.append(up)
+            lay.addLayout(update_row, len(fields) + 2, col, 1, 3)
 
         return box
 
@@ -259,13 +652,82 @@ class JuxieMotorPanel(QWidget):
         self._brake_chk.setChecked(bool(self._cfg.get("brake")))
         self._brake_chk.blockSignals(False)
 
-        self._clear_err_chk.blockSignals(True)
-        self._clear_err_chk.setChecked(bool(self._cfg.get("clear_err")))
-        self._clear_err_chk.blockSignals(False)
-
         self._auto_send_chk.blockSignals(True)
         self._auto_send_chk.setChecked(bool(self._cfg.get("auto_send")))
         self._auto_send_chk.blockSignals(False)
+
+        self._auto_req_chk.blockSignals(True)
+        self._auto_req_chk.setChecked(bool(self._cfg.get("auto_request")))
+        self._auto_req_chk.blockSignals(False)
+
+        self._req_spin.blockSignals(True)
+        self._req_spin.setValue(int(self._cfg.get("req_interval")))
+        self._req_spin.blockSignals(False)
+
+        self._mit_cont_chk.blockSignals(True)
+        self._mit_cont_chk.setChecked(bool(self._cfg.get("mit_continuous")))
+        self._mit_cont_chk.blockSignals(False)
+
+        self._mit_interval_spin.blockSignals(True)
+        self._mit_interval_spin.setValue(int(self._cfg.get("mit_interval")))
+        self._mit_interval_spin.blockSignals(False)
+
+        self._slew_spin.blockSignals(True)
+        self._slew_spin.setValue(float(self._cfg.get("slew_dps")))
+        self._slew_spin.blockSignals(False)
+
+        self._auto_clear_chk.blockSignals(True)
+        self._auto_clear_chk.setChecked(bool(self._cfg.get("auto_clear")))
+        self._auto_clear_chk.blockSignals(False)
+
+        self._clear_interval_spin.blockSignals(True)
+        self._clear_interval_spin.setValue(int(self._cfg.get("clear_interval")))
+        self._clear_interval_spin.blockSignals(False)
+
+        self._wave_amp_spin.blockSignals(True)
+        self._wave_amp_spin.setValue(float(self._cfg.get("wave_amp")))
+        self._wave_amp_spin.blockSignals(False)
+
+        self._wave_period_spin.blockSignals(True)
+        self._wave_period_spin.setValue(float(self._cfg.get("wave_period")))
+        self._wave_period_spin.blockSignals(False)
+
+        hi = float(self._cfg.get("wave_hold_hi"))
+        lo = float(self._cfg.get("wave_hold_lo"))
+        legacy = self._ctx.get_setting("juxie_motor.wave_hold", None)
+        if legacy is not None:      # 兼容旧版单一「端点保持」
+            if self._ctx.get_setting("juxie_motor.wave_hold_hi", None) is None:
+                hi = float(legacy)
+            if self._ctx.get_setting("juxie_motor.wave_hold_lo", None) is None:
+                lo = float(legacy)
+
+        self._wave_hold_hi_spin.blockSignals(True)
+        self._wave_hold_hi_spin.setValue(hi)
+        self._wave_hold_hi_spin.blockSignals(False)
+
+        self._wave_hold_lo_spin.blockSignals(True)
+        self._wave_hold_lo_spin.setValue(lo)
+        self._wave_hold_lo_spin.blockSignals(False)
+
+        self._wave_iv_spin.blockSignals(True)
+        self._wave_iv_spin.setValue(int(self._cfg.get("wave_interval")))
+        self._wave_iv_spin.blockSignals(False)
+
+        self._wave_log_chk.blockSignals(True)
+        self._wave_log_chk.setChecked(bool(self._cfg.get("wave_log")))
+        self._wave_log_chk.blockSignals(False)
+
+        self._mirror_chk.blockSignals(True)
+        self._mirror_chk.setChecked(bool(self._cfg.get("mirror")))
+        self._mirror_chk.blockSignals(False)
+
+        self._mirror_id_spin.blockSignals(True)
+        self._mirror_id_spin.setValue(int(self._cfg.get("mirror_id")))
+        self._mirror_id_spin.blockSignals(False)
+
+        self._target_max_spin.blockSignals(True)
+        self._target_max_spin.setValue(float(self._cfg.get("target_max")))
+        self._target_max_spin.blockSignals(False)
 
         self._pos_max_spin.blockSignals(True)
         self._pos_max_spin.setValue(float(self._cfg.get("pos_max")))
@@ -276,28 +738,132 @@ class JuxieMotorPanel(QWidget):
         self._vel_max_spin.blockSignals(False)
 
         self._torque_max_spin.blockSignals(True)
-        self._torque_max_spin.setValue(float(self._cfg.get("torque_max")))
+        tmax = float(self._cfg.get("torque_max"))
+        if tmax < MIN_TORQUE_MAX:      # 历史遗留的过小量程会锁死目标力矩范围
+            self._ctx.status_message(_("Juxie.ScaleReset").format(
+                v=tmax, d=DEFAULT_TORQUE_MAX), 6000)
+            tmax = DEFAULT_TORQUE_MAX
+            self._cfg.set("torque_max", tmax)
+        self._torque_max_spin.setValue(tmax)
         self._torque_max_spin.blockSignals(False)
 
         self._update_id_label()
         self._update_ranges()
 
+        # MIT 目标参数（含 Kp/Kd）记忆：量程先就绪，再恢复数值并按量程夹取
+        self._vel_spin.blockSignals(True)
+        self._vel_spin.setValue(float(self._cfg.get("target_vel")))
+        self._vel_spin.blockSignals(False)
+
+        self._kp_spin.blockSignals(True)
+        self._kp_spin.setValue(float(self._cfg.get("kp")))
+        self._kp_spin.blockSignals(False)
+
+        self._kd_spin.blockSignals(True)
+        self._kd_spin.setValue(float(self._cfg.get("kd")))
+        self._kd_spin.blockSignals(False)
+
+        self._torque_spin.blockSignals(True)
+        self._torque_spin.setValue(float(self._cfg.get("target_torque")))
+        self._torque_spin.blockSignals(False)
+
+        self._pos_slider.blockSignals(True)
+        self._pos_slider.setValue(int(self._cfg.get("target_pos")))
+        self._pos_slider.blockSignals(False)
+
+        self._tq_raw_chk.blockSignals(True)
+        self._tq_raw_chk.setChecked(bool(self._cfg.get("tq_raw_enable")))
+        self._tq_raw_chk.blockSignals(False)
+
+        self._tq_raw_spin.blockSignals(True)
+        self._tq_raw_spin.setValue(int(self._cfg.get("tq_raw")))
+        self._tq_raw_spin.blockSignals(False)
+
+        mode = self._cfg.get("tq_zero_mode")
+        idx = self._tq_zero_combo.findData(mode)
+        self._tq_zero_combo.blockSignals(True)
+        self._tq_zero_combo.setCurrentIndex(max(0, idx))
+        self._tq_zero_combo.blockSignals(False)
+
+        self._update_pos_label()
+        self._update_wave_info()
+        self._update_wave_log_info()
+
     # ── 事件处理 ──
 
     def _on_dev_id_changed(self, val):
         self._cfg.set("dev_id", val)
+        self._slew_pos = None
         self._update_id_label()
+        self._clear_feedback_display()
+
+    def _on_mirror_changed(self, checked):
+        self._cfg.set("mirror", bool(checked))
+        self._slew_pos = None
+        self._update_id_label()
+        self._update_ranges()
+        self._clear_feedback_display()
+        self._update_mit_timer()
+
+    def _on_mirror_id_changed(self, val):
+        self._cfg.set("mirror_id", int(val))
+        self._slew_pos = None
+        self._update_id_label()
+        self._clear_feedback_display()
+
+    def _on_target_max_changed(self, val):
+        self._cfg.set("target_max", float(val))
+        self._update_ranges()
+        self._update_id_label()
+
+    def _motor_ids(self) -> list:
+        """参与控制的电机 ID：[主] 或 [主, 镜像]。"""
+        ids = [self._dev_id_spin.value()]
+        if self._mirror_chk.isChecked():
+            ids.append(self._mirror_id_spin.value())
+        return ids
+
+    def _zero_ids(self) -> list:
+        """标零固定覆盖两台电机（主 + 镜像），与镜像开关无关。"""
+        return [self._dev_id_spin.value(), self._mirror_id_spin.value()]
+
+    def _target_primary(self) -> float:
+        """主电机目标角度；镜像模式下属对称机构，限制在 0~上限。"""
+        deg = self._pos_slider.value() / 10.0
+        if self._mirror_chk.isChecked():
+            return max(0.0, min(self._target_max_spin.value(), deg))
+        return deg
 
     def _update_id_label(self):
         dev_id = self._dev_id_spin.value()
         tx_id = P.build_mit_single_canid(dev_id)
         rx_id = P.build_feedback_canid(dev_id)
         self._id_label.setText(f"TX=0x{tx_id:03X}  RX=0x{rx_id:03X}")
+        self._update_fb_headers()
+
+    def _update_fb_headers(self):
+        ids = self._motor_ids()
+        max_deg = self._target_max_spin.value()
+        for m in (0, 1):
+            head = self._fb_head[m]
+            if m < len(ids):
+                tag = _("Juxie.Primary") if m == 0 else _("Juxie.MirrorTag")
+                rx = P.build_feedback_canid(ids[m])
+                if self._mirror_chk.isChecked():
+                    # 主电机 0~上限；镜像电机方向相反，即 -上限~0
+                    rng = (f"0~{max_deg:.0f}°" if m == 0
+                           else f"-{max_deg:.0f}~0°")
+                else:
+                    rng = f"±{self._pos_max_spin.value():.0f}°"
+                head.setText(f"{tag}  ID={ids[m]}  (RX=0x{rx:03X})  {rng}")
+                head.setStyleSheet(f"color: {_TEXT}; font-weight: 700;")
+            else:
+                head.setText(_("Juxie.NoData"))
+                head.setStyleSheet(f"color: {_DIM}; font-weight: 700;")
 
     def _on_ctl_changed(self):
         self._cfg.set("enable", self._enable_chk.isChecked())
         self._cfg.set("brake", self._brake_chk.isChecked())
-        self._cfg.set("clear_err", self._clear_err_chk.isChecked())
 
     def _on_auto_send_changed(self, checked):
         self._cfg.set("auto_send", bool(checked))
@@ -307,6 +873,28 @@ class JuxieMotorPanel(QWidget):
         self._cfg.set("vel_max", self._vel_max_spin.value())
         self._cfg.set("torque_max", self._torque_max_spin.value())
         self._update_ranges()
+        self._update_id_label()
+
+    def _on_target_params_changed(self):
+        self._cfg.set("target_vel", self._vel_spin.value())
+        self._cfg.set("kp", self._kp_spin.value())
+        self._cfg.set("kd", self._kd_spin.value())
+        self._cfg.set("target_torque", self._torque_spin.value())
+
+    def _on_tq_raw_changed(self, *_args):
+        self._cfg.set("tq_raw_enable", self._tq_raw_chk.isChecked())
+        self._cfg.set("tq_raw", int(self._tq_raw_spin.value()))
+
+    def _torque_signed(self) -> bool:
+        return self._tq_zero_combo.currentData() == "signed"
+
+    def _on_tq_zero_changed(self, _index: int):
+        self._cfg.set("tq_zero_mode", self._tq_zero_combo.currentData())
+
+    def _update_kp_kd_ranges(self):
+        """Kp/Kd 量程固定为文档 9 字节帧的 0~500 / 0~5。"""
+        self._kp_spin.setRange(0.0, P.KP_MAX)
+        self._kd_spin.setRange(0.0, P.KD_MAX)
 
     def _update_ranges(self):
         pos_max = self._pos_max_spin.value()
@@ -314,7 +902,11 @@ class JuxieMotorPanel(QWidget):
         torque_max = self._torque_max_spin.value()
 
         self._pos_slider.blockSignals(True)
-        self._pos_slider.setRange(int(-pos_max * 10), int(pos_max * 10))
+        if self._mirror_chk.isChecked():
+            # 镜像模式：主电机 0 ~ 角度上限，镜像电机取负（对称为 -上限 ~ 0）
+            self._pos_slider.setRange(0, int(self._target_max_spin.value() * 10))
+        else:
+            self._pos_slider.setRange(int(-pos_max * 10), int(pos_max * 10))
         self._pos_slider.blockSignals(False)
 
         self._vel_spin.blockSignals(True)
@@ -325,106 +917,604 @@ class JuxieMotorPanel(QWidget):
         self._torque_spin.setRange(-torque_max, torque_max)
         self._torque_spin.blockSignals(False)
 
+        self._update_kp_kd_ranges()
+        if hasattr(self, "_torque_label"):
+            self._torque_label.setText(
+                f"{_('Juxie.TargetTorque')}  (±{torque_max:g} Nm)")
         self._update_pos_label()
 
     def _on_pos_changed(self, val):
+        self._cfg.set("target_pos", int(val))
         self._update_pos_label()
+        # 连续发送模式下由斜坡逼近目标，不在此处阶跃下发
+        if self._mit_cont_chk.isChecked():
+            return
         if self._auto_send_chk.isChecked():
             self._send_mit_frame(auto=True)
 
     def _update_pos_label(self):
-        deg = self._pos_slider.value() / 10.0
-        self._pos_label.setText(f"{deg:+.1f}°")
+        t = self._target_primary()
+        self._pos_label.setText(f"{t:+.1f}°")
+        if self._mirror_chk.isChecked():
+            self._mirror_target_label.setText(
+                f"{_('Juxie.MirrorTag')} {-t:+.1f}°")
+        else:
+            self._mirror_target_label.setText("")
 
     # ── 发送 ──
 
+    def _send_sync(self) -> bool:
+        if not self._ctx.is_connected():
+            return False
+        self._ctx.send_frame(CANFrame(can_id=P.SYNC_ID, data=b"",
+                                      extended=False, fd=True, brs=True))
+        return True
+
     def _on_request_feedback(self):
+        if not self._send_sync():
+            self._ctx.status_message(_("Juxie.Err.NotConnected"))
+
+    # ── 定时请求反馈 ──
+    def _on_req_tick(self):
+        self._send_sync()
+
+    def _on_auto_req_changed(self, checked: bool):
+        self._cfg.set("auto_request", bool(checked))
+        self._update_req_timer()
+
+    def _on_req_interval_changed(self, value: int):
+        self._cfg.set("req_interval", int(value))
+        self._req_timer.setInterval(int(value))
+
+    def _update_req_timer(self):
+        if self._auto_req_chk.isChecked() and self._ctx.is_connected():
+            self._req_timer.start()
+        else:
+            self._req_timer.stop()
+
+    # ── 连续 MIT 控制（位置斜坡限速）──
+    def _on_mit_cont_changed(self, checked: bool):
+        self._cfg.set("mit_continuous", bool(checked))
+        if checked:
+            self._stop_wave(send_zero=False)    # 与周期往复互斥
+        self._update_mit_timer()
+
+    def _on_mit_interval_changed(self, value: int):
+        self._cfg.set("mit_interval", int(value))
+        self._mit_timer.setInterval(int(value))
+
+    def _on_slew_changed(self, value: float):
+        self._cfg.set("slew_dps", float(value))
+
+    def _update_mit_timer(self):
+        if (self._mit_cont_chk.isChecked() and self._ctx.is_connected()
+                and self._ctx.is_fd_mode()):
+            if not self._mit_timer.isActive():
+                self._slew_pos = None      # 重新起步：从当前位置开始逼近
+            self._mit_timer.start()
+        else:
+            self._mit_timer.stop()
+
+    def _on_mit_tick(self):
+        if not self._ctx.is_connected() or not self._ctx.is_fd_mode():
+            self._mit_timer.stop()
+            return
+        target = self._target_primary()
+        if self._slew_pos is None:
+            # 起手用主电机当前反馈位置，避免第一帧就是阶跃
+            fb = self._fb[0]
+            self._slew_pos = fb.position if fb is not None else target
+        slew = float(self._slew_spin.value())
+        if slew > 0.0:
+            step = slew * (self._mit_timer.interval() / 1000.0)
+            delta = target - self._slew_pos
+            if abs(delta) <= step:
+                self._slew_pos = target
+            else:
+                self._slew_pos += step if delta > 0 else -step
+        else:
+            self._slew_pos = target
+        self._send_mit_pair(self._slew_pos)
+
+    def _send_mit_pair(self, pos_primary: float, clear_err: bool = False,
+                       release: bool = False):
+        """主电机发 +pos/+τ，镜像电机发 −pos/−τ（位置与力矩都取反对称）。"""
+        ids = self._motor_ids()
+        self._ctx.send_frame(self._build_mit_frame(
+            clear_err=clear_err, pos_deg=pos_primary, dev_id=ids[0]))
+        if len(ids) > 1:
+            self._ctx.send_frame(self._build_mit_frame(
+                clear_err=clear_err, pos_deg=-pos_primary, dev_id=ids[1],
+                mirror=True, update_label=False))
+
+    # ── 周期往复（参考 E1_Hand_G474 host: _wave_pos）──
+    def _on_wave_param_changed(self):
+        self._cfg.set("wave_amp", self._wave_amp_spin.value())
+        self._cfg.set("wave_period", self._wave_period_spin.value())
+        self._cfg.set("wave_hold_hi", self._wave_hold_hi_spin.value())
+        self._cfg.set("wave_hold_lo", self._wave_hold_lo_spin.value())
+        self._update_wave_info()
+
+    def _on_wave_interval_changed(self, value: int):
+        self._cfg.set("wave_interval", int(value))
+        self._wave_timer.setInterval(int(value))
+
+    def _update_wave_info(self):
+        if self._wave_on:
+            return
+        amp = self._wave_amp_spin.value()
+        period = self._wave_period_spin.value()
+        hi = self._wave_hold_hi_spin.value()
+        lo = self._wave_hold_lo_spin.value()
+        self._wave_info.setText(_("Juxie.WaveIdle").format(
+            amp=amp, period=period, hi=hi, lo=lo,
+            total=period + hi + lo))
+
+    def _wave_pos(self, t: float) -> float:
+        """往复位置：0→A（正弦）→ 保持 A → A→0（正弦）→ 保持 0，循环。
+
+        运动周期 T_move 内完成往返；上限端保持 T_hold_hi，0°端保持 T_hold_lo，
+        两端可分别设置；正弦段两端速度≈0。
+        """
+        a = self._wave_amp_cur
+        t_move = max(1e-6, self._wave_period_spin.value())
+        h_hi = self._wave_hold_hi_spin.value()
+        h_lo = self._wave_hold_lo_spin.value()
+        half = t_move * 0.5
+        cycle = t_move + h_hi + h_lo
+        tt = t % cycle
+        if tt < half:                       # 0° → 上限角
+            return a * 0.5 * (1.0 - math.cos(math.pi * tt / half))
+        if tt < half + h_hi:                # 在上限角保持
+            return a
+        if tt < t_move + h_hi:              # 上限角 → 0°
+            return a * 0.5 * (1.0 + math.cos(math.pi * (tt - half - h_hi) / half))
+        return 0.0                          # 在 0° 保持 h_lo
+
+    def _on_wave_toggle(self):
+        if self._wave_on and not self._wave_rand:
+            self._stop_wave()
+        else:
+            self._start_wave(randomize=False)
+
+    def _on_wave_rand_toggle(self):
+        if self._wave_on and self._wave_rand:
+            self._stop_wave()
+        else:
+            self._start_wave(randomize=True)
+
+    def _wave_max_deg(self) -> float:
+        """当前行程上限：镜像模式为「角度上限」，单机模式为 Pos_Max。"""
+        return (self._target_max_spin.value() if self._mirror_chk.isChecked()
+                else self._pos_max_spin.value())
+
+    def _wave_cycle_len(self) -> float:
+        return (max(1e-6, self._wave_period_spin.value())
+                + self._wave_hold_hi_spin.value()
+                + self._wave_hold_lo_spin.value())
+
+    def _wave_update_cycle(self, t: float):
+        """每 tick 更新本周期幅值：固定模式跟随上限角，随机模式每周期重取。"""
+        if not self._wave_rand:
+            self._wave_amp_cur = self._wave_amp_spin.value()
+            return
+        idx = int(t / self._wave_cycle_len())
+        if idx != self._wave_cur_idx:
+            self._wave_cur_idx = idx
+            mx = max(1e-6, self._wave_max_deg())
+            self._wave_amp_cur = random.uniform(WAVE_RAND_MIN_FRAC * mx, mx)
+            self._update_wave_info_live()
+
+    def _update_wave_buttons(self):
+        self._wave_btn.setText(
+            _("Juxie.WaveStop")
+            if (self._wave_on and not self._wave_rand) else _("Juxie.WaveStart"))
+        self._wave_rnd_btn.setText(
+            _("Juxie.WaveRandStop")
+            if (self._wave_on and self._wave_rand) else _("Juxie.WaveRandStart"))
+
+    def _update_wave_info_live(self):
+        """运行中的状态行（含本周期实际幅值）。"""
+        if not self._wave_on:
+            self._update_wave_info()
+            return
+        hi = self._wave_hold_hi_spin.value()
+        lo = self._wave_hold_lo_spin.value()
+        period = self._wave_period_spin.value()
+        key = ("Juxie.WaveRandRunning" if self._wave_rand
+               else "Juxie.WaveRunning")
+        self._wave_info.setText(_(key).format(
+            amp=self._wave_amp_cur, period=period, hi=hi, lo=lo,
+            total=period + hi + lo))
+        self._wave_cur_label.setText(
+            _("Juxie.WaveCurAmp").format(amp=self._wave_amp_cur)
+            if self._wave_rand else "")
+
+    def _start_wave(self, randomize: bool = False):
         if not self._ctx.is_connected():
             self._ctx.status_message(_("Juxie.Err.NotConnected"))
             return
-        frame = CANFrame(can_id=P.SYNC_ID, data=b"", extended=False, fd=True, brs=True)
-        self._ctx.send_frame(frame)
+        if not self._ctx.is_fd_mode():
+            self._ctx.status_message(_("Juxie.Err.NeedFd"))
+            return
+        if self._wave_on:
+            self._stop_wave(send_zero=False)
+        amp = self._wave_amp_spin.value()
+        max_deg = self._wave_max_deg()
+        if amp > max_deg:                   # 上限角不超过当前行程
+            amp = max_deg
+            self._wave_amp_spin.setValue(amp)   # 触发保存与信息刷新
+        # 与连续 MIT 互斥
+        self._mit_cont_chk.setChecked(False)
+        self._slew_pos = None
+        self._wave_rand = bool(randomize)
+        self._wave_cur_idx = -1
+        self._wave_amp_cur = amp
+        self._wave_on = True
+        self._wave_t0 = time.monotonic()
+        self._open_wave_log()
+        self._wave_timer.setInterval(int(self._wave_iv_spin.value()))
+        self._wave_timer.start()
+        self._update_wave_buttons()
+        self._update_wave_info_live()
 
-    def _build_mit_frame(self) -> CANFrame | None:
-        dev_id = self._dev_id_spin.value()
+    def _stop_wave(self, send_zero: bool = True):
+        was_on = self._wave_on
+        self._wave_on = False
+        self._wave_rand = False
+        self._wave_cur_idx = -1
+        self._wave_timer.stop()
+        self._wave_cur_label.setText("")
+        self._update_wave_buttons()
+        self._update_wave_info()
+        if send_zero and was_on and self._ctx.is_connected() and self._ctx.is_fd_mode():
+            self._slew_pos = 0.0
+            self._send_mit_pair(0.0)        # 停止时目标回 0°
+
+    def _on_wave_tick(self):
+        if not self._ctx.is_connected() or not self._ctx.is_fd_mode():
+            self._stop_wave(send_zero=False)
+            return
+        t = time.monotonic() - self._wave_t0
+        self._wave_update_cycle(t)
+        pos = self._wave_pos(t)
+        self._slew_pos = pos
+        self._send_mit_pair(pos)
+        self._maybe_log_hold_mid(t)
+
+    # ── 上限保持中点记录（每个周期一行）──
+    def _on_wave_log_changed(self, checked: bool):
+        self._cfg.set("wave_log", bool(checked))
+        self._update_wave_log_info()
+
+    def _update_wave_log_info(self):
+        if self._wave_log_file:
+            self._wave_log_path_label.setText(
+                f"{_('Juxie.WaveLogFile')}: "
+                f"{os.path.basename(self._wave_log_file)}  "
+                f"({self._wave_log_rows})")
+        else:
+            self._wave_log_path_label.setText(_("Juxie.WaveLogNone"))
+
+    def _on_wave_open_csv(self):
+        path = self._wave_log_file
+        if not path or not os.path.exists(path):
+            self._ctx.status_message(_("Juxie.WaveLogNone"))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_wave_log(self):
+        """开始往复时新建 CSV；未勾选记录则关闭记录。"""
+        self._wave_log_rows = 0
+        self._wave_last_cycle = -1
+        self._wave_log_file = None
+        if not self._wave_log_chk.isChecked():
+            self._update_wave_log_info()
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(_base_dir(), f"juxie_wave_{stamp}.csv")
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                csv.writer(fh).writerow(WAVE_LOG_HEADER)
+        except OSError as exc:
+            logger.warning("创建往复记录文件失败: %s", exc)
+            self._ctx.status_message(_("Juxie.WaveLogFail"))
+            self._update_wave_log_info()
+            return
+        self._wave_log_file = path
+        self._update_wave_log_info()
+        self._ctx.status_message(
+            f"{_('Juxie.WaveLogFile')}: {os.path.basename(path)}", 4000)
+
+    def _maybe_log_hold_mid(self, t: float):
+        """到达「上限保持」时间中点时记录一次（每周期仅一次）。"""
+        if not self._wave_log_file:
+            return
+        t_move = max(1e-6, self._wave_period_spin.value())
+        hi = self._wave_hold_hi_spin.value()
+        lo = self._wave_hold_lo_spin.value()
+        cycle = t_move + hi + lo
+        idx = int(t // cycle)
+        if t % cycle >= t_move * 0.5 + hi * 0.5 and idx != self._wave_last_cycle:
+            self._wave_last_cycle = idx
+            self._write_wave_row(idx + 1, t)
+
+    def _write_wave_row(self, cycle_no: int, t: float):
+        cmd = self._wave_amp_cur          # 本周期实际幅值（随机模式即随机上限角）
+        kp = self._kp_spin.value()
+        kd = self._kd_spin.value()
+        fb0, fb1 = self._fb[0], self._fb[1]
+        p = fb0.position if fb0 is not None else None
+        m = fb1.position if fb1 is not None else None
+        row = [
+            cycle_no, f"{t:.3f}", f"{cmd:.3f}", f"{kp:.3f}", f"{kd:.3f}",
+            "" if p is None else f"{p:.3f}",
+            "" if m is None else f"{m:.3f}",
+            "" if p is None else f"{p - cmd:.3f}",
+            "" if m is None else f"{m + cmd:.3f}",
+        ]
+        try:
+            with open(self._wave_log_file, "a", newline="",
+                      encoding="utf-8-sig") as fh:
+                csv.writer(fh).writerow(row)
+        except OSError as exc:
+            logger.warning("写入往复记录失败: %s", exc)
+            return
+        self._wave_log_rows += 1
+        self._update_wave_log_info()
+
+    def _build_mit_frame(self, clear_err: bool = False,
+                         pos_deg: float | None = None,
+                         dev_id: int | None = None,
+                         mirror: bool = False,
+                         update_label: bool = True) -> CANFrame | None:
+        if dev_id is None:
+            dev_id = self._dev_id_spin.value()
+        if pos_deg is None:
+            pos_deg = self._target_primary()
+        # 镜像电机：前馈扭矩取负（与位置取负一致）
+        torque_nm = (-self._torque_spin.value() if mirror
+                     else self._torque_spin.value())
+        tq_raw = None
+        if self._tq_raw_chk.isChecked():
+            raw = int(self._tq_raw_spin.value())
+            if mirror:
+                # 居中映射关于 2048 对称 -> 4095-raw；有符号则取 12bit 补码
+                raw = ((-raw) & 0x0FFF) if self._torque_signed() else (4095 - raw)
+            tq_raw = raw
         payload = P.build_mit_control(
             dev_id,
             self._enable_chk.isChecked(),
             self._brake_chk.isChecked(),
-            self._clear_err_chk.isChecked(),
-            self._pos_slider.value() / 10.0,
+            clear_err,
+            pos_deg,
             self._vel_spin.value(),
             self._kp_spin.value(),
             self._kd_spin.value(),
-            self._torque_spin.value(),
+            torque_nm,
             self._pos_max_spin.value(),
             self._vel_max_spin.value(),
             self._torque_max_spin.value(),
+            torque_raw=tq_raw,
+            torque_signed=self._torque_signed(),
         )
-        return CANFrame(can_id=P.build_mit_single_canid(dev_id), data=payload,
+        if update_label:
+            self._update_frame_label(payload)
+        return CANFrame(can_id=P.build_mit_single_canid(dev_id),
+                        data=bytes(payload),
                         extended=False, fd=True, brs=True)
 
-    def _send_mit_frame(self, auto: bool = False):
+    def _update_frame_label(self, payload: bytes):
+        """显示最后一帧 MIT 的原始字段，便于核对协议映射是否合理。"""
+        if not hasattr(self, "_frame_label"):
+            return
+        ctrl = payload[0]
+        pos_raw = (payload[1] << 8) | payload[2]
+        vel_raw = (payload[3] << 4) | (payload[4] >> 4)
+        kp_raw = ((payload[4] & 0x0F) << 8) | payload[5]
+        kd_raw = (payload[6] << 4) | (payload[7] >> 4)
+        tq_raw = ((payload[7] & 0x0F) << 8) | payload[8]
+        tq_max = max(1e-9, self._torque_max_spin.value())
+        tq_nm = P.raw_to_torque(tq_raw, tq_max, self._torque_signed())
+        self._frame_label.setText(
+            f"frame: ctrl=0x{ctrl:02X} pos={pos_raw} vel={vel_raw} "
+            f"kp={kp_raw} kd={kd_raw} tq={tq_raw} (~{tq_nm:+.3f} Nm)")
+
+    def _send_mit_frame(self, auto: bool = False, clear_err: bool = False):
         if not self._ctx.is_connected():
             if not auto:
                 self._ctx.status_message(_("Juxie.Err.NotConnected"))
             return
-        frame = self._build_mit_frame()
-        self._ctx.send_frame(frame)
+        # MIT 帧为 9 字节，必须使用 CAN FD
+        if not self._ctx.is_fd_mode():
+            if not auto:
+                self._ctx.status_message(_("Juxie.Err.NeedFd"))
+            return
+        self._send_mit_pair(self._target_primary(), clear_err)
 
     def _on_send_mit(self):
         self._send_mit_frame()
+
+    # ── 清除故障：短促脉冲 ──
+    def _on_clear_error(self):
+        if not self._ctx.is_connected():
+            self._ctx.status_message(_("Juxie.Err.NotConnected"))
+            return
+        if not self._ctx.is_fd_mode():
+            self._ctx.status_message(_("Juxie.Err.NeedFd"))
+            return
+        self._clear_watch_timer.stop()
+        self._clear_burst_left = CLEAR_BURST_FRAMES
+        self._send_clear_tick()
+        self._clear_burst_timer.start()
+
+    def _send_clear_tick(self):
+        if not self._ctx.is_connected() or not self._ctx.is_fd_mode():
+            self._clear_burst_timer.stop()
+            self._clear_burst_left = 0
+            return
+        if self._clear_burst_left <= 0:
+            # 脉冲结束：发一帧释放帧（清错位归 0），再观察反馈错误码
+            self._clear_burst_timer.stop()
+            self._clear_pending = True
+            self._ctx.status_message(_("Juxie.ClearSent"), 3000)
+            self._clear_release_timer.start()
+            self._clear_watch_timer.start(CLEAR_WATCH_MS)
+            return
+        self._clear_burst_left -= 1
+        self._send_mit_pair(self._clear_position(), clear_err=True)
+
+    def _on_clear_watch_timeout(self):
+        if not self._clear_pending:
+            return
+        self._clear_pending = False
+        fb = self._fb[0]
+        if fb is None:
+            self._ctx.status_message(_("Juxie.ClearNoFeedback"), 4000)
+        else:
+            self._ctx.status_message(
+                _("Juxie.ClearFailed").format(code=f"0x{fb.error_code:04X}"), 5000)
+
+    def _hold_position(self) -> float | None:
+        """清错脉冲用的位置目标：保持当前指令/反馈位置，避免顺带的位置阶跃。"""
+        if self._slew_pos is not None:
+            return self._slew_pos
+        if self._fb[0] is not None:
+            return self._fb[0].position
+        return None
+
+    def _clear_position(self) -> float:
+        """清错帧的位置：优先保持位置，其次沿用当前目标（避免误发 0°）。"""
+        pos = self._hold_position()
+        return pos if pos is not None else self._target_primary()
+
+    def _on_clear_release(self):
+        """清错脉冲后发一帧不带清错位的帧，保证下次清错仍有 0→1 跳变。"""
+        if not self._ctx.is_connected() or not self._ctx.is_fd_mode():
+            return
+        self._send_mit_pair(self._clear_position())
+
+    # ── 周期清错 ──
+    def _on_auto_clear_changed(self, checked: bool):
+        self._cfg.set("auto_clear", bool(checked))
+        self._update_clear_timer()
+
+    def _on_clear_interval_changed(self, value: int):
+        self._cfg.set("clear_interval", int(value))
+        self._auto_clear_timer.setInterval(int(value))
+
+    def _update_clear_timer(self):
+        if (self._auto_clear_chk.isChecked() and self._ctx.is_connected()
+                and self._ctx.is_fd_mode()):
+            if not self._auto_clear_timer.isActive():
+                self._on_auto_clear_tick()      # 立即清一次，不必等满一个周期
+            self._auto_clear_timer.start()
+        else:
+            self._auto_clear_timer.stop()
+            self._clear_release_timer.stop()    # 取消挂起的释放帧，避免停止后仍发帧
+
+    def _on_auto_clear_tick(self):
+        if not self._ctx.is_connected() or not self._ctx.is_fd_mode():
+            self._auto_clear_timer.stop()
+            return
+        self._send_mit_pair(self._clear_position(), clear_err=True)
+        # 释放延时取周期的 1/2（不超过 15ms），保证清错位在下一拍之前归 0，
+        # 这样即使周期很短（如 10ms）每拍依然有 0→1 跳变
+        period = max(1, int(self._auto_clear_timer.interval()))
+        release = max(1, min(CLEAR_BURST_MS, period // 2))
+        if not self._clear_release_timer.isActive():
+            # 已在计时的释放帧不重排，避免系统繁忙时被无限推迟（清错位一直为高）
+            self._clear_release_timer.start(release)
+
+    def _stop_clear(self):
+        self._clear_burst_timer.stop()
+        self._clear_watch_timer.stop()
+        self._auto_clear_timer.stop()
+        self._clear_release_timer.stop()
+        self._clear_burst_left = 0
+        self._clear_pending = False
+
+    # ── 标零（CANopen SDO 0x2531=1）──
+    def _on_zero(self):
+        if not self._ctx.is_connected():
+            self._ctx.status_message(_("Juxie.Err.NotConnected"))
+            return
+        if not self._ctx.is_fd_mode():
+            self._ctx.status_message(_("Juxie.Err.NeedFd"))
+            return
+        ret = QMessageBox.warning(
+            self, _("Juxie.Zero"), _("Juxie.ZeroConfirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        # 标零两台电机（与镜像开关无关：主 + 镜像都要标零）
+        ids = list(dict.fromkeys(self._zero_ids()))     # 去重，避免两路同 ID 时重复发
+        for dev_id in ids:
+            self._ctx.send_frame(CANFrame(
+                can_id=P.build_zero_canid(dev_id),
+                data=P.SDO_ZERO_DATA, extended=False, fd=True, brs=True))
+        self._ctx.status_message(_("Juxie.ZeroSent"), 3000)
 
     # ── 反馈处理 ──
 
     def on_frames(self, frames):
         if not self._ctx.is_connected():
             return
-        dev_id = self._dev_id_spin.value()
-        target_id = P.build_feedback_canid(dev_id)
+        ids = self._motor_ids()
+        route = {P.build_feedback_canid(d): m for m, d in enumerate(ids)}
 
         for f in frames:
-            if f.is_tx or f.is_error or f.can_id != target_id:
+            if f.is_tx or f.is_error:
+                continue
+            m = route.get(f.can_id)
+            if m is None:
                 continue
             fb = P.parse_feedback(f.data)
-            if fb is not None:
-                self._feedback = fb
-                self._last_rx = time.monotonic()
-                self._update_feedback_display()
+            if fb is None:
+                continue
+            self._fb[m] = fb
+            self._last_rx[m] = time.monotonic()
+            self._update_feedback_display(m)
+            if self._clear_pending and fb.error_code == 0:
+                self._clear_pending = False
+                self._clear_watch_timer.stop()
+                self._ctx.status_message(_("Juxie.ClearOk"), 4000)
 
-    def _update_feedback_display(self):
-        fb = self._feedback
+    def _update_feedback_display(self, m: int = 0):
+        fb = self._fb[m]
         if fb is None:
             return
+        labels = self._fb_labels[m]
 
-        self._fb_labels["position"].setText(f"{fb.position:+.2f}")
-        self._fb_labels["speed"].setText(str(fb.speed))
-        self._fb_labels["current"].setText(str(fb.current))
-        self._fb_labels["temperature"].setText(f"{fb.temperature:.1f}")
-        self._fb_labels["torque"].setText(
+        labels["position"].setText(f"{fb.position:+.2f}")
+        labels["speed"].setText(str(fb.speed))
+        labels["current"].setText(str(fb.current))
+        labels["temperature"].setText(f"{fb.temperature:.1f}")
+        labels["torque"].setText(
             f"{fb.torque:.2f}" if fb.torque is not None else _("Juxie.NoData"))
-        self._fb_labels["error_code"].setText(f"0x{fb.error_code:04X}")
-        self._fb_labels["mode_feedback"].setText(self._mode_name(fb.mode_feedback))
+        labels["error_code"].setText(f"0x{fb.error_code:04X}")
+        labels["mode_feedback"].setText(self._mode_name(fb.mode_feedback))
 
         if fb.error_code != 0:
-            self._fb_labels["error_code"].setStyleSheet(f"color: {_ERR}; font-weight: 600;")
+            labels["error_code"].setStyleSheet(f"color: {_ERR}; font-weight: 600;")
         else:
-            self._fb_labels["error_code"].setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
+            labels["error_code"].setStyleSheet(f"color: {_OK}; font-weight: 600;")
 
         status_parts = []
         status_parts.append(_("Juxie.Status.Enabled") if fb.enabled else _("Juxie.Status.Disabled"))
         status_parts.append(_("Juxie.Status.BrakeOff") if fb.brake_released else _("Juxie.Status.BrakeOn"))
         status_parts.append(_("Juxie.Status.Error") if fb.has_error else _("Juxie.Status.Normal"))
         status_parts.append(_("Juxie.Status.InPosition") if fb.position_reached else _("Juxie.Status.Running"))
-        self._fb_status.setText("  |  ".join(status_parts))
+        self._fb_status[m].setText("  |  ".join(status_parts))
 
-        age = time.monotonic() - self._last_rx
+        age = time.monotonic() - self._last_rx[m]
         if age < 2.0:
-            self._fb_update.setText(f"{_('Juxie.LastUpdate')}: {age:.1f}s")
-            self._fb_update.setStyleSheet(f"color: {_OK};")
+            self._fb_update[m].setText(f"{_('Juxie.LastUpdate')}: {age:.1f}s")
+            self._fb_update[m].setStyleSheet(f"color: {_OK};")
         else:
-            self._fb_update.setText(_("Juxie.Offline"))
-            self._fb_update.setStyleSheet(f"color: {_WARN};")
+            self._fb_update[m].setText(_("Juxie.Offline"))
+            self._fb_update[m].setStyleSheet(f"color: {_WARN};")
 
     def _mode_name(self, mode_val: int) -> str:
         name_map = {
@@ -441,36 +1531,93 @@ class JuxieMotorPanel(QWidget):
     # ── 生命周期 ──
 
     def on_activated(self):
-        pass
+        self._update_req_timer()
+        self._update_mit_timer()
+        self._update_clear_timer()
 
     def on_deactivating(self):
-        pass
+        self._req_timer.stop()
+        self._mit_timer.stop()
+        self._wave_timer.stop()
+        self._wave_on = False
+        self._stop_clear()
 
     def on_connect(self):
-        self._feedback = None
+        self._fb = [None, None]
+        self._last_rx = [0.0, 0.0]
+        self._slew_pos = None
         self._clear_feedback_display()
+        self._update_req_timer()
+        self._update_mit_timer()
+        self._update_clear_timer()
 
     def on_disconnect(self):
-        self._feedback = None
+        self._req_timer.stop()
+        self._mit_timer.stop()
+        self._stop_wave(send_zero=False)
+        self._stop_clear()
+        self._fb = [None, None]
+        self._last_rx = [0.0, 0.0]
+        self._slew_pos = None
         self._clear_feedback_display()
-        self._fb_update.setText(_("Juxie.Offline"))
-        self._fb_update.setStyleSheet(f"color: {_WARN};")
+        for up in self._fb_update:
+            up.setText(_("Juxie.Offline"))
+            up.setStyleSheet(f"color: {_WARN};")
 
     def _clear_feedback_display(self):
-        for key in self._fb_labels:
-            self._fb_labels[key].setText(_("Juxie.NoData"))
-            self._fb_labels[key].setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
-        self._fb_status.setText("")
-        self._fb_update.setText("")
+        for m in (0, 1):
+            for key in self._fb_labels[m]:
+                lbl = self._fb_labels[m][key]
+                lbl.setText(_("Juxie.NoData"))
+                lbl.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+            self._fb_status[m].setText("")
+            self._fb_update[m].setText("")
 
     def refresh_language(self):
         self._update_id_label()
         self._update_pos_label()
+        self._update_ranges()
         self._sync_btn.setText(_("Juxie.RequestFeedback"))
         self._send_btn.setText(_("Juxie.SendMIT"))
+        self._frame_label.setToolTip(_("Juxie.FrameTip"))
+        self._tq_raw_chk.setText(_("Juxie.TorqueRaw"))
+        self._tq_raw_chk.setToolTip(_("Juxie.TorqueRawTip"))
+        self._tq_raw_spin.setToolTip(_("Juxie.TorqueRawTip"))
+        self._tq_zero_combo.setToolTip(_("Juxie.TorqueZeroTip"))
+        cur = self._tq_zero_combo.currentData()
+        self._tq_zero_combo.blockSignals(True)
+        self._tq_zero_combo.setItemText(0, _("Juxie.TorqueZeroOffset"))
+        self._tq_zero_combo.setItemText(1, _("Juxie.TorqueZeroSigned"))
+        self._tq_zero_combo.setCurrentIndex(max(0, self._tq_zero_combo.findData(cur)))
+        self._tq_zero_combo.blockSignals(False)
+        self._dev_id_label.setText(_("Juxie.DevID"))
+        self._mirror_chk.setText(_("Juxie.Mirror"))
+        self._mirror_id_label.setText(_("Juxie.MirrorID"))
+        self._target_max_label.setText(_("Juxie.TargetMax"))
         self._enable_chk.setText(_("Juxie.Enable"))
         self._brake_chk.setText(_("Juxie.Brake"))
-        self._clear_err_chk.setText(_("Juxie.ClearError"))
+        self._clear_err_btn.setText(_("Juxie.ClearError"))
+        self._zero_btn.setText(_("Juxie.Zero"))
         self._auto_send_chk.setText(_("Juxie.AutoSend"))
-        if self._feedback is not None:
-            self._update_feedback_display()
+        self._auto_req_chk.setText(_("Juxie.AutoRequest"))
+        self._req_label.setText(_("Juxie.ReqInterval"))
+        self._mit_cont_chk.setText(_("Juxie.Continuous"))
+        self._mit_int_label.setText(_("Juxie.MitInterval"))
+        self._slew_label.setText(_("Juxie.SlewRate"))
+        self._auto_clear_chk.setText(_("Juxie.AutoClear"))
+        self._auto_clear_label.setText(_("Juxie.ClearInterval"))
+        self._wave_amp_label.setText(_("Juxie.WaveAmp"))
+        self._wave_period_label.setText(_("Juxie.WavePeriod"))
+        self._wave_hold_hi_label.setText(_("Juxie.WaveHoldHi"))
+        self._wave_hold_lo_label.setText(_("Juxie.WaveHoldLo"))
+        self._wave_iv_label.setText(_("Juxie.WaveInterval"))
+        self._update_wave_buttons()
+        self._update_wave_info_live()
+        self._wave_log_chk.setText(_("Juxie.WaveLog"))
+        self._wave_open_btn.setText(_("Juxie.WaveOpenCsv"))
+        self._update_wave_log_info()
+        for lbl, key in self._fb_field_labels:
+            lbl.setText(_(key))
+        self._update_fb_headers()
+        for m in (0, 1):
+            self._update_feedback_display(m)

@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
-from typing import Deque, Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List
 
 from PySide6.QtCore import (Qt, QAbstractTableModel, QModelIndex, Signal,
                             QTimer)
@@ -20,7 +19,7 @@ from . import icons as icon_lib
 logger = logging.getLogger("cangui.trace")
 
 
-DEFAULT_MAX_ROWS = 30_000
+DEFAULT_MAX_ROWS = 10_000
 
 
 class TraceModel(QAbstractTableModel):
@@ -34,17 +33,37 @@ class TraceModel(QAbstractTableModel):
         super().__init__(parent)
         self._header_labels = self._make_headers()
         # 完整数据存储：永远不折叠，按时间顺序保留所有帧
-        self._rows: Deque[CANFrame] = deque(maxlen=max_rows)
-        self._meta: Deque[dict]     = deque(maxlen=max_rows)
-        self._text: Deque[list]     = deque(maxlen=max_rows)
+        # 用 list（而非 deque）：data() 每个单元格都要按下标取行，
+        # deque 随机访问是 O(n)，10k 行时单次重绘可达十几毫秒。
+        self._max_rows = max_rows
+        self._rows: List[CANFrame] = []
+        self._text: List[list] = []
         self._counts: Dict[Tuple[int, bool], int] = {}
         self._last_ts: Dict[Tuple[int, bool], float] = {}
         self._period:  Dict[Tuple[int, bool], float] = {}
+        # 每个 cid 当前仍存活于 _rows 的帧数：淘汰时 O(1) 维护统计字典
+        self._live: Dict[Tuple[int, bool], int] = {}
         self._collapse = False
         # 折叠视图层：仅影响显示，不影响 _rows 存储
         # _view_rows[vis_pos] = _rows 真实索引；每个 cid 只占一个 vis_pos
         self._view_rows: List[int] = []
         self._cid_to_vis: Dict[Tuple[int, bool], int] = {}
+        # 画刷缓存（避免 data() 每次新建 QBrush/QColor）
+        self._brush_tx = QBrush(QColor(BG_TX))
+        self._brush_err = QBrush(QColor(BG_ERROR))
+        self._brush_fg_tx = QBrush(QColor(FG_ACCENT))
+        self._brush_fg_dim = QBrush(QColor(FG_DIM))
+        self._fg_cache: Dict[Tuple[int, bool], QBrush] = {}
+
+    def _fg_brush(self, can_id: int, extended: bool) -> QBrush:
+        key = (can_id, extended)
+        brush = self._fg_cache.get(key)
+        if brush is None:
+            if len(self._fg_cache) > 4096:
+                self._fg_cache.clear()
+            brush = QBrush(QColor(id_color(can_id, extended)))
+            self._fg_cache[key] = brush
+        return brush
 
     # ---------- Qt model interface ---------- #
     def rowCount(self, parent=QModelIndex()):
@@ -64,7 +83,7 @@ class TraceModel(QAbstractTableModel):
         return None
 
     @staticmethod
-    def _format_row(frame: CANFrame, meta: dict) -> list:
+    def _format_row(frame: CANFrame, dt: float, period: float, count: int) -> list:
         t = frame.timestamp % 1000.0
         ch = "ERR" if frame.is_error else ("TX" if frame.is_tx else "CAN1")
         if frame.is_error:
@@ -99,9 +118,9 @@ class TraceModel(QAbstractTableModel):
             typ,
             dlc,
             data,
-            f"{meta['dt']:.1f}" if meta['dt'] else "",
-            f"{meta['period']:.1f}" if meta['period'] else "",
-            str(meta['count']),
+            f"{dt:.1f}" if dt else "",
+            f"{period:.1f}" if period else "",
+            str(count),
         ]
 
     def data(self, index, role=Qt.DisplayRole):
@@ -123,17 +142,17 @@ class TraceModel(QAbstractTableModel):
 
         if role == Qt.BackgroundRole:
             if f.is_error:
-                return QBrush(QColor(BG_ERROR))
+                return self._brush_err
             if f.is_tx:
-                return QBrush(QColor(BG_TX))
+                return self._brush_tx
 
         if role == Qt.ForegroundRole:
             if f.is_tx:
-                return QBrush(QColor(FG_ACCENT))
+                return self._brush_fg_tx
             if f.rtr:
-                return QBrush(QColor(FG_DIM))
+                return self._brush_fg_dim
             if not f.is_error:
-                return QBrush(QColor(id_color(f.can_id, f.extended)))
+                return self._fg_brush(f.can_id, f.extended)
 
         if role == Qt.TextAlignmentRole:
             if col in (self.COL_DLC, self.COL_COUNT):
@@ -145,83 +164,94 @@ class TraceModel(QAbstractTableModel):
         return None
 
     # ---------- public methods ---------- #
-    def add_frame(self, frame: CANFrame):
+    def _prepare(self, frame: CANFrame) -> list:
+        """更新统计并格式化一行（不触碰模型结构）。"""
         cid = (frame.can_id, frame.extended)
         now = frame.timestamp
-        self._counts[cid] = self._counts.get(cid, 0) + 1
-
+        count = self._counts.get(cid, 0) + 1
+        self._counts[cid] = count
         dt = 0.0
-        if cid in self._last_ts:
-            dt = (now - self._last_ts[cid]) * 1000.0
+        last = self._last_ts.get(cid)
+        if last is not None:
+            dt = (now - last) * 1000.0
             old = self._period.get(cid, dt)
             self._period[cid] = old * 0.7 + dt * 0.3
         self._last_ts[cid] = now
         period = self._period.get(cid, 0.0)
-        count = self._counts[cid]
-        meta = {"dt": dt, "period": period, "count": count}
-        txt = self._format_row(frame, meta)
+        return self._format_row(frame, dt, period, count)
 
-        if self._collapse:
-            # 折叠模式：_rows 始终保留所有帧，_view_rows 仅维护显示索引
-            will_drop = len(self._rows) == self._rows.maxlen
-            if will_drop:
-                # popleft 会让 _view_rows 中所有索引失效，整表重建
-                self.beginResetModel()
-                self._rows.popleft()
-                self._meta.popleft()
-                self._text.popleft()
-                self._rows.append(frame)
-                self._meta.append(meta)
-                self._text.append(txt)
-                self._rebuild_view()
-                self.endResetModel()
-                return
+    def _release(self, cid: Tuple[int, bool]) -> None:
+        """淘汰一帧后维护计数；该 cid 全部淘汰时清理统计字典（O(1)）。"""
+        live = self._live.get(cid, 1) - 1
+        if live > 0:
+            self._live[cid] = live
+            return
+        self._live.pop(cid, None)
+        self._counts.pop(cid, None)
+        self._last_ts.pop(cid, None)
+        self._period.pop(cid, None)
 
-            new_row_idx = len(self._rows)
-            vis_pos = self._cid_to_vis.get(cid)
-            if vis_pos is not None:
-                # cid 已存在视图：仅更新指向，触发该行重绘
-                self._rows.append(frame)
-                self._meta.append(meta)
-                self._text.append(txt)
-                self._view_rows[vis_pos] = new_row_idx
-                self.dataChanged.emit(
-                    self.index(vis_pos, 0),
-                    self.index(vis_pos, self.columnCount() - 1),
-                )
-            else:
-                # 新 cid：在视图末尾追加一行
-                vis_pos = len(self._view_rows)
-                self._cid_to_vis[cid] = vis_pos
-                self.beginInsertRows(QModelIndex(), vis_pos, vis_pos)
-                self._rows.append(frame)
-                self._meta.append(meta)
-                self._text.append(txt)
-                self._view_rows.append(new_row_idx)
-                self.endInsertRows()
+    def add_frame(self, frame: CANFrame):
+        self.add_frames((frame,))
+
+    def add_frames(self, frames):
+        """批量写入：整批只做一次插入（及一次淘汰）模型变更。
+
+        相比逐帧 begin/endInsertRows，可把每批 1000 帧的模型通知从 2000 次
+        降到 2 次，是高频收帧不卡的关键。
+        """
+        if not isinstance(frames, (list, tuple)):
+            frames = list(frames)
+        n = len(frames)
+        if n == 0:
             return
 
-        # 非折叠模式：_rows 索引 == 显示行号
-        if len(self._rows) == self._rows.maxlen:
-            self.beginRemoveRows(QModelIndex(), 0, 0)
-            old = self._rows[0]
-            self._rows.popleft()
-            self._meta.popleft()
-            self._text.popleft()
-            old_cid = (old.can_id, old.extended)
-            # 若该 ID 已无任何帧，清理统计字典避免无限增长
-            if not any((f.can_id, f.extended) == old_cid for f in self._rows):
-                self._counts.pop(old_cid, None)
-                self._last_ts.pop(old_cid, None)
-                self._period.pop(old_cid, None)
+        if self._collapse:
+            self._add_frames_collapsed(frames)
+            return
+
+        cap = self._max_rows
+        overflow = len(self._rows) + n - cap if cap else 0
+        # 先淘汰，再统计，避免同一 cid 的计数被清掉
+        if overflow > 0:
+            self.beginRemoveRows(QModelIndex(), 0, overflow - 1)
+            dropped = self._rows[:overflow]
+            del self._rows[:overflow]
+            del self._text[:overflow]
+            for old in dropped:
+                self._release((old.can_id, old.extended))
             self.endRemoveRows()
 
+        texts = [self._prepare(f) for f in frames]
         pos = len(self._rows)
-        self.beginInsertRows(QModelIndex(), pos, pos)
-        self._rows.append(frame)
-        self._meta.append(meta)
-        self._text.append(txt)
+        self.beginInsertRows(QModelIndex(), pos, pos + n - 1)
+        for frame, txt in zip(frames, texts):
+            self._rows.append(frame)
+            self._text.append(txt)
+            cid = (frame.can_id, frame.extended)
+            self._live[cid] = self._live.get(cid, 0) + 1
         self.endInsertRows()
+
+    def _add_frames_collapsed(self, frames):
+        """折叠模式：整批一次 reset（最多每批一次，而不是每帧一次）。"""
+        n = len(frames)
+        cap = self._max_rows
+        overflow = len(self._rows) + n - cap if cap else 0
+        texts = [self._prepare(f) for f in frames]
+        self.beginResetModel()
+        if overflow > 0:
+            dropped = self._rows[:overflow]
+            del self._rows[:overflow]
+            del self._text[:overflow]
+            for old in dropped:
+                self._release((old.can_id, old.extended))
+        for frame, txt in zip(frames, texts):
+            self._rows.append(frame)
+            self._text.append(txt)
+            cid = (frame.can_id, frame.extended)
+            self._live[cid] = self._live.get(cid, 0) + 1
+        self._rebuild_view()
+        self.endResetModel()
 
     def _rebuild_view(self):
         """从 _rows 重建折叠视图索引。
@@ -267,14 +297,18 @@ class TraceModel(QAbstractTableModel):
     def clear(self):
         self.beginResetModel()
         self._rows.clear()
-        self._meta.clear()
         self._text.clear()
         self._counts.clear()
         self._last_ts.clear()
         self._period.clear()
+        self._live.clear()
         self._view_rows.clear()
         self._cid_to_vis.clear()
         self.endResetModel()
+
+    def unique_count(self) -> int:
+        """当前保留帧涉及的唯一 ID 数（不构造列表，供状态栏使用）。"""
+        return len(self._counts)
 
     def id_summary(self):
         result = []
@@ -336,7 +370,6 @@ class TraceView(QTableView):
 
 
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
-        self.verticalScrollBar().rangeChanged.connect(self._on_range)
 
     def _on_scroll(self, _):
         sb = self.verticalScrollBar()
@@ -347,12 +380,20 @@ class TraceView(QTableView):
         if newSize < mn:
             self.horizontalHeader().resizeSection(logicalIndex, mn)
 
-    def _on_range(self, _min, _max):
-        if self._auto_scroll:
-            self.verticalScrollBar().setValue(_max)
+    def add_frames(self, frames):
+        # 整批插入期间暂停重绘，结束后只刷新一次（视觉结果不变）
+        self.setUpdatesEnabled(False)
+        try:
+            self._model.add_frames(frames)
+            if self._auto_scroll:
+                # 每批只滚动一次（原先每次 rangeChanged 都 setValue，等于每帧滚动一次）
+                self.scrollToBottom()
+        finally:
+            self.setUpdatesEnabled(True)
+            self.viewport().update()
 
     def add_frame(self, frame: CANFrame):
-        self._model.add_frame(frame)
+        self.add_frames((frame,))
 
     def clear(self):
         self._model.clear()
@@ -362,6 +403,9 @@ class TraceView(QTableView):
 
     def id_summary(self):
         return self._model.id_summary()
+
+    def unique_count(self):
+        return self._model.unique_count()
 
     def selected_frames(self):
         rows = sorted({i.row() for i in self.selectionModel().selectedIndexes()})
@@ -445,18 +489,20 @@ class TracePanel(QWidget):
 
     def _update_summary(self):
         n = self._frame_count
-        ids = self.view.id_summary()
-        uniq = len(ids)
+        uniq = self.view.unique_count()
         mode = _("Trace.ModeCollapsed") if self.collapse_chk.isChecked() else _("Trace.ModeAll")
         self.summary_label.setText(
             f"{_("Trace.Received")} {n} {_("Trace.Frames")}   {_("Trace.UniqueIDs")} {uniq}   [{mode}]"
         )
 
-    def append_frame(self, frame: CANFrame):
-        if self._paused:
+    def append_frames(self, frames):
+        if self._paused or not frames:
             return
-        self.view.add_frame(frame)
-        self._frame_count += 1
+        self.view.add_frames(frames)
+        self._frame_count += len(frames)
+
+    def append_frame(self, frame: CANFrame):
+        self.append_frames((frame,))
 
     def refresh_language(self):
         self.clear_btn.setText(_("Trace.Clear"))
