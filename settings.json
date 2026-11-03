@@ -1,5 +1,7 @@
 {
-  "plugin.active_list": [],
+  "plugin.active_list": [
+    "juxie_motor"
+  ],
   "bitrate": 1000000,
   "fd_mode": true,
   "data_bitrate": 1000000,
@@ -22,7 +24,7 @@
   "plugin.boot_upgrade.fw_version": 1,
   "plugin.boot_upgrade.frame_size": 64,
   "plugin.boot_upgrade.fw_path": "C:/Users/32457/Desktop/stm32_workspace_/stm32_g474_boot/stm32_g474_boot.bin",
-  "active_tab": "trace",
+  "active_tab": "plugin.juxie_motor",
   "plugin.power_monitor.auto_request": true,
   "plugin.power_monitor.feedback_mask": 127,
   "plugin.power_monitor.req_interval": 1000,
@@ -51,7 +53,15 @@
   "plugin.juxie_motor.wave_amp": 30.0,
   "plugin.juxie_motor.wave_period": 3.0,
   "plugin.juxie_motor.wave_hold_hi": 5.0,
-  "plugin.juxie_motor.wave_hold_lo": 3.0,
+  "plugin.juxie_motor.wave_hold_lo": 2.0,
   "plugin.battery_monitor.auto_poll": false,
-  "paused": false
+  "paused": false,
+  "plugin.juxie_motor.sdo_torque_nm": 9.5,
+  "plugin.juxie_motor.sdo_mode": "current",
+  "plugin.juxie_motor.sdo_current_ma": 200,
+  "plugin.juxie_motor.target_pos": 287,
+  "plugin.juxie_motor.target_vel": 0.0,
+  "plugin.juxie_motor.kp": 0.0,
+  "plugin.juxie_motor.kd": 0.0,
+  "plugin.juxie_motor.target_torque": 1.0
 }

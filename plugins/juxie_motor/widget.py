@@ -61,6 +61,17 @@ CLEAR_BURST_FRAMES = 5
 CLEAR_BURST_MS = 15
 CLEAR_WATCH_MS = 1500
 
+# SDO 序列逐帧间隔（6040h 使能序列 + 6060h 模式 + 6071h 目标）
+SDO_STEP_MS = 40
+# 序列发完后等待 6060h 读回的时限
+SDO_READ_MS = 400
+# 6060h 模式 → 反馈报文里的模式值（§2.2 Byte[14]）
+SDO_MODE_FEEDBACK = {
+    10: 5,      # CST/项目电流模式 → 反馈「电流环」
+    5: 5,       # 项目原生电流模式
+    7: 6,       # 力矩传感器闭环 → 反馈「力矩环」
+}
+
 # 往复记录 CSV 表头（每个上限保持中点记录一行）
 WAVE_LOG_HEADER = ["cycle", "elapsed_s", "cmd_max_deg", "kp", "kd",
                    "primary_fb_deg", "mirror_fb_deg",
@@ -116,6 +127,9 @@ class _ConfigStore:
         "wave_hold_lo": 5.0,
         "wave_interval": 10,
         "wave_log": True,
+        "sdo_current_ma": 500,
+        "sdo_torque_nm": 1.0,
+        "sdo_mode": "current",
     }
 
     def __init__(self, ctx):
@@ -157,6 +171,13 @@ class JuxieMotorPanel(QWidget):
         self._clear_burst_left = 0
         self._clear_pending = False
 
+        # SDO 电流/力矩模式下发（逐帧间隔，避免驱动器来不及处理）
+        self._sdo_queue: list = []
+        self._sdo_what = ""
+        self._sdo_expect_mode = 0
+        self._sdo_retried = False
+        self._sdo_retry_args = None
+
         self._build_ui()
         self._load_config()
 
@@ -192,6 +213,18 @@ class JuxieMotorPanel(QWidget):
         self._wave_timer.setInterval(int(self._cfg.get("wave_interval")))
         self._wave_timer.timeout.connect(self._on_wave_tick)
 
+        # SDO 序列发送
+        self._sdo_timer = QTimer(self)
+        self._sdo_timer.setSingleShot(True)
+        self._sdo_timer.setInterval(SDO_STEP_MS)
+        self._sdo_timer.timeout.connect(self._sdo_step)
+
+        # 模式读回超时
+        self._sdo_read_timer = QTimer(self)
+        self._sdo_read_timer.setSingleShot(True)
+        self._sdo_read_timer.setInterval(SDO_READ_MS)
+        self._sdo_read_timer.timeout.connect(self._on_sdo_read_timeout)
+
     # ── UI 构建 ──
 
     def _build_ui(self):
@@ -208,6 +241,7 @@ class JuxieMotorPanel(QWidget):
 
         root.addWidget(self._build_dev_config())
         root.addWidget(self._build_mit_control())
+        root.addWidget(self._build_sdo())
         root.addWidget(self._build_wave())
         root.addWidget(self._build_feedback())
         root.addStretch(1)
@@ -481,6 +515,192 @@ class JuxieMotorPanel(QWidget):
         self._frame_label.setToolTip(_("Juxie.FrameTip"))
         outer.addWidget(self._frame_label)
         return box
+
+    # ── SDO 电流 / 力矩控制（文档 §4.3）──
+    def _build_sdo(self) -> QGroupBox:
+        box = QGroupBox(_("Juxie.Sdo"))
+        lay = QVBoxLayout(box)
+        lay.setSpacing(4)
+
+        row = QHBoxLayout()
+        self._sdo_cur_label = QLabel(_("Juxie.SdoCurrent"))
+        row.addWidget(self._sdo_cur_label)
+        self._sdo_current_spin = _IntSpin()
+        self._sdo_current_spin.setRange(0, P.CURRENT_MAX_MA)
+        self._sdo_current_spin.setSingleStep(50)
+        self._sdo_current_spin.setValue(int(self._cfg.get("sdo_current_ma")))
+        self._sdo_current_spin.setSuffix(" mA")
+        self._sdo_current_spin.valueChanged.connect(self._on_sdo_current_changed)
+        row.addWidget(self._sdo_current_spin)
+        self._sdo_cur_btn = QPushButton(_("Juxie.SdoApplyCurrent"))
+        self._sdo_cur_btn.clicked.connect(self._on_sdo_current)
+        row.addWidget(self._sdo_cur_btn)
+
+        row.addSpacing(14)
+        self._sdo_tq_label = QLabel(_("Juxie.SdoTorque"))
+        row.addWidget(self._sdo_tq_label)
+        self._sdo_torque_spin = _FloatSpin()
+        self._sdo_torque_spin.setRange(0.0, 6553.5)
+        self._sdo_torque_spin.setDecimals(1)
+        self._sdo_torque_spin.setSingleStep(0.1)
+        self._sdo_torque_spin.setValue(float(self._cfg.get("sdo_torque_nm")))
+        self._sdo_torque_spin.setSuffix(" N·m")
+        self._sdo_torque_spin.valueChanged.connect(self._on_sdo_torque_changed)
+        row.addWidget(self._sdo_torque_spin)
+        self._sdo_tq_btn = QPushButton(_("Juxie.SdoApplyTorque"))
+        self._sdo_tq_btn.clicked.connect(self._on_sdo_torque)
+        row.addWidget(self._sdo_tq_btn)
+
+        row.addStretch(1)
+        self._sdo_zero_btn = QPushButton(_("Juxie.SdoZero"))
+        self._sdo_zero_btn.clicked.connect(self._on_sdo_zero)
+        row.addWidget(self._sdo_zero_btn)
+        lay.addLayout(row)
+
+        self._sdo_hint = QLabel(_("Juxie.SdoHint"))
+        self._sdo_hint.setStyleSheet(f"color: {_DIM};")
+        self._sdo_hint.setWordWrap(True)
+        lay.addWidget(self._sdo_hint)
+
+        self._sdo_status = QLabel(_("Juxie.SdoIdle"))
+        self._sdo_status.setStyleSheet(f"color: {_DIM};")
+        lay.addWidget(self._sdo_status)
+        return box
+
+    def _on_sdo_current_changed(self, value: int):
+        self._cfg.set("sdo_current_ma", int(value))
+
+    def _on_sdo_torque_changed(self, value: float):
+        self._cfg.set("sdo_torque_nm", float(value))
+
+    def _sdo_ready(self) -> bool:
+        if not self._ctx.is_connected():
+            self._ctx.status_message(_("Juxie.Err.NotConnected"), 3000)
+            return False
+        if not self._ctx.is_fd_mode():
+            self._ctx.status_message(_("Juxie.Err.NeedFd"), 3000)
+            return False
+        return True
+
+    def _stop_mode_conflicts(self):
+        """进入 SDO 电流/力矩模式前，停掉会改写运行模式的 MIT 连续下发。"""
+        if self._mit_cont_chk.isChecked():
+            self._mit_cont_chk.setChecked(False)
+        if self._wave_on:
+            self._stop_wave(send_zero=False)
+        if self._auto_clear_chk.isChecked():
+            self._auto_clear_chk.setChecked(False)
+
+    def _start_sdo(self, frames, what: str, expect_mode: int = 0,
+                   retry=None):
+        if not self._sdo_ready():
+            return
+        self._stop_mode_conflicts()
+        self._sdo_queue = list(frames)
+        self._sdo_what = what
+        self._sdo_expect_mode = int(expect_mode)
+        self._sdo_retried = False
+        self._sdo_retry_args = retry
+        self._sdo_status.setText(_("Juxie.SdoSending").format(what=what))
+        self._sdo_status.setStyleSheet(f"color: {_WARN};")
+        self._sdo_step()
+
+    def _sdo_step(self):
+        if not self._ctx.is_connected():
+            self._sdo_queue = []
+            return
+        if not self._sdo_queue:
+            self._sdo_finish()
+            return
+        frame = self._sdo_queue.pop(0)
+        self._ctx.send_frame(frame)
+        logger.info("SDO TX id=0x%03X %s", frame.can_id, frame.data.hex(" "))
+        if self._sdo_queue:
+            self._sdo_timer.start()
+
+    def _sdo_finish(self):
+        if not self._sdo_what:
+            return
+        if not self._sdo_expect_mode:
+            self._sdo_status.setText(_("Juxie.SdoSent").format(what=self._sdo_what))
+            self._sdo_status.setStyleSheet(f"color: {_OK};")
+            return
+        # 序列发完：读回 6060h，确认驱动器真的切到了目标模式
+        self._sdo_status.setText(_("Juxie.SdoVerify").format(what=self._sdo_what))
+        self._sdo_status.setStyleSheet(f"color: {_WARN};")
+        self._ctx.send_frame(P.build_sdo_read(self._dev_id_spin.value(), P.OBJ_MODES))
+        self._sdo_read_timer.start()
+
+    def _sdo_success(self):
+        self._sdo_read_timer.stop()
+        mode = self._sdo_expect_mode
+        self._sdo_expect_mode = 0
+        self._sdo_retry_args = None
+        self._sdo_status.setText(_("Juxie.SdoModeOk").format(mode=mode))
+        self._sdo_status.setStyleSheet(f"color: {_OK};")
+
+    def _sdo_fail(self, key: str, **kw):
+        if self._sdo_expect_mode and not self._sdo_retried and self._sdo_retry_args:
+            mode, target = self._sdo_retry_args
+            self._sdo_retried = True
+            self._sdo_queue = P.build_mode_sequence_before_enable(
+                self._dev_id_spin.value(), mode, target)
+            self._sdo_status.setText(_("Juxie.SdoRetry"))
+            self._sdo_status.setStyleSheet(f"color: {_WARN};")
+            logger.warning("SDO mode not applied (%s) -> retry mode-before-enable",
+                           key)
+            self._sdo_step()
+            return
+        self._sdo_read_timer.stop()
+        self._sdo_expect_mode = 0
+        self._sdo_retry_args = None
+        self._sdo_status.setText(_(key).format(**kw))
+        self._sdo_status.setStyleSheet(f"color: {_ERR};")
+        logger.warning("SDO mode verification failed: %s %s", key, kw)
+
+    def _on_sdo_read_timeout(self):
+        self._sdo_fail("Juxie.SdoNoReply")
+
+    def _on_sdo_response(self, data):
+        parsed = P.parse_sdo_response(data)
+        if parsed is None:
+            return
+        index, value = parsed
+        logger.info("SDO RX index=0x%04X value=%s", index, value)
+        if index != P.OBJ_MODES or not self._sdo_expect_mode:
+            return
+        if value is None:
+            self._sdo_fail("Juxie.SdoModeAbort")
+        elif value == self._sdo_expect_mode:
+            self._sdo_success()
+        else:
+            self._sdo_fail("Juxie.SdoModeMismatch", mode=value)
+
+    def _on_sdo_current(self):
+        ma = int(self._sdo_current_spin.value())
+        self._cfg.set("sdo_current_ma", ma)
+        self._cfg.set("sdo_mode", "current")
+        self._start_sdo(
+            P.build_current_mode_sequence(self._dev_id_spin.value(), ma),
+            _("Juxie.SdoWhatCurrent").format(ma=ma),
+            expect_mode=P.MODE_CST_PROJECT,
+            retry=(P.MODE_CST_PROJECT, ma))
+
+    def _on_sdo_torque(self):
+        nm = float(self._sdo_torque_spin.value())
+        self._cfg.set("sdo_torque_nm", nm)
+        self._cfg.set("sdo_mode", "torque")
+        raw = max(0, min(0xFFFF, int(round(nm / P.TORQUE_LSB_NM))))
+        self._start_sdo(
+            P.build_torque_mode_sequence(self._dev_id_spin.value(), nm),
+            _("Juxie.SdoWhatTorque").format(nm=nm),
+            expect_mode=P.MODE_TORQUE_SENSOR,
+            retry=(P.MODE_TORQUE_SENSOR, raw))
+
+    def _on_sdo_zero(self):
+        self._start_sdo(
+            [P.build_sdo_target(self._dev_id_spin.value(), 0)],
+            _("Juxie.SdoWhatZero"))
 
     def _build_wave(self) -> QGroupBox:
         box = QGroupBox(_("Juxie.Wave"))
@@ -1463,9 +1683,14 @@ class JuxieMotorPanel(QWidget):
             return
         ids = self._motor_ids()
         route = {P.build_feedback_canid(d): m for m, d in enumerate(ids)}
+        sdo_resp_ids = {P.SDO_RESP_ID_BASE | d for d in ids}
+        sdo_resp_ids.add(P.SDO_RESP_ID_BASE | self._dev_id_spin.value())
 
         for f in frames:
             if f.is_tx or f.is_error:
+                continue
+            if f.can_id in sdo_resp_ids:
+                self._on_sdo_response(f.data)
                 continue
             m = route.get(f.can_id)
             if m is None:
@@ -1476,6 +1701,10 @@ class JuxieMotorPanel(QWidget):
             self._fb[m] = fb
             self._last_rx[m] = time.monotonic()
             self._update_feedback_display(m)
+            if (self._sdo_expect_mode
+                    and fb.mode_feedback == SDO_MODE_FEEDBACK.get(
+                        self._sdo_expect_mode)):
+                self._sdo_success()
             if self._clear_pending and fb.error_code == 0:
                 self._clear_pending = False
                 self._clear_watch_timer.stop()
@@ -1524,6 +1753,7 @@ class JuxieMotorPanel(QWidget):
             0x04: "Juxie.Mode.CSV",
             0x05: "Juxie.Mode.Current",
             0x06: "Juxie.Mode.Torque",
+            0x0A: "Juxie.Mode.MIT",
         }
         key = name_map.get(mode_val)
         return _(key) if key else f"0x{mode_val:02X}"
@@ -1540,6 +1770,11 @@ class JuxieMotorPanel(QWidget):
         self._mit_timer.stop()
         self._wave_timer.stop()
         self._wave_on = False
+        self._sdo_timer.stop()
+        self._sdo_read_timer.stop()
+        self._sdo_expect_mode = 0
+        self._sdo_retry_args = None
+        self._sdo_queue = []
         self._stop_clear()
 
     def on_connect(self):
@@ -1554,6 +1789,11 @@ class JuxieMotorPanel(QWidget):
     def on_disconnect(self):
         self._req_timer.stop()
         self._mit_timer.stop()
+        self._sdo_timer.stop()
+        self._sdo_read_timer.stop()
+        self._sdo_expect_mode = 0
+        self._sdo_retry_args = None
+        self._sdo_queue = []
         self._stop_wave(send_zero=False)
         self._stop_clear()
         self._fb = [None, None]
@@ -1615,6 +1855,12 @@ class JuxieMotorPanel(QWidget):
         self._update_wave_info_live()
         self._wave_log_chk.setText(_("Juxie.WaveLog"))
         self._wave_open_btn.setText(_("Juxie.WaveOpenCsv"))
+        self._sdo_cur_label.setText(_("Juxie.SdoCurrent"))
+        self._sdo_tq_label.setText(_("Juxie.SdoTorque"))
+        self._sdo_cur_btn.setText(_("Juxie.SdoApplyCurrent"))
+        self._sdo_tq_btn.setText(_("Juxie.SdoApplyTorque"))
+        self._sdo_zero_btn.setText(_("Juxie.SdoZero"))
+        self._sdo_hint.setText(_("Juxie.SdoHint"))
         self._update_wave_log_info()
         for lbl, key in self._fb_field_labels:
             lbl.setText(_(key))

@@ -94,17 +94,24 @@ class ZDTCanable:
     def list_devices() -> List[dict]:
         devs = []
         for d in usb.core.find(find_all=True, idVendor=CANABLE_VID, idProduct=CANABLE_PID):
+            strings_ok = True
             try:
                 mfg = usb.util.get_string(d, d.iManufacturer) or ""
                 prd = usb.util.get_string(d, d.iProduct) or ""
                 ser = usb.util.get_string(d, d.iSerialNumber) or ""
             except Exception:
+                # 设备已被本进程打开（占用）时读取字符串可能失败；
+                # 这不影响列举结果，上层会用 VID/PID/总线地址兜底显示。
                 mfg = prd = ser = ""
+                strings_ok = False
             devs.append({
                 "backend": "elmue",
                 "vid": CANABLE_VID, "pid": CANABLE_PID,
                 "manufacturer": mfg, "product": prd, "serial": ser,
                 "path": None,
+                "bus": getattr(d, "bus", None),
+                "address": getattr(d, "address", None),
+                "strings_ok": strings_ok,
             })
         return devs
 

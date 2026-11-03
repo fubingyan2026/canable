@@ -429,27 +429,111 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- 设备扫描
     @Slot()
-    def _scan_devices(self):
+    def _scan_devices(self, _retry: bool = False):
         self.device_list.clear()
+        scan_error = None
         try:
             devs = ZDTCanable.list_devices()
         except Exception as e:
-            QMessageBox.critical(self, _("Left.Scan"), f"{_('Scan.Failed')}: {e}")
-            self.connect_btn.setEnabled(False)
+            # 已连接时设备由本进程占用，枚举偶尔会报错：不弹窗，改用已打开句柄兜底
+            devs = []
+            scan_error = e
+            logger.warning("扫描设备失败: %s", e)
+
+        # 当前连接中的设备：即使枚举读不到（被占用/正在重枚举）也要能显示
+        connected_dev = self._connected_device_info()
+        if not devs and connected_dev is not None:
+            devs = [connected_dev]
+
+        if not devs and not _retry and scan_error is None and not self._connected:
+            # 刚断开/刚上电时设备可能还在重枚举，250 ms 后自动重试一次
+            logger.info("未发现设备，250 ms 后重试一次")
+            QTimer.singleShot(250, lambda: self._scan_devices(True))
             return
+
         if not devs:
+            if scan_error is not None and not self._connected:
+                QMessageBox.critical(self, _("Left.Scan"),
+                                     f"{_('Scan.Failed')}: {scan_error}")
             item = QListWidgetItem(_("Left.NoDevice"))
             item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.device_list.addItem(item)
-            self.connect_btn.setEnabled(False)
+            self._sync_connect_button()
             return
+
         for d in devs:
-            label = f"{d['manufacturer']} {d['product']}\n  S/N: {d['serial']}"
-            li = QListWidgetItem(label)
+            name = f"{d.get('manufacturer', '')} {d.get('product', '')}".strip()
+            if not name:
+                name = _("Scan.GenericDevice")
+            extras = []
+            if d.get("serial"):
+                extras.append("S/N: %s" % d["serial"])
+            bus = d.get("bus")
+            addr = d.get("address")
+            if bus is not None or addr is not None:
+                extras.append(_("Scan.BusAddr").format(
+                    loc="%s:%s" % ("?" if bus is None else bus,
+                                   "?" if addr is None else addr)))
+            if self._is_connected_dev(d, connected_dev):
+                name = "%s %s" % (name, _("Scan.Connected"))
+            line2 = ("  " + "  ".join(extras)) if extras else ""
+            li = QListWidgetItem(name + ("\n" + line2 if line2 else ""))
             li.setData(Qt.UserRole, d)
             self.device_list.addItem(li)
         self.device_list.setCurrentRow(0)
-        self.connect_btn.setEnabled(not self._connected)
+        self._sync_connect_button()
+
+    def _sync_connect_button(self):
+        """按连接状态同步连接/断开按钮。
+
+        已连接时按钮是“断开”，必须保持可用可点（扫描不能把它禁用）；
+        未连接时是“连接”，按当前是否有可选设备决定是否可用。
+        """
+        if self._connected:
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setChecked(True)
+            self.connect_btn.setText(_("Left.Disconnect"))
+            self.connect_btn.setIcon(icon_lib.make_icon("power_off"))
+            return
+        item = self.device_list.currentItem()
+        selectable = item is not None and bool(item.flags() & Qt.ItemIsEnabled)
+        self.connect_btn.setChecked(False)
+        self.connect_btn.setText(_("Left.ConnectDevice"))
+        self.connect_btn.setIcon(icon_lib.make_icon("power"))
+        self.connect_btn.setEnabled(selectable)
+
+    def _connected_device_info(self) -> Optional[dict]:
+        """由当前已打开的 SDK 句柄构造一条设备信息；未连接返回 None。"""
+        if not self._connected or self._worker is None:
+            return None
+        bus = getattr(self._worker, "_bus", None)
+        if bus is None:
+            return None
+        return {
+            "backend": "elmue",
+            "vid": getattr(bus, "vid", None),
+            "pid": getattr(bus, "pid", None),
+            "manufacturer": "",
+            "product": "",
+            "serial": getattr(bus, "serial", None) or "",
+            "path": None,
+            "bus": None,
+            "address": None,
+            "strings_ok": False,
+        }
+
+    @staticmethod
+    def _is_connected_dev(dev: dict, connected: Optional[dict]) -> bool:
+        if connected is None:
+            return False
+        if dev.get("vid") != connected.get("vid"):
+            return False
+        if dev.get("pid") != connected.get("pid"):
+            return False
+        ser = connected.get("serial")
+        if ser and dev.get("serial"):
+            return str(ser) == str(dev["serial"])
+        return True
 
     @Slot()
     def _on_device_selection_changed(self):
@@ -457,7 +541,6 @@ class MainWindow(QMainWindow):
             return
         item = self.device_list.currentItem()
         self.connect_btn.setEnabled(item is not None and bool(item.flags() & Qt.ItemIsEnabled))
-
     # ----------------------------------------------------------- CAN FD
     @Slot(bool)
     def _on_fd_toggle(self, enabled: bool):

@@ -178,6 +178,9 @@ _TR.update({
     "Stat.HdrLastDelta":    {"zh": "最近间隔(ms)","en": "Last Δt (ms)"},
     # Main window misc
     "Scan.Failed":          {"zh": "扫描失败",    "en": "Scan failed"},
+    "Scan.GenericDevice":   {"zh": "USB-CAN 适配器", "en": "USB-CAN adapter"},
+    "Scan.BusAddr":         {"zh": "总线 {loc}",   "en": "Bus {loc}"},
+    "Scan.Connected":       {"zh": "（已连接）",   "en": "(connected)"},
     "Send.SelectRow":       {"zh": "请先选中一行", "en": "Please select a row first"},
     "Load.Failed":          {"zh": "加载失败",    "en": "Load failed"},
 

@@ -52,6 +52,12 @@ a = Analysis(
         'plugins.battery_monitor.plugin',
         'plugins.battery_monitor.protocol',
         'plugins.battery_monitor.widget',
+        # keli_torque 插件
+        'plugins.keli_torque',
+        'plugins.keli_torque.plugin',
+        'plugins.keli_torque.protocol',
+        'plugins.keli_torque.scope',
+        'plugins.keli_torque.widget',
     ],
     hookspath=[],
     hooksconfig={},

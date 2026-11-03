@@ -9,6 +9,8 @@ import math
 import struct
 from dataclasses import dataclass
 
+from canable_sdk import CANFrame
+
 # ── CAN ID 基址 ──
 SYNC_ID = 0x80
 MIT_SINGLE_BASE = 0x110
@@ -180,6 +182,116 @@ SDO_ZERO_DATA = bytes([0x23, 0x31, 0x25, 0x00, 0x01, 0x00, 0x00, 0x00])
 def build_zero_canid(dev_id: int) -> int:
     """标零帧 CAN ID：0x600 | Dev_ID。"""
     return ZERO_ID_BASE | _clamp_uint8(dev_id)
+
+
+# ── CiA402 SDO 电流环 / 力矩环（文档 §4.3）──
+# SDO expedited download（CiA301）：0x2F=1 字节, 0x2B=2 字节, 0x23=4 字节
+OBJ_CONTROLWORD = 0x6040        # 6040h：启动/抱闸/使能序列
+OBJ_MODES = 0x6060              # 6060h：运行模式
+OBJ_TARGET = 0x6071             # 6071h：目标值（电流 mA / 力矩 0.1Nm）
+OBJ_ZERO = 0x2531               # 2531h：标零（见 build_zero_*）
+
+CTRL_PREPARE = 0x0006           # 6040h=6 准备好启动
+CTRL_BRAKE_RELEASE = 0x0007     # 6040h=7 松开抱闸
+CTRL_ENABLE = 0x000F            # 6040h=0x0F 电机使能
+
+MODE_CST_PROJECT = 10           # 6060h=10：兼容 CST 输入，项目电流模式
+MODE_CURRENT_NATIVE = 5         # 6060h=5：项目原生电流模式
+MODE_TORQUE_SENSOR = 7          # 6060h=7：力矩传感器闭环（项目原生）
+TORQUE_LSB_NM = 0.1             # 6071h 力矩分辨率 0.1 Nm/LSB
+CURRENT_MAX_MA = 65535
+
+_SDO_CCS = {1: 0x2F, 2: 0x2B, 4: 0x23}
+
+
+def build_sdo_write(dev_id: int, index: int, sub: int, value: int,
+                    size: int) -> CANFrame:
+    """构造 SDO 下行帧（0x600|Dev_ID，DLC 8，FD+BRS）。"""
+    if size not in _SDO_CCS:
+        raise ValueError("SDO size must be 1, 2 or 4")
+    payload = {1: struct.pack("<B", int(value) & 0xFF),
+               2: struct.pack("<H", int(value) & 0xFFFF),
+               4: struct.pack("<I", int(value) & 0xFFFFFFFF)}[size]
+    data = (bytes([_SDO_CCS[size], index & 0xFF, (index >> 8) & 0xFF,
+                   sub & 0xFF]) + payload).ljust(8, b"\x00")
+    return CANFrame(can_id=ZERO_ID_BASE | _clamp_uint8(dev_id), data=data,
+                    extended=False, fd=True, brs=True)
+
+
+def _sdo_enable_sequence(dev_id: int) -> list:
+    """准备好启动 → 松开抱闸 → 电机使能（6040h）。"""
+    return [
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_PREPARE, 2),
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_BRAKE_RELEASE, 2),
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_ENABLE, 2),
+    ]
+
+
+def build_current_mode_sequence(dev_id: int, current_ma: int,
+                                mode: int = MODE_CST_PROJECT) -> list:
+    """进入电流环并下发目标电流（mA）。"""
+    ma = max(0, min(CURRENT_MAX_MA, int(current_ma)))
+    frames = _sdo_enable_sequence(dev_id)
+    frames.append(build_sdo_write(dev_id, OBJ_MODES, 0, mode, 1))
+    frames.append(build_sdo_write(dev_id, OBJ_TARGET, 0, ma, 2))
+    return frames
+
+
+def build_torque_mode_sequence(dev_id: int, torque_nm: float) -> list:
+    """进入力矩传感器闭环并下发目标力矩（0.1 Nm/LSB）。"""
+    raw = int(round(float(torque_nm) / TORQUE_LSB_NM))
+    raw = max(0, min(0xFFFF, raw))
+    frames = _sdo_enable_sequence(dev_id)
+    frames.append(build_sdo_write(dev_id, OBJ_MODES, 0, MODE_TORQUE_SENSOR, 1))
+    frames.append(build_sdo_write(dev_id, OBJ_TARGET, 0, raw, 2))
+    return frames
+
+
+def build_sdo_target(dev_id: int, value: int) -> CANFrame:
+    """仅下发目标值（6071h，2 字节）。"""
+    return build_sdo_write(dev_id, OBJ_TARGET, 0, int(value), 2)
+
+
+def build_mode_sequence_before_enable(dev_id: int, mode: int,
+                                      target_value: int) -> list:
+    """标准 CiA402 顺序重试：先写模式再使能（部分驱动器拒绝使能后改模式）。"""
+    return [
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_PREPARE, 2),
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_BRAKE_RELEASE, 2),
+        build_sdo_write(dev_id, OBJ_MODES, 0, int(mode), 1),
+        build_sdo_write(dev_id, OBJ_CONTROLWORD, 0, CTRL_ENABLE, 2),
+        build_sdo_write(dev_id, OBJ_TARGET, 0, int(target_value), 2),
+    ]
+
+
+SDO_RESP_ID_BASE = 0x580         # 0x580|Dev_ID：SDO 响应
+SDO_CMD_READ = 0x40             # 触发上传读
+SDO_ABORT = 0x80                # 中止码
+_SDO_UPLOAD_SIZE = {0x4F: 1, 0x4B: 2, 0x47: 3, 0x43: 4}
+
+
+def build_sdo_read(dev_id: int, index: int, sub: int = 0) -> CANFrame:
+    """构造 SDO 上传请求（读回对象字典值）。"""
+    data = bytes([SDO_CMD_READ, index & 0xFF, (index >> 8) & 0xFF,
+                  sub & 0xFF, 0, 0, 0, 0])
+    return CANFrame(can_id=ZERO_ID_BASE | _clamp_uint8(dev_id), data=data,
+                    extended=False, fd=True, brs=True)
+
+
+def parse_sdo_response(data: bytes):
+    """解析 SDO 响应 → (index, value)；中止或非法帧返回 None / (index, None)。"""
+    if len(data) < 8:
+        return None
+    cmd = data[0]
+    if cmd == 0:
+        return None
+    index = data[1] | (data[2] << 8)
+    if cmd == SDO_ABORT:
+        return index, None
+    n = _SDO_UPLOAD_SIZE.get(cmd)
+    if n is None:
+        return None
+    return index, int.from_bytes(data[4:4 + n], "little")
 
 
 # ── 反馈解析 ──
