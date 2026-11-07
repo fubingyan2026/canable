@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (QTableView, QHeaderView, QAbstractItemView,
 
 from canable_sdk import CANFrame
 from .i18n import _, language_changed
-from .style import id_color, FG_DIM, FG_ACCENT, BG_TX, BG_ERROR
+from .style import id_color
+from . import style
 from . import icons as icon_lib
 
 logger = logging.getLogger("cangui.trace")
@@ -49,11 +50,19 @@ class TraceModel(QAbstractTableModel):
         self._view_rows: List[int] = []
         self._cid_to_vis: Dict[Tuple[int, bool], int] = {}
         # 画刷缓存（避免 data() 每次新建 QBrush/QColor）
-        self._brush_tx = QBrush(QColor(BG_TX))
-        self._brush_err = QBrush(QColor(BG_ERROR))
-        self._brush_fg_tx = QBrush(QColor(FG_ACCENT))
-        self._brush_fg_dim = QBrush(QColor(FG_DIM))
         self._fg_cache: Dict[Tuple[int, bool], QBrush] = {}
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        self._brush_tx = QBrush(QColor(style.BG_TX))
+        self._brush_err = QBrush(QColor(style.BG_ERROR))
+        self._brush_fg_tx = QBrush(QColor(style.FG_ACCENT))
+        self._brush_fg_err = QBrush(QColor(style.FG_ERROR))
+        self._brush_fg_dim = QBrush(QColor(style.FG_DIM))
+        self._fg_cache.clear()
+        if self.rowCount():
+            self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1),
+                                  [Qt.ForegroundRole, Qt.BackgroundRole])
 
     def _fg_brush(self, can_id: int, extended: bool) -> QBrush:
         key = (can_id, extended)
@@ -147,12 +156,16 @@ class TraceModel(QAbstractTableModel):
                 return self._brush_tx
 
         if role == Qt.ForegroundRole:
-            if f.is_tx:
+            if f.is_error:
+                return self._brush_fg_err
+            if f.is_tx and col in (self.COL_CH, self.COL_TYPE):
                 return self._brush_fg_tx
             if f.rtr:
                 return self._brush_fg_dim
-            if not f.is_error:
+            if col == self.COL_ID:
                 return self._fg_brush(f.can_id, f.extended)
+            if col in (self.COL_INDEX, self.COL_TIME, self.COL_DELTA, self.COL_PERIOD, self.COL_COUNT):
+                return self._brush_fg_dim
 
         if role == Qt.TextAlignmentRole:
             if col in (self.COL_DLC, self.COL_COUNT):
@@ -328,11 +341,12 @@ class TraceView(QTableView):
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setShowGrid(False)
         self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(18)
+        self.verticalHeader().setDefaultSectionSize(28)
         self.setAlternatingRowColors(True)
         self.setSortingEnabled(False)
 
-        font = QFont("Consolas", 9)
+        font = QFont("Consolas")
+        font.setPointSizeF(9.5)
         font.setFamilies(["Consolas", "Noto Sans Mono CJK SC", "Liberation Mono", "Courier New", "monospace"])
         font.setStyleHint(QFont.Monospace)
         self.setFont(font)
@@ -340,18 +354,21 @@ class TraceView(QTableView):
         self._auto_scroll = True
 
         h = self.horizontalHeader()
+        header_font = QFont()
+        header_font.setPointSizeF(9)
+        h.setFont(header_font)
         h.setHighlightSections(False)
         widths = {
-            TraceModel.COL_INDEX:  60,
-            TraceModel.COL_TIME:  120,
-            TraceModel.COL_CH:    50,
-            TraceModel.COL_ID:   110,
-            TraceModel.COL_TYPE:  65,
+            TraceModel.COL_INDEX:  42,
+            TraceModel.COL_TIME:  100,
+            TraceModel.COL_CH:    48,
+            TraceModel.COL_ID:    78,
+            TraceModel.COL_TYPE:  64,
             TraceModel.COL_DLC:   40,
-            TraceModel.COL_DATA:  220,
-            TraceModel.COL_DELTA: 70,
-            TraceModel.COL_PERIOD:95,
-            TraceModel.COL_COUNT: 60,
+            TraceModel.COL_DATA:  250,
+            TraceModel.COL_DELTA: 68,
+            TraceModel.COL_PERIOD:76,
+            TraceModel.COL_COUNT: 56,
         }
         for col, w in widths.items():
             h.resizeSection(col, w)
@@ -361,15 +378,21 @@ class TraceView(QTableView):
         h.setSectionResizeMode(TraceModel.COL_COUNT, QHeaderView.Fixed)
         h.setStretchLastSection(False)
         # per-column minimum widths based on header text
-        fm = self.fontMetrics()
         self._col_mins = {}
-        for c, hdr in enumerate(TraceModel._make_headers()):
-            w = fm.horizontalAdvance(hdr) + 14
-            self._col_mins[c] = max(w, 30)
+        self.update_column_minimums()
         self.horizontalHeader().sectionResized.connect(self._clamp_width)
 
 
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    def update_column_minimums(self):
+        header = self.horizontalHeader()
+        metrics = header.fontMetrics()
+        for column, text in enumerate(TraceModel._make_headers()):
+            minimum = max(metrics.horizontalAdvance(text) + 14, 30)
+            self._col_mins[column] = minimum
+            if self.columnWidth(column) < minimum:
+                header.resizeSection(column, minimum)
 
     def _on_scroll(self, _):
         sb = self.verticalScrollBar()
@@ -418,9 +441,11 @@ class TracePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("tracePanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setContentsMargins(10, 10, 10, 8)
+        layout.setSpacing(8)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -455,7 +480,7 @@ class TracePanel(QWidget):
         layout.addWidget(self.view, 1)
 
         self.summary_label = QLabel(f"{_("Trace.Received")} 0 {_("Trace.Frames")}")
-        self.summary_label.setStyleSheet(f"color: {FG_DIM};")
+        self.summary_label.setObjectName("panelSummary")
         layout.addWidget(self.summary_label)
 
         self._paused = False
@@ -511,6 +536,7 @@ class TracePanel(QWidget):
         self.collapse_chk.setText(_("Trace.Collapse"))
         self._update_summary()
         self.view._model.update_headers()
+        self.view.update_column_minimums()
         hdr = self.view.horizontalHeader()
         hdr.update()
         self.view.update()
@@ -521,6 +547,11 @@ class TracePanel(QWidget):
         """主题切换时重新生成图标（颜色随主题变化）。"""
         self.clear_btn.setIcon(icon_lib.make_icon("trash"))
         self.pause_btn.setIcon(icon_lib.make_icon("play" if self._paused else "pause"))
+
+    def refresh_theme(self):
+        self.view._model.refresh_theme()
+        self.refresh_icons()
+        self.view.viewport().update()
 
     def clear_all(self):
         self._on_clear()

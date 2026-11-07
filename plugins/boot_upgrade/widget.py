@@ -23,10 +23,13 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QGroupBox,
                                 QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                 QPlainTextEdit, QProgressBar, QPushButton,
                                 QSpinBox, QVBoxLayout, QWidget)
+
+from cangui.i18n import _, get_language
+from cangui.plugin_ui import FlowLayout
 
 from . import protocol as P
 from .upgrader import UpgradeTask, UpgradeSignals, BootConfig
@@ -159,7 +162,7 @@ class BootUpgradePanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         self._cfg_box = QGroupBox(self._tr("Boot.Config"))
-        cfg_layout = QFormLayout(self._cfg_box)
+        cfg_layout = QVBoxLayout(self._cfg_box)
 
         self._file_edit = QLineEdit()
         self._file_edit.setReadOnly(True)
@@ -169,7 +172,8 @@ class BootUpgradePanel(QWidget):
         file_row.addWidget(self._file_edit, 1)
         file_row.addWidget(self._browse_btn)
         self._lbl_firmware_file = QLabel(self._tr("Boot.FirmwareFile"))
-        cfg_layout.addRow(self._lbl_firmware_file, file_row)
+        file_row.insertWidget(0, self._lbl_firmware_file)
+        cfg_layout.addLayout(file_row)
 
         self._host_id_spin = QSpinBox()
         self._host_id_spin.setRange(0, 0x7FF)
@@ -177,7 +181,6 @@ class BootUpgradePanel(QWidget):
         self._host_id_spin.setDisplayIntegerBase(16)
         self._host_id_spin.setPrefix("0x")
         self._lbl_host_can_id = QLabel(self._tr("Boot.HostCanID"))
-        cfg_layout.addRow(self._lbl_host_can_id, self._host_id_spin)
 
         self._hw_id_spin = QSpinBox()
         self._hw_id_spin.setRange(0, 0xFFFF)
@@ -185,7 +188,6 @@ class BootUpgradePanel(QWidget):
         self._hw_id_spin.setDisplayIntegerBase(16)
         self._hw_id_spin.setPrefix("0x")
         self._lbl_hardware_id = QLabel(self._tr("Boot.HardwareID"))
-        cfg_layout.addRow(self._lbl_hardware_id, self._hw_id_spin)
 
         self._fw_version_spin = QSpinBox()
         self._fw_version_spin.setRange(0, 0xFFFF)
@@ -193,22 +195,33 @@ class BootUpgradePanel(QWidget):
         self._fw_version_spin.setDisplayIntegerBase(16)
         self._fw_version_spin.setPrefix("0x")
         self._lbl_firmware_version = QLabel(self._tr("Boot.FirmwareVersion"))
-        cfg_layout.addRow(self._lbl_firmware_version, self._fw_version_spin)
 
         self._frame_size_combo = QComboBox()
         self._rebuild_frame_size_combo()
         self._frame_size_combo.setCurrentIndex(self._frame_size_combo.findData(64))
         self._lbl_frame_size = QLabel(self._tr("Boot.FrameSize"))
-        cfg_layout.addRow(self._lbl_frame_size, self._frame_size_combo)
 
+        fields = FlowLayout()
+        for label, control in ((self._lbl_host_can_id, self._host_id_spin),
+                               (self._lbl_hardware_id, self._hw_id_spin),
+                               (self._lbl_firmware_version, self._fw_version_spin),
+                               (self._lbl_frame_size, self._frame_size_combo)):
+            pair = QWidget()
+            pair_layout = QHBoxLayout(pair)
+            pair_layout.setContentsMargins(0, 0, 0, 0)
+            pair_layout.addWidget(label)
+            pair_layout.addWidget(control)
+            fields.addWidget(pair)
+        cfg_layout.addLayout(fields)
         layout.addWidget(self._cfg_box)
 
         # --- 进度区 ---
         self._prog_box = QGroupBox(self._tr("Boot.Progress"))
-        prog_layout = QVBoxLayout(self._prog_box)
+        prog_layout = FlowLayout(self._prog_box)
 
         self._overall_bar = QProgressBar()
         self._overall_bar.setRange(0, 100)
+        self._overall_bar.setMinimumWidth(140)
         self._overall_label = QLabel(self._tr("Boot.OverallProgress"))
         prog_layout.addWidget(self._overall_label)
         prog_layout.addWidget(self._overall_bar)
@@ -220,17 +233,14 @@ class BootUpgradePanel(QWidget):
         layout.addWidget(self._prog_box)
 
         # --- 控制按钮 ---
-        btn_row = QHBoxLayout()
         self._start_btn = QPushButton(self._tr("Boot.Start"))
         self._start_btn.setObjectName("primaryBtn")
         self._start_btn.clicked.connect(self._on_start)
         self._cancel_btn = QPushButton(self._tr("Boot.Cancel"))
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._cancel_btn.setEnabled(False)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self._start_btn)
-        btn_row.addWidget(self._cancel_btn)
-        layout.addLayout(btn_row)
+        prog_layout.addWidget(self._start_btn)
+        prog_layout.addWidget(self._cancel_btn)
 
         # --- 日志区 ---
         self._log_box = QGroupBox(self._tr("Boot.Log"))
@@ -241,23 +251,18 @@ class BootUpgradePanel(QWidget):
         font.setStyleHint(QFont.StyleHint.TypeWriter)
         self._log_view.setFont(font)
         log_layout.addWidget(self._log_view)
-        clear_row = QHBoxLayout()
-        clear_row.addStretch(1)
         self._clear_log_btn = QPushButton(self._tr("Boot.ClearLog"))
         self._clear_log_btn.clicked.connect(self._log_view.clear)
-        clear_row.addWidget(self._clear_log_btn)
-        log_layout.addLayout(clear_row)
+        prog_layout.addWidget(self._clear_log_btn)
         layout.addWidget(self._log_box, 1)
 
     # ------------------------------------------------------------------ #
     #  i18n / 状态文本
     # ------------------------------------------------------------------ #
     def _tr(self, key: str) -> str:
-        from cangui.i18n import _
         return _(key)
 
     def _state_text(self, state: str) -> str:
-        from cangui.i18n import get_language
         table = _STATE_TEXT_ZH if get_language() == "zh" else _STATE_TEXT_EN
         return table.get(state, state)
 

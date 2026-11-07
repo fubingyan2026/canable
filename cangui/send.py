@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 
 from canable_sdk import CANFrame
 from .i18n import _
-from .style import id_color, FG_DIM
 from . import icons as icon_lib
 
 logger = logging.getLogger("cangui.send")
@@ -245,25 +244,27 @@ class SendPanel(QWidget):
         self._connected = connected
 
     def _init_ui(self):
+        self.setObjectName("sendPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setContentsMargins(10, 10, 10, 6)
+        layout.setSpacing(8)
 
         # 表
         self.table = QTableWidget(0, len(self.HEADERS()), self)
         self.table.setHorizontalHeaderLabels(self.HEADERS())
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(20)
+        self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setShowGrid(False)
-        self.table.setAlternatingRowColors(False)
+        self.table.setAlternatingRowColors(True)
         self.table.doubleClicked.connect(self._on_double_clicked)
         h = self.table.horizontalHeader()
-        widths = {self.COL_INDEX: 70, self.COL_ID: 110, self.COL_TYPE: 50,
-                  self.COL_DLC: 40, self.COL_DATA: 200, self.COL_PERIOD: 70,
-                  self.COL_SENT: 60, self.COL_ON: 35}
+        widths = {self.COL_INDEX: 130, self.COL_ID: 90, self.COL_TYPE: 64,
+                  self.COL_DLC: 44, self.COL_DATA: 200, self.COL_PERIOD: 90,
+                  self.COL_SENT: 62, self.COL_ON: 48}
         for c, w in widths.items():
             h.resizeSection(c, w)
         h.setSectionResizeMode(self.COL_DATA, QHeaderView.Stretch)
@@ -272,6 +273,7 @@ class SendPanel(QWidget):
         # 按钮（macOS 风格：图标 + 文字）
         # 启停合并为单个 toggle 按钮：根据选中行的 enabled 状态切换文本/图标
         bar = QHBoxLayout()
+        bar.setSpacing(6)
         self.add_btn   = QPushButton(_("Send.Add"))
         self.add_btn.setIcon(icon_lib.make_icon("plus"))
         self.edit_btn  = QPushButton(_("Send.Edit"))
@@ -279,7 +281,7 @@ class SendPanel(QWidget):
         self.del_btn   = QPushButton(_("Send.Delete"))
         self.del_btn.setIcon(icon_lib.make_icon("trash"))
         self.send_btn  = QPushButton(_("Send.SendOnce"))
-        self.send_btn.setIcon(icon_lib.make_icon("send"))
+        self.send_btn.setIcon(icon_lib.make_icon("send", "#FFFFFF"))
         self.toggle_btn = QPushButton(_("Send.Start"))
         self.toggle_btn.setIcon(icon_lib.make_icon("play"))
         self.send_btn.setObjectName("sendBtn")
@@ -301,7 +303,7 @@ class SendPanel(QWidget):
 
         # 状态
         self.status_label = QLabel(_("Send.Ready"))
-        self.status_label.setStyleSheet(f"color: {FG_DIM};")
+        self.status_label.setObjectName("panelSummary")
         layout.addWidget(self.status_label)
 
     # ---- 内部 ---- #
@@ -504,7 +506,7 @@ class SendPanel(QWidget):
         self.add_btn.setIcon(icon_lib.make_icon("plus"))
         self.edit_btn.setIcon(icon_lib.make_icon("pencil"))
         self.del_btn.setIcon(icon_lib.make_icon("trash"))
-        self.send_btn.setIcon(icon_lib.make_icon("send"))
+        self.send_btn.setIcon(icon_lib.make_icon("send", "#FFFFFF"))
         # toggle_btn 图标随状态变化，统一通过 _update_toggle_btn 刷新
         self._update_toggle_btn()
 

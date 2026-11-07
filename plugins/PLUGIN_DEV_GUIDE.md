@@ -659,16 +659,21 @@ if payload_len > 8 and not ctx.is_fd_mode():
 所有颜色必须用 `cangui.style` 的常量，**禁止**硬编码 hex：
 
 ```python
-from cangui.style import BG_CARD, FG_ACCENT, FG_DIM, FG_WARN, FG_ERROR, BORDER
+from cangui import style
 
-label.setStyleSheet(f"color: {FG_ACCENT};")
+style.set_text_color(label, style.FG_ACCENT, "font-weight: 600;")
 ```
 
-主题切换时主程序自动重新 apply QSS，但**手动 setStyleSheet 的样式不会被刷新**。建议：
-- 优先用 QSS objectName 选择器（自动响应主题）
-- 必须动态改色时，在 `refresh_language` 中也重设一次颜色
+用户可在“工具 → 主题 → 浅色/深色”即时切换，选择保存在 `settings.json` 的 `theme` 字段。主题切换不会重建插件或清空报文、参数和波形。
+
+- 通过 `style.FG_TEXT`、`style.FG_DIM`、`style.LOAD_LOW/MID/HIGH` 动态取色，避免 `from ... import FG_TEXT` 或模块级颜色副本。
+- 优先使用 QSS objectName 选择器。动态文字使用 `style.set_text_color()`，它绑定语义角色，已有标签会自动响应主题。
+- 自绘控件使用 `QPalette.Base/WindowText/Mid`；需要缓存曲线颜色时处理 Qt `PaletteChange` 事件。
+- `QTableWidgetItem` 前景/背景、自定义画刷缓存等应在控件的 `refresh_theme()` 中刷新。基类 `Plugin.refresh_theme()` 会转发到插件控件的同名方法；也可直接重写插件钩子。刷新时不要重建控件、发送 CAN 命令或改变采集状态。
 
 ### 10.2 控件样式
+
+宿主在 `build_widget()` 后自动调用 `cangui.plugin_ui.prepare_plugin_ui()`，为插件控件设置 `pluginCompact` 属性，统一压缩边距、按钮和输入框留白及表格行高。样式同时适配明暗主题；避免另设固定控件高度，以免高 DPI 或英文界面裁字。
 
 用 QSS objectName 而非内联样式：
 
@@ -676,6 +681,14 @@ label.setStyleSheet(f"color: {FG_ACCENT};")
 btn = QPushButton("Start")
 btn.setObjectName("primaryBtn")   # 在 style.py 中定义 #primaryBtn 样式
 ```
+
+内容较多时，可复用 `cangui.plugin_ui` 的原生 Qt 布局组件：
+
+- `SectionPage` 配合 `SectionTabs.add_section(page)`：将详细数据、参数、维护等放进页内标签，页签文字随 `page.setTitle()` 更新；尺寸以当前页计算。
+- `DisclosureSection(title)`：默认收起的次要设置区，控件放入 `section.body` 的布局中；在 `refresh_language()` 中更新 `section.setTitle()`。
+- `FlowLayout`：工具栏在窄窗口按完整控件自动换行；标签与输入框应先组合为一个 QWidget 再加入，避免分行后失去对应关系。具有水平扩展策略的控件（如进度条）会占用同行剩余宽度。
+
+页签切换和展开只改变可见性。保持原有控件实例，让隐藏页继续接收数据，不在导航时重建控件、清空波形或发送 CAN 命令。
 
 ### 10.3 字体
 

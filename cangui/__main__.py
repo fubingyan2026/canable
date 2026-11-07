@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QFont, QFontDatabase
 
 from cangui.main_window import MainWindow
-from cangui.style import get_qss
+from cangui.style import apply_style
 
 LOGO_PATH = os.path.join(_HERE, "logo.svg")
 
@@ -85,7 +85,7 @@ def _pick_app_font() -> QFont:
                    "Noto Sans CJK SC", "Microsoft YaHei", "Noto Sans",
                    "Helvetica Neue", "Segoe UI"):
         if family in available:
-            f = QFont(family, 9)
+            f = QFont(family, 10)
             f.setStyleStrategy(QFont.PreferAntialias)
             return f
     return QFont()
@@ -110,7 +110,7 @@ def main():
     app.setOrganizationName("canable")
     app.setApplicationName("CANable2.5")
     app.setWindowIcon(QIcon(LOGO_PATH))
-    app.setStyleSheet(get_qss())
+    apply_style(app)
 
     # 定期唤醒 Python 事件循环，确保 SIGINT 能被处理
     from PySide6.QtCore import QTimer

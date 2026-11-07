@@ -11,7 +11,7 @@ from cangui.i18n import _
 from .widget import JuxieMotorPanel
 
 _I18N_KEYS = {
-    "Juxie.Title":              ("捷电机控制",          "Juxie Motor Control"),
+    "Juxie.Title":              ("巨蟹电机控制",          "Juxie Motor Control"),
     "Juxie.DevConfig":          ("设备配置",            "Device Config"),
     "Juxie.DevID":              ("设备 ID",             "Device ID"),
     "Juxie.Mirror":             ("镜像",                "Mirror"),
@@ -20,6 +20,7 @@ _I18N_KEYS = {
     "Juxie.Primary":            ("主电机",              "Primary"),
     "Juxie.MirrorTag":          ("镜像电机",            "Mirror"),
     "Juxie.MITControl":         ("MIT 控制",            "MIT Control"),
+    "Juxie.Tuning":             ("量程与增益",          "Limits & gains"),
     "Juxie.Enable":             ("上使能",              "Enable"),
     "Juxie.Brake":              ("抱闸释放",            "Brake Release"),
     "Juxie.ClearError":         ("清除故障",            "Clear Fault"),

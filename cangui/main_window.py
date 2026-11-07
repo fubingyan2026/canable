@@ -8,17 +8,17 @@ import logging
 import time
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QThread, Slot, QMutexLocker
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QThread, Slot, QMutexLocker, QSize
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut, QIcon
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QApplication,
                                 QLabel, QComboBox, QPushButton, QSplitter, QFrame,
                                 QListWidget, QListWidgetItem, QTabWidget, QTabBar,
                                 QDockWidget, QStatusBar, QFileDialog,
                                 QMessageBox, QGroupBox, QFormLayout,
-                                QCheckBox, QToolButton)
+                                QCheckBox, QToolButton, QSizePolicy)
 
 from canable_sdk import ZDTCanable, CANFrame
-from .style import get_qss
+from . import style
 from .i18n import _, get_language, set_language
 from .worker import CANWorker
 from .trace import TracePanel
@@ -28,6 +28,23 @@ from .plugin_host import PluginHost
 from . import icons as icon_lib
 
 logger = logging.getLogger("cangui.main_window")
+
+
+class _WorkspaceTabs(QTabWidget):
+    """Inactive plugin pages must not impose their height on the trace view."""
+
+    def __init__(self):
+        super().__init__()
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        page = self.currentWidget()
+        if page is None:
+            return hint
+        page_height = max(page.minimumHeight(), page.minimumSizeHint().height())
+        return QSize(hint.width(), page_height + self.tabBar().sizeHint().height() + 6)
+
 
 # --------------------------------------------------------------------------- #
 #  主窗口
@@ -42,6 +59,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        style.apply_style(QApplication.instance())
         self.setWindowTitle("CANable 2.5")
         self.resize(1400, 850)
         self.setDockOptions(self.dockOptions() & ~QMainWindow.AnimatedDocks)
@@ -120,11 +138,13 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         # 中心：Tab
         self.trace_panel  = TracePanel(self)
-        self.trace_panel.view.setAlternatingRowColors(False)
         # 暂停/继续状态即时持久化（2s 防抖），并在关闭时一并写入
         self.trace_panel.pause_btn.toggled.connect(
             lambda checked: self._set("paused", checked))
-        center_tabs = QTabWidget()
+        center_tabs = _WorkspaceTabs()
+        center_tabs.setObjectName("centerTabs")
+        center_tabs.setDocumentMode(True)
+        center_tabs.setUsesScrollButtons(True)
         center_tabs.setTabsClosable(True)
         center_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         center_tabs.addTab(self.trace_panel, _("Trace.TabLabel"))
@@ -136,15 +156,12 @@ class MainWindow(QMainWindow):
         center_tabs.currentChanged.connect(self._on_center_tab_changed)
         self._center_tabs = center_tabs
 
-        # 左侧：设备 + 总线（包装为圆角卡片，带柔和投影）
+        # 左侧配置栏；沿用 Qt 标准窗口和布局，无额外绘制/投影开销。
         left_inner = self._build_left_panel()
-        # left_inner 保留 objectName="sidebar"（QSS 中已改为透明背景），
-        # 由外层 sidebarCard 提供卡片底色 + 圆角 + 投影
-        # 外层 margins 与 dock 一致（2px），保持左右间隔视觉统一
         left_card = QFrame()
         left_card.setObjectName("sidebarCard")
         left_card_lay = QVBoxLayout(left_card)
-        left_card_lay.setContentsMargins(2, 2, 2, 2)
+        left_card_lay.setContentsMargins(0, 0, 0, 0)
         left_card_lay.setSpacing(0)
         left_card_lay.addWidget(left_inner)
         self._left_inner = left_inner
@@ -155,10 +172,17 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(center_tabs)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([280, 1120])
-        self.splitter.setHandleWidth(4)
-        left_card.setMinimumWidth(150)
-        self.setCentralWidget(self.splitter)
+        self.splitter.setSizes([264, 1120])
+        self.splitter.setHandleWidth(8)
+        self.splitter.setChildrenCollapsible(False)
+        left_card.setMinimumWidth(230)
+        left_card.setMaximumWidth(320)
+        workspace = QWidget()
+        workspace.setObjectName("workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(10, 8, 2, 4)
+        workspace_layout.addWidget(self.splitter)
+        self.setCentralWidget(workspace)
         self._left_card = left_card
 
         # 底部 Send Dock
@@ -180,6 +204,8 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self.filter_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, self.filter_dock)
+        self.resizeDocks([self.filter_dock], [300], Qt.Horizontal)
+        self.resizeDocks([self.send_dock], [230], Qt.Vertical)
 
     def _toggle_maximize(self):
         """切换最大化/还原。"""
@@ -192,12 +218,35 @@ class MainWindow(QMainWindow):
         w = QFrame()
         w.setObjectName("sidebar")
         layout = QVBoxLayout(w)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(10)
+
+        brand = QHBoxLayout()
+        brand.setContentsMargins(8, 4, 4, 4)
+        brand.setSpacing(10)
+        logo = QLabel()
+        logo_icon = QIcon(os.path.join(os.path.dirname(__file__), "logo.svg"))
+        logo.setPixmap(logo_icon.pixmap(QSize(34, 34), self.devicePixelRatioF()))
+        brand.addWidget(logo)
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(2)
+        self._app_title = QLabel(_("App.Title"))
+        self._app_title.setObjectName("appTitle")
+        self._app_subtitle = QLabel(_("App.Transport"))
+        self._app_subtitle.setObjectName("appSubtitle")
+        brand_text.addWidget(self._app_title)
+        brand_text.addWidget(self._app_subtitle)
+        brand.addLayout(brand_text, 1)
+        layout.addLayout(brand)
 
         # 总线配置
         self._bus_box = QGroupBox(_("Left.Bus"))
         bf = QFormLayout(self._bus_box)
+        bf.setContentsMargins(11, 12, 11, 12)
+        bf.setHorizontalSpacing(8)
+        bf.setVerticalSpacing(8)
+        bf.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        bf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.bitrate_combo = QComboBox()
         bps = _("Left.BPS")
         for b in self.BITRATES:
@@ -241,26 +290,42 @@ class MainWindow(QMainWindow):
         self.sample_combo.addItem(_("Left.Sample50"), 0.50)
         self._lbl_sample = QLabel(_("Left.SamplePoint"))
         bf.addRow(self._lbl_sample, self.sample_combo)
+        for label in (self._lbl_bitrate, self._lbl_canmode, self._lbl_data_bitrate,
+                      self._lbl_data_sample, self._lbl_sample):
+            label.setWordWrap(True)
+            label.setFixedWidth(86)
         layout.addWidget(self._bus_box)
 
         # 设备
         self._dev_box = QGroupBox(_("Left.Devices"))
         dv = QVBoxLayout(self._dev_box)
+        dv.setContentsMargins(12, 12, 12, 12)
+        dv.setSpacing(8)
         self.device_list = QListWidget()
+        self.device_list.setObjectName("deviceList")
+        self.device_list.setTextElideMode(Qt.ElideRight)
+        self.device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.device_list.setSpacing(0)
         dv.addWidget(self.device_list)
+        device_actions = QHBoxLayout()
+        device_actions.setSpacing(8)
         self.scan_btn = QPushButton(_("Left.Scan"))
         self.scan_btn.setIcon(icon_lib.make_icon("scan"))
         self.scan_btn.clicked.connect(self._scan_devices)
         self.device_list.currentItemChanged.connect(self._on_device_selection_changed)
-        dv.addWidget(self.scan_btn)
+        device_actions.addWidget(self.scan_btn)
         self.connect_btn = QPushButton(_("Left.ConnectDevice"))
         self.connect_btn.setObjectName("connectBtn")
         self.connect_btn.setIcon(icon_lib.make_icon("power"))
         self.connect_btn.setCheckable(True)
         self.connect_btn.setEnabled(False)
         self.connect_btn.clicked.connect(self._on_connect_toggle)
-        dv.addWidget(self.connect_btn)
-        layout.addWidget(self._dev_box, 1)
+        device_actions.addWidget(self.connect_btn, 1)
+        dv.addLayout(device_actions)
+        self._dev_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout.addWidget(self._dev_box)
+        layout.addStretch(1)
+        self._fit_device_list()
 
         return w
 
@@ -309,6 +374,18 @@ class MainWindow(QMainWindow):
         lang_menu.addAction(self.act_lang_en)
         lang_group.triggered.connect(self._on_language_changed)
 
+        theme_menu = tools_menu.addMenu(_("Menu.Theme"))
+        self.act_theme_light = QAction(_("Theme.Light"), self, checkable=True)
+        self.act_theme_dark = QAction(_("Theme.Dark"), self, checkable=True)
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        for action, name in ((self.act_theme_light, "light"), (self.act_theme_dark, "dark")):
+            action.setData(name)
+            action.setChecked(style.current_theme() == name)
+            theme_group.addAction(action)
+            theme_menu.addAction(action)
+        theme_group.triggered.connect(self._on_theme_changed)
+
         # Help
         help_menu = mb.addMenu(_("Menu.Help"))
         act_about = QAction(_("Help.About"), self)
@@ -323,6 +400,9 @@ class MainWindow(QMainWindow):
         # register actions for language refresh
         self._menu_actions = [
             (lang_menu, "Menu.Language"),
+            (theme_menu, "Menu.Theme"),
+            (self.act_theme_light, "Theme.Light"),
+            (self.act_theme_dark, "Theme.Dark"),
             (self._menu_file, "Menu.File"),
             (view_menu, "Menu.Windows"),
             (tools_menu, "Menu.Tools"),
@@ -431,6 +511,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _scan_devices(self, _retry: bool = False):
         self.device_list.clear()
+        self._fit_device_list()
         scan_error = None
         try:
             devs = ZDTCanable.list_devices()
@@ -458,6 +539,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(_("Left.NoDevice"))
             item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.device_list.addItem(item)
+            self._fit_device_list()
             self._sync_connect_button()
             return
 
@@ -476,12 +558,20 @@ class MainWindow(QMainWindow):
                                    "?" if addr is None else addr)))
             if self._is_connected_dev(d, connected_dev):
                 name = "%s %s" % (name, _("Scan.Connected"))
-            line2 = ("  " + "  ".join(extras)) if extras else ""
+            line2 = "  ".join(extras)
             li = QListWidgetItem(name + ("\n" + line2 if line2 else ""))
             li.setData(Qt.UserRole, d)
+            li.setToolTip(name + ("\n" + "\n".join(extras) if extras else ""))
             self.device_list.addItem(li)
+        self._fit_device_list()
         self.device_list.setCurrentRow(0)
         self._sync_connect_button()
+
+    def _fit_device_list(self):
+        """Show up to two devices without letting the list consume the sidebar."""
+        rows = max(1, min(2, self.device_list.count()))
+        row_height = self.device_list.fontMetrics().lineSpacing() * 2 + 20
+        self.device_list.setFixedHeight(rows * row_height + 4)
 
     def _sync_connect_button(self):
         """按连接状态同步连接/断开按钮。
@@ -493,13 +583,13 @@ class MainWindow(QMainWindow):
             self.connect_btn.setEnabled(True)
             self.connect_btn.setChecked(True)
             self.connect_btn.setText(_("Left.Disconnect"))
-            self.connect_btn.setIcon(icon_lib.make_icon("power_off"))
+            self.connect_btn.setIcon(icon_lib.make_icon("power_off", style.FG_ERROR))
             return
         item = self.device_list.currentItem()
         selectable = item is not None and bool(item.flags() & Qt.ItemIsEnabled)
         self.connect_btn.setChecked(False)
         self.connect_btn.setText(_("Left.ConnectDevice"))
-        self.connect_btn.setIcon(icon_lib.make_icon("power"))
+        self.connect_btn.setIcon(icon_lib.make_icon("power", "#FFFFFF" if selectable else style.FG_DIM))
         self.connect_btn.setEnabled(selectable)
 
     def _connected_device_info(self) -> Optional[dict]:
@@ -539,8 +629,7 @@ class MainWindow(QMainWindow):
     def _on_device_selection_changed(self):
         if self._connected:
             return
-        item = self.device_list.currentItem()
-        self.connect_btn.setEnabled(item is not None and bool(item.flags() & Qt.ItemIsEnabled))
+        self._sync_connect_button()
     # ----------------------------------------------------------- CAN FD
     @Slot(bool)
     def _on_fd_toggle(self, enabled: bool):
@@ -873,6 +962,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self._settings = {}
         s = self._settings
+        self._apply_theme(s.get("theme", "light"), persist=False)
         bitrate = s.get("bitrate", 500_000)
         if bitrate in self.BITRATES:
             self.bitrate_combo.setCurrentIndex(self.bitrate_combo.findData(bitrate))
@@ -891,7 +981,6 @@ class MainWindow(QMainWindow):
         if s.get("paused", False):
             self.trace_panel.pause_btn.setChecked(True)
         lang = s.get("language", "zh")
-        QApplication.instance().setStyleSheet(get_qss())
         set_language(lang)
         if hasattr(self, "act_lang_zh"):
             self.act_lang_zh.setChecked(lang == "zh")
@@ -903,8 +992,15 @@ class MainWindow(QMainWindow):
         splitter_hex = s.get("splitter")
         if splitter_hex:
             self.splitter.restoreState(bytes.fromhex(splitter_hex))
+        compact_layout = s.get("ui.layout_version", 0) < 1
+        if compact_layout:
+            # One-time migration from the oversized sidebar/trace columns.
+            self.splitter.setSizes([264, 1120])
+            self._set("splitter", bytes(self.splitter.saveState().toHex()).decode())
+            self._set("trace_hdr", bytes(self.trace_panel.view.horizontalHeader().saveState().toHex()).decode())
+            self._set("ui.layout_version", 1)
         trace_hdr = s.get("trace_hdr")
-        if trace_hdr:
+        if trace_hdr and not compact_layout:
             self.trace_panel.view.horizontalHeader().restoreState(bytes.fromhex(trace_hdr))
         send_hdr = s.get("send_hdr")
         if send_hdr:
@@ -918,6 +1014,10 @@ class MainWindow(QMainWindow):
         state = s.get("state")
         if state:
             self.restoreState(bytes.fromhex(state))
+        else:
+            # Resolve the initial dock proportions after Qt knows the actual
+            # central-widget geometry, rather than the pre-show size hints.
+            QTimer.singleShot(0, lambda: self.resizeDocks([self.send_dock], [260], Qt.Vertical))
         # 恢复浮动 dock 的几何信息
         for name, dock in [("send_dock", self.send_dock), ("filter_dock", self.filter_dock)]:
             if s.get(f"{name}_floating"):
@@ -940,8 +1040,32 @@ class MainWindow(QMainWindow):
         set_language("zh" if action == self.act_lang_zh else "en")
         self._refresh_language()
 
+    def _on_theme_changed(self, action):
+        self._apply_theme(action.data())
+
+    def _apply_theme(self, name, persist=True):
+        previous = style.current_theme()
+        style.apply_style(QApplication.instance(), name)
+        theme = style.current_theme()
+        self.act_theme_light.setChecked(theme == "light")
+        self.act_theme_dark.setChecked(theme == "dark")
+        icon_lib.clear_cache()
+        self.trace_panel.refresh_theme()
+        self.send_panel.refresh_icons()
+        self.filter_panel.refresh_icons()
+        self.scan_btn.setIcon(icon_lib.make_icon("scan"))
+        self._sync_connect_button()
+        if hasattr(self, "plugins"):
+            self.plugins.refresh_theme()
+        if persist:
+            self._set("theme", theme)
+        if previous != theme:
+            logger.info("界面主题: %s", theme)
+
     def _refresh_language(self):
         self.setWindowTitle("CANable 2.5")
+        self._app_title.setText(_("App.Title"))
+        self._app_subtitle.setText(_("App.Transport"))
         # menu actions
         if hasattr(self, "_menu_actions"):
             for item, key in self._menu_actions:
@@ -959,6 +1083,7 @@ class MainWindow(QMainWindow):
         self._lbl_data_bitrate.setText(_("Left.DataBitrate"))
         self._lbl_sample.setText(_("Left.SamplePoint"))
         self._lbl_canmode.setText(_("Left.CANMode"))
+        self._lbl_data_sample.setText(_("Left.DataSamplePoint"))
         self.fd_chk.setText(_("Left.CANFD"))
         # status bar
         if hasattr(self, "fps_label"):
@@ -1040,6 +1165,7 @@ class MainWindow(QMainWindow):
             self.data_sample_combo.blockSignals(False)
         # 语言切换重建下拉框后，同步 8Mbps 强制 50% 的 UI 状态
         self._update_data_sample_state()
+        self._fit_device_list()
         # 通知插件刷新语言
         if hasattr(self, "plugins"):
             self.plugins.refresh_language()
@@ -1058,6 +1184,7 @@ class MainWindow(QMainWindow):
         self._set("collapse", self.trace_panel.collapse_chk.isChecked())
         self._set("paused", self.trace_panel.pause_btn.isChecked())
         self._set("language", get_language())
+        self._set("theme", style.current_theme())
         self._set("filters", self.filter_panel.to_dict_list())
         self._set("splitter", bytes(self.splitter.saveState().toHex()).decode())
         self._set("trace_hdr", bytes(self.trace_panel.view.horizontalHeader().saveState().toHex()).decode())

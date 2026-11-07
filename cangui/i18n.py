@@ -32,6 +32,8 @@ def get_language() -> str:
 
 # ── register translations ────────────────────────────────────────────
 _TR.update({
+    "App.Title":             {"zh": "CANable 2.5", "en": "CANable 2.5"},
+    "App.Transport":         {"zh": "USB · CAN / CAN FD", "en": "USB · CAN / CAN FD"},
     # Menus
     "Menu.File":             {"zh": "文件(&F)",  "en": "&File"},
     "Menu.Windows":          {"zh": "窗口(&W)",  "en": "&Windows"},
@@ -39,6 +41,10 @@ _TR.update({
     "Menu.Help":             {"zh": "帮助(&H)",  "en": "&Help"},
     "Menu.Plugins":          {"zh": "插件(&P)",  "en": "&Plugins"},
     "Menu.Language":         {"zh": "语言",      "en": "Language"},
+    "Menu.Theme":            {"zh": "主题",      "en": "Theme"},
+    "Theme.Light":           {"zh": "浅色",      "en": "Light"},
+    "Theme.Dark":            {"zh": "深色",      "en": "Dark"},
+    "Plugin.ToggleSection": {"zh": "展开 / 收起", "en": "Expand / collapse"},
 
     # File menu items
     "File.OpenTrace":        {"zh": "打开 Trace(&O)…", "en": "&Open Trace…"},

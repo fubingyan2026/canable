@@ -12,9 +12,10 @@ from __future__ import annotations
 from collections import deque
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QEvent
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
+from cangui import style
 
 BUCKET_S = 0.005
 MAX_BUCKETS = 5000                  # 25 s @5 ms
@@ -31,6 +32,7 @@ class ValueScope(QWidget):
         super().__init__(parent)
         self._name = name
         self._color = QColor(color)
+        self._color_role = style.color_role(color)
         self._unit = unit
         self._bucket: deque = deque(maxlen=MAX_BUCKETS)
         self._offset = 0.0
@@ -94,6 +96,12 @@ class ValueScope(QWidget):
         self._timer.stop()
 
     # ── 内部 ──
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.PaletteChange and getattr(self, "_color_role", None):
+            self._color = QColor(getattr(style, self._color_role))
+            self.update()
+
     def _last_t(self) -> Optional[float]:
         return self._bucket[-1][0] * BUCKET_S if self._bucket else None
 

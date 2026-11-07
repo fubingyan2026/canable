@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QGridLayout,
 
 from cangui.i18n import _
 from cangui import style
+from cangui.plugin_ui import DisclosureSection, FlowLayout
 
 from . import protocol as P
 from .scope import DEFAULT_WINDOW_S, WINDOW_CHOICES, TorqueScope
@@ -38,11 +39,6 @@ from .setid import SetIdSignals, SetIdTask
 logger = logging.getLogger("plugin.torque_sensor")
 
 # 颜色（复用 style.py 常量，不硬编码 hex）
-_OK = style.LOAD_LOW    # 绿
-_WARN = style.LOAD_MID  # 橙
-_ERR = style.LOAD_HIGH  # 红
-_DIM = style.FG_DIM
-_TEXT = style.FG_TEXT
 
 # 命令应答超时（秒）：配置写入应答通常很快，超过即视为超时
 _CMD_TIMEOUT_S = 1.5
@@ -234,7 +230,7 @@ class TorqueSensorPanel(QWidget):
         self._setid_restore: list = []
         self._setid_status_key = "Torque.SetId.Idle"
         self._setid_status_params = None
-        self._setid_status_color = _DIM
+        self._setid_status_color = style.FG_DIM
 
         self._build_ui()
         self._load_config_to_ui()
@@ -300,7 +296,7 @@ class TorqueSensorPanel(QWidget):
 
     def _build_config_box(self) -> QGroupBox:
         box = self._group("Torque.Config")
-        lay = QHBoxLayout(box)
+        lay = FlowLayout(box)
 
         lay.addWidget(self._label("Torque.SampleRate"))
         self._rate_spin = QSpinBox()
@@ -319,7 +315,6 @@ class TorqueSensorPanel(QWidget):
         self._static.append((self._auto_init_chk, "Torque.AutoInit"))
         lay.addWidget(self._auto_init_chk)
 
-        lay.addStretch(1)
         lay.addWidget(self._btn("Torque.StartAll", self._on_start_all))
         lay.addWidget(self._btn("Torque.StopAll", self._on_stop_all))
         return box
@@ -341,45 +336,44 @@ class TorqueSensorPanel(QWidget):
         f.setPointSize(f.pointSize() + 5)
         f.setBold(True)
         big.setFont(f)
-        big.setStyleSheet(f"color: {_OK};")
+        style.set_text_color(big, style.LOAD_LOW)
 
         raw = QLabel(_("Torque.NoData"))
         off = QLabel("+0.000")
         for w in (raw, off):
-            w.setStyleSheet(f"color: {_DIM};")
+            style.set_text_color(w, style.FG_DIM)
 
         fmt = QLabel(_("Torque.Fmt.None"))
         frames = QLabel("0 (0)")
         ack = QLabel(_("Torque.NoData"))
-        ack.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(ack, style.FG_DIM)
         status = QLabel(_("Torque.Reporting.Unknown"))
-        status.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(status, style.FG_DIM)
 
         grid.addWidget(self._label("Torque.Corrected"), 0, 0)
-        grid.addWidget(big, 0, 1)
-        grid.addWidget(unit, 0, 2)
+        grid.addWidget(big, 0, 1, 1, 4)
+        grid.addWidget(unit, 0, 5)
         grid.addWidget(self._label("Torque.Raw"), 1, 0)
         grid.addWidget(raw, 1, 1, 1, 2)
-        grid.addWidget(self._label("Torque.Offset"), 2, 0)
-        grid.addWidget(off, 2, 1, 1, 2)
-        grid.addWidget(self._label("Torque.Format"), 3, 0)
-        grid.addWidget(fmt, 3, 1, 1, 2)
-        grid.addWidget(self._label("Torque.Frames"), 4, 0)
-        grid.addWidget(frames, 4, 1, 1, 2)
-        grid.addWidget(self._label("Torque.Ack"), 5, 0)
-        grid.addWidget(ack, 5, 1, 1, 2)
-        grid.addWidget(self._label("Torque.Status"), 6, 0)
-        grid.addWidget(status, 6, 1, 1, 2)
+        grid.addWidget(self._label("Torque.Offset"), 1, 3)
+        grid.addWidget(off, 1, 4, 1, 2)
+        grid.addWidget(self._label("Torque.Format"), 2, 0)
+        grid.addWidget(fmt, 2, 1, 1, 2)
+        grid.addWidget(self._label("Torque.Frames"), 2, 3)
+        grid.addWidget(frames, 2, 4, 1, 2)
+        grid.addWidget(self._label("Torque.Ack"), 3, 0)
+        grid.addWidget(ack, 3, 1, 1, 2)
+        grid.addWidget(self._label("Torque.Status"), 3, 3)
+        grid.addWidget(status, 3, 4, 1, 2)
 
-        btn_row = QHBoxLayout()
+        btn_row = FlowLayout()
         btn_row.addWidget(self._btn("Torque.Start", lambda: self._on_start(i)))
         btn_row.addWidget(self._btn("Torque.Stop", lambda: self._on_stop(i)))
         btn_row.addWidget(self._btn("Torque.HwZero", lambda: self._on_hw_zero(i)))
         btn_row.addWidget(self._btn("Torque.SwZero", lambda: self._on_sw_zero(i)))
         btn_row.addWidget(self._btn("Torque.ClearOffset",
                                     lambda: self._on_clear_offset(i)))
-        btn_row.addStretch(1)
-        grid.addLayout(btn_row, 7, 0, 1, 3)
+        grid.addLayout(btn_row, 4, 0, 1, 6)
 
         self._chan.append({"big": big, "raw": raw, "off": off, "fmt": fmt,
                            "frames": frames, "ack": ack, "status": status,
@@ -456,21 +450,22 @@ class TorqueSensorPanel(QWidget):
         self._scope.clear()
 
     # ── 站号扫描 / 设置 ID ──
-    def _build_setid_box(self) -> QGroupBox:
-        box = self._group("Torque.SetId.Title")
-        lay = QVBoxLayout(box)
+    def _build_setid_box(self) -> DisclosureSection:
+        box = DisclosureSection(_("Torque.SetId.Title"))
+        self._titles.append((box, "Torque.SetId.Title"))
+        lay = QVBoxLayout(box.body)
         lay.setSpacing(4)
 
         info = QLabel(_("Torque.SetId.Warn"))
         info.setWordWrap(True)
-        info.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(info, style.FG_DIM)
         self._static.append((info, "Torque.SetId.Warn"))
         lay.addWidget(info)
 
         row = QHBoxLayout()
         row.addWidget(self._label("Torque.SetId.Current"))
         self._setid_current_lbl = QLabel(_("Torque.NoData"))
-        self._setid_current_lbl.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
+        style.set_text_color(self._setid_current_lbl, style.FG_TEXT, 'font-weight: 600;')
         row.addWidget(self._setid_current_lbl)
         row.addStretch(1)
         self._scan_btn = self._btn("Torque.SetId.Scan", self._on_setid_scan)
@@ -489,7 +484,7 @@ class TorqueSensorPanel(QWidget):
         row2.addWidget(self._write_btn)
         row2.addStretch(1)
         self._setid_status = QLabel(_("Torque.SetId.Idle"))
-        self._setid_status.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._setid_status, style.FG_DIM)
         row2.addWidget(self._setid_status)
         lay.addLayout(row2)
 
@@ -522,7 +517,7 @@ class TorqueSensorPanel(QWidget):
             except Exception:
                 pass
         self._setid_status.setText(text)
-        self._setid_status.setStyleSheet(f"color: {self._setid_status_color};")
+        style.set_text_color(self._setid_status, self._setid_status_color)
 
     def _render_setid_current(self):
         if self._setid_current is None:
@@ -553,7 +548,7 @@ class TorqueSensorPanel(QWidget):
             return
         target = int(self._setid_target_spin.value())
         if not P.station_valid(target):
-            self._set_setid_status("Torque.SetId.BadTarget", _ERR)
+            self._set_setid_status("Torque.SetId.BadTarget", style.LOAD_HIGH)
             return
         ret = QMessageBox.warning(
             self, _("Torque.SetId.Title"),
@@ -572,7 +567,7 @@ class TorqueSensorPanel(QWidget):
             return
         self._setid_busy = True
         self._setid_buttons_enabled(False)
-        self._set_setid_status("Torque.SetId.Running", _WARN)
+        self._set_setid_status("Torque.SetId.Running", style.LOAD_MID)
         # 记录改号前正在上报的通道，操作结束后恢复
         self._setid_restore = [i for i in range(P.NUM_CHANNELS)
                                if self._st[i].reporting in ("on", "pending_on")]
@@ -596,11 +591,11 @@ class TorqueSensorPanel(QWidget):
         except Exception as exc:
             self._setid_busy = False
             self._setid_buttons_enabled(True)
-            self._set_setid_status("Torque.SetId.Error", _ERR)
+            self._set_setid_status("Torque.SetId.Error", style.LOAD_HIGH)
             logger.warning("启动扫描/改号任务失败: %s", exc)
 
     def _on_setid_progress(self, scanned: int, total: int):
-        self._set_setid_status("Torque.SetId.Scanning", _WARN,
+        self._set_setid_status("Torque.SetId.Scanning", style.LOAD_MID,
                                {"n": scanned, "total": total})
 
     def _on_setid_found(self, station: int, replies: int):
@@ -631,30 +626,30 @@ class TorqueSensorPanel(QWidget):
         if code == "scan_only" and res is not None:
             self._setid_current = res.current
             self._render_setid_current()
-            self._set_setid_status("Torque.SetId.ScanOk", _OK,
+            self._set_setid_status("Torque.SetId.ScanOk", style.LOAD_LOW,
                                    {"station": res.current})
         elif code == "write_ok" and res is not None:
             self._setid_current = res.target
             self._render_setid_current()
-            self._set_setid_status("Torque.SetId.WriteOk", _OK,
+            self._set_setid_status("Torque.SetId.WriteOk", style.LOAD_LOW,
                                    {"target": res.target})
             self._ctx.status_message(
                 _("Torque.SetId.WriteOk").format(target=res.target), 5000)
         elif code == "scan_failed":
             count = len(res.found_stations) if res is not None else 0
-            self._set_setid_status("Torque.SetId.ScanFail", _ERR,
+            self._set_setid_status("Torque.SetId.ScanFail", style.LOAD_HIGH,
                                    {"count": count})
         elif code == "bad_target":
-            self._set_setid_status("Torque.SetId.BadTarget", _ERR)
+            self._set_setid_status("Torque.SetId.BadTarget", style.LOAD_HIGH)
         elif code == "write_timeout":
-            self._set_setid_status("Torque.SetId.WriteTimeout", _ERR)
+            self._set_setid_status("Torque.SetId.WriteTimeout", style.LOAD_HIGH)
             self._append_setid_log("warn", _("Torque.SetId.WriteTimeout"))
         elif code == "write_error":
-            self._set_setid_status("Torque.SetId.WriteError", _ERR)
+            self._set_setid_status("Torque.SetId.WriteError", style.LOAD_HIGH)
         elif code == "cancelled":
-            self._set_setid_status("Torque.SetId.Cancelled", _WARN)
+            self._set_setid_status("Torque.SetId.Cancelled", style.LOAD_MID)
         else:
-            self._set_setid_status("Torque.SetId.Error", _ERR)
+            self._set_setid_status("Torque.SetId.Error", style.LOAD_HIGH)
 
     # ── 配置事件 ──
     def _on_rate_changed(self, value: int):
@@ -903,22 +898,22 @@ class TorqueSensorPanel(QWidget):
     def _status_text(self, i: int):
         st = self._st[i]
         if not self._ctx.is_connected():
-            return _("Torque.Status.Disconnected"), _DIM
+            return _("Torque.Status.Disconnected"), style.FG_DIM
         if st.pending_cmd is not None:
-            return _("Torque.Reporting.Pending"), _WARN
+            return _("Torque.Reporting.Pending"), style.LOAD_MID
         if st.reporting == "on":
             if st.last_rx:
                 if time.monotonic() - st.last_rx <= self._stale_threshold:
                     t = datetime.now().strftime("%H:%M:%S")
                     return (f"{_('Torque.Reporting.On')} · "
-                            f"{_('Torque.UpdatedAt')} {t}", _OK)
-                return _("Torque.Offline"), _WARN
-            return _("Torque.Waiting"), _DIM
+                            f"{_('Torque.UpdatedAt')} {t}", style.LOAD_LOW)
+                return _("Torque.Offline"), style.LOAD_MID
+            return _("Torque.Waiting"), style.FG_DIM
         if st.reporting == "off":
-            return _("Torque.Reporting.Off"), _DIM
+            return _("Torque.Reporting.Off"), style.FG_DIM
         if st.last_rx:
-            return _("Torque.Offline"), _WARN
-        return _("Torque.Reporting.Unknown"), _DIM
+            return _("Torque.Offline"), style.LOAD_MID
+        return _("Torque.Reporting.Unknown"), style.FG_DIM
 
     def _update_channel(self, i: int):
         if i >= len(self._chan):
@@ -934,7 +929,7 @@ class TorqueSensorPanel(QWidget):
         w["ack"].setText(self._ack_text(st.last_ack))
         text, color = self._status_text(i)
         w["status"].setText(text)
-        w["status"].setStyleSheet(f"color: {color};")
+        style.set_text_color(w["status"], color)
 
     def _update_status(self):
         now = time.monotonic()
@@ -976,7 +971,7 @@ class TorqueSensorPanel(QWidget):
         self._hz_stage = None
         self._hz_target = None
         self._hz_restore = []
-        self._set_setid_status("Torque.SetId.Idle", _DIM)
+        self._set_setid_status("Torque.SetId.Idle", style.FG_DIM)
         self._stale_timer.start()
         self._update_status()
 
@@ -1003,7 +998,7 @@ class TorqueSensorPanel(QWidget):
                 pass
         self._setid_busy = False
         self._setid_buttons_enabled(True)
-        self._set_setid_status("Torque.Status.Disconnected", _DIM)
+        self._set_setid_status("Torque.Status.Disconnected", style.FG_DIM)
         self._scope.clear()
         for st in self._st:
             st.reset()

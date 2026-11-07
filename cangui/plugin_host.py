@@ -35,6 +35,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QTabWidget, QWidget
 
 from canable_sdk import CANFrame
+from .plugin_ui import prepare_plugin_ui
 
 logger = logging.getLogger("cangui.plugins")
 
@@ -145,6 +146,7 @@ class Plugin(QObject):
           on_disconnect()          — 仅 active 时收到
           on_frames(frames)        — 仅 active 时收到批量帧（100ms 节流）
           refresh_language()       — 语言切换时刷新 UI
+          refresh_theme()          — 明暗切换时刷新自定义画刷/缓存
         deactivate()               — 用户关闭 Tab：on_deactivating() → remove_tab() → teardown_widget()
         shutdown()                 — 应用退出一次：若仍 active 先 deactivate
 
@@ -155,7 +157,7 @@ class Plugin(QObject):
 
     子类可选实现：
         teardown_widget(widget) — 默认调用 widget.deleteLater()
-        on_activated / on_deactivating / on_connect / on_disconnect / on_frames / refresh_language
+        on_activated / on_deactivating / on_connect / on_disconnect / on_frames / refresh_language / refresh_theme
     """
 
     name: str = ""
@@ -185,6 +187,7 @@ class Plugin(QObject):
         widget = None
         try:
             widget = self.build_widget(self._ctx)
+            prepare_plugin_ui(widget)
             self._widget = widget
             self._ctx.add_tab(self.display_title(), widget, plugin_name=self.name)
             if self._menu_action is not None:
@@ -296,6 +299,13 @@ class Plugin(QObject):
 
     def teardown_widget(self, widget: QWidget) -> None:
         widget.deleteLater()
+
+    def refresh_theme(self) -> None:
+        """Refresh custom brushes without recreating the plugin or its state."""
+        if self._widget is not None:
+            callback = getattr(self._widget, "refresh_theme", None)
+            if callback is not None:
+                callback()
 
 
 # --------------------------------------------------------------------------- #
@@ -444,7 +454,7 @@ class PluginHost:
         """防抖 500ms 保存当前 active 插件名列表。"""
         from PySide6.QtCore import QTimer
         if self._save_timer is None:
-            self._save_timer = QTimer()
+            self._save_timer = QTimer(self._mw)
             self._save_timer.setSingleShot(True)
             self._save_timer.setInterval(500)
             self._save_timer.timeout.connect(self._save_active_state)
@@ -511,6 +521,14 @@ class PluginHost:
             except Exception:
                 logger.exception("插件 %s refresh_language 异常", p.name)
 
+    def refresh_theme(self) -> None:
+        for plugin in self._plugins:
+            if plugin.is_active():
+                try:
+                    plugin.refresh_theme()
+                except Exception:
+                    logger.exception("插件 %s refresh_theme 异常", plugin.name)
+
     def shutdown(self) -> None:
         # 先把 active 状态立即落盘（不等防抖）
         try:
@@ -523,4 +541,8 @@ class PluginHost:
                 p.deactivate(force=True)
             except Exception:
                 logger.exception("插件 %s shutdown 异常", p.name)
+        # Unchecking plugin actions during deactivate can restart the debounce
+        # timer. Do not overwrite the saved active list after the window closes.
+        if self._save_timer is not None:
+            self._save_timer.stop()
         self._plugins.clear()

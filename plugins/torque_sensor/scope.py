@@ -14,9 +14,10 @@ import time
 from collections import deque
 from typing import List, Optional
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QEvent
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
+from cangui import style
 
 BUCKET_S = 0.005            # 5ms 时间桶
 MAX_BUCKETS = 5000          # 25s @5ms，覆盖最大时间窗
@@ -33,6 +34,7 @@ class TorqueScope(QWidget):
         super().__init__(parent)
         self._names = list(names)
         self._colors = [QColor(c) for c in colors]
+        self._color_roles = [style.color_role(color) for color in colors]
         self._buckets: List[deque] = [deque(maxlen=MAX_BUCKETS) for _ in names]
         self._offsets = [0.0] * len(names)
         self._window = DEFAULT_WINDOW_S
@@ -44,6 +46,13 @@ class TorqueScope(QWidget):
         self._timer.timeout.connect(self.update)
         self.setMinimumHeight(160)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.PaletteChange and hasattr(self, "_color_roles"):
+            self._colors = [QColor(getattr(style, role)) if role else color
+                            for role, color in zip(self._color_roles, self._colors)]
+            self.update()
 
     # ── 数据接口（主线程）──
     def add_sample(self, ch: int, t: Optional[float], raw: float) -> None:

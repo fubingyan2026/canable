@@ -20,7 +20,7 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont
-from PySide6.QtWidgets import (QCheckBox, QGridLayout, QGroupBox, QHBoxLayout,
+from PySide6.QtWidgets import (QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
                                 QLabel, QPushButton, QSpinBox, QTableWidget,
                                 QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -31,11 +31,6 @@ from . import protocol as P
 logger = logging.getLogger("plugin.power_monitor")
 
 # 颜色（复用 style.py 常量，不硬编码 hex）
-_OK = style.LOAD_LOW    # 绿
-_WARN = style.LOAD_MID  # 橙
-_ERR = style.LOAD_HIGH  # 红
-_DIM = style.FG_DIM
-_TEXT = style.FG_TEXT
 
 # 表格列
 COL_PARAM = 0    # 参数（协议字段名，如 total_ov）
@@ -355,7 +350,7 @@ class PowerMonitorPanel(QWidget):
         # 状态行
         status_row = QHBoxLayout()
         self._status_label = QLabel(_("Power.Status.Waiting"))
-        self._status_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._status_label, style.FG_DIM)
         status_row.addWidget(self._status_label)
         status_row.addStretch(1)
         root.addLayout(status_row)
@@ -370,11 +365,12 @@ class PowerMonitorPanel(QWidget):
         self._table.setShowGrid(False)
         self._table.setAlternatingRowColors(False)
         self._table.verticalHeader().setVisible(False)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(COL_PARAM, 170)
-        self._table.setColumnWidth(COL_DESC, 220)
-        self._table.setColumnWidth(COL_VALUE, 90)
-        self._table.setColumnWidth(COL_UNIT, 56)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
+        self._table.setColumnWidth(COL_PARAM, 150)
+        self._table.setColumnWidth(COL_VALUE, 80)
+        self._table.setColumnWidth(COL_UNIT, 48)
+        self._table.setColumnWidth(COL_STATUS, 180)
         self._build_rows()
         root.addWidget(self._table, 1)
 
@@ -398,8 +394,8 @@ class PowerMonitorPanel(QWidget):
                 font = QFont()
                 font.setBold(True)
                 item.setFont(font)
-                item.setForeground(QBrush(QColor(_DIM)))
-                bg = QColor(_DIM)
+                item.setForeground(QBrush(QColor(style.FG_DIM)))
+                bg = QColor(style.FG_DIM)
                 bg.setAlpha(26)
                 item.setBackground(QBrush(bg))
                 item.setFlags(Qt.ItemIsEnabled)
@@ -413,7 +409,7 @@ class PowerMonitorPanel(QWidget):
                 u = QTableWidgetItem("")
                 s = QTableWidgetItem("")
                 for it in (v, u, s):
-                    it.setForeground(QBrush(QColor(_DIM)))
+                    it.setForeground(QBrush(QColor(style.FG_DIM)))
                 table.setItem(row, COL_PARAM, p)
                 table.setItem(row, COL_DESC, d)
                 table.setItem(row, COL_VALUE, v)
@@ -461,7 +457,7 @@ class PowerMonitorPanel(QWidget):
 
     def _send_request(self):
         if not self._ctx.is_connected():
-            self._set_status(_("Power.NotConnected"), _ERR)
+            self._set_status(_("Power.NotConnected"), style.LOAD_HIGH)
             return
         self._ctx.send_frame(P.build_request_frame(self._current_mask()))
 
@@ -472,26 +468,26 @@ class PowerMonitorPanel(QWidget):
     # ── 状态标签 ──
     def _set_status(self, text: str, color: str):
         if (self._status_label.text() == text
-                and color in self._status_label.styleSheet()):
+                and self._status_label.property("themeForeground") == style.color_role(color)):
             return
         self._status_label.setText(text)
-        self._status_label.setStyleSheet(f"color: {color};")
+        style.set_text_color(self._status_label, color)
 
     def _update_status_label(self):
         if not self._ctx.is_connected():
-            self._set_status(_("Power.Status.Disconnected"), _DIM)
+            self._set_status(_("Power.Status.Disconnected"), style.FG_DIM)
             return
         if self._state.last_rx:
             age = time.monotonic() - self._state.last_rx
             if age > self._stale_threshold:
-                self._set_status(_("Power.Status.Offline"), _WARN)
+                self._set_status(_("Power.Status.Offline"), style.LOAD_MID)
             else:
                 t = datetime.now().strftime("%H:%M:%S")
                 self._set_status(
                     f"{_('Power.Status.Connected')} · {_('Power.Status.Updating')} {t}",
-                    _OK)
+                    style.LOAD_LOW)
         else:
-            self._set_status(_("Power.Status.Waiting"), _DIM)
+            self._set_status(_("Power.Status.Waiting"), style.FG_DIM)
 
     # ── 帧处理 ──
     def _store(self, can_id: int, obj):
@@ -567,7 +563,7 @@ class PowerMonitorPanel(QWidget):
 
     # ── 值计算：返回 (value, unit, status, value_color, status_color) ──
     def _nodata(self):
-        return (_("Power.NoData"), "", "", _DIM, _DIM)
+        return (_("Power.NoData"), "", "", style.FG_DIM, style.FG_DIM)
 
     @staticmethod
     def _attr(obj, name, default=None):
@@ -575,11 +571,11 @@ class PowerMonitorPanel(QWidget):
 
     def _ok_err(self, ok: bool):
         return (_("Power.OK") if ok else _("Power.Abnormal"), "", "",
-                _OK if ok else _ERR, _OK if ok else _ERR)
+                style.LOAD_LOW if ok else style.LOAD_HIGH, style.LOAD_LOW if ok else style.LOAD_HIGH)
 
     def _online(self, v: bool):
         return (_("Power.Online") if v else _("Power.Offline"), "", "",
-                _OK if v else _ERR, _OK if v else _ERR)
+                style.LOAD_LOW if v else style.LOAD_HIGH, style.LOAD_LOW if v else style.LOAD_HIGH)
 
     def _compute(self, rid: str):
         st = self._state
@@ -599,15 +595,15 @@ class PowerMonitorPanel(QWidget):
         if rid == "sys.stopkey":
             v = sys.stop_key_state
             return (_("Power.Pressed") if v else _("Power.Released"), "", "",
-                    _ERR if v else _OK, _ERR if v else _OK)
+                    style.LOAD_HIGH if v else style.LOAD_LOW, style.LOAD_HIGH if v else style.LOAD_LOW)
         if rid == "sys.batkey":
             v = sys.battery_key_state
             return (_("Power.On") if v else _("Power.Off"), "", "",
-                    _OK if v else _DIM, _OK if v else _DIM)
+                    style.LOAD_LOW if v else style.FG_DIM, style.LOAD_LOW if v else style.FG_DIM)
         if rid == "sys.charging":
             v = sys.battery_charging
             return (_("Power.Charging") if v else _("Power.Discharging"), "", "",
-                    _OK if v else _TEXT, _OK if v else _TEXT)
+                    style.LOAD_LOW if v else style.FG_TEXT, style.LOAD_LOW if v else style.FG_TEXT)
         if rid == "sys.battempe":
             return self._ok_err(not sys.battery_temp_error)
         if rid == "sys.slaver":
@@ -627,14 +623,14 @@ class PowerMonitorPanel(QWidget):
         if name == "err_ntc":
             bits = sys.ntc_bits
             if bits == 0:
-                return (_("Power.OK"), "", "", _OK, _OK)
+                return (_("Power.OK"), "", "", style.LOAD_LOW, style.LOAD_LOW)
             lst = ",".join(f"NTC{i}" for i in range(8) if bits & (1 << i))
-            return (lst, "", "", _ERR, _ERR)
+            return (lst, "", "", style.LOAD_HIGH, style.LOAD_HIGH)
         v = sys.rail_errors.get(name)
         if v is None:
             return self._nodata()
         if name.startswith("a_in"):
-            return ("1" if v else "0", "", "", _TEXT, _TEXT)
+            return ("1" if v else "0", "", "", style.FG_TEXT, style.FG_TEXT)
         return self._ok_err(not v)
 
     def _compute_bat(self, n: int, field: str, st):
@@ -668,61 +664,61 @@ class PowerMonitorPanel(QWidget):
         if field == "Soc":
             if soc is None:
                 return self._nodata()
-            color = _ERR if soc < 20 else (_WARN if soc < 50 else _OK)
+            color = style.LOAD_HIGH if soc < 20 else (style.LOAD_MID if soc < 50 else style.LOAD_LOW)
             return (f"{soc}", "%", "", color, color)
         if field == "Voltage":
             if volt is None:
                 return self._nodata()
-            return (f"{volt:.1f}", "V", "", _TEXT, _TEXT)
+            return (f"{volt:.1f}", "V", "", style.FG_TEXT, style.FG_TEXT)
         if field == "Current":
             if curr is None:
                 return self._nodata()
             s = _("Power.Discharging") if curr >= 0 else _("Power.Charging")
-            c = _OK if curr >= 0 else _WARN
+            c = style.LOAD_LOW if curr >= 0 else style.LOAD_MID
             return (f"{curr:+.1f}", "A", s, c, c)
         if field == "Temp":
             if temp is None:
                 return self._nodata()
-            return (f"{temp}", "°C", "", _TEXT, _TEXT)
+            return (f"{temp}", "°C", "", style.FG_TEXT, style.FG_TEXT)
         if field == "Capacity":
             if cap is None:
                 return self._nodata()
-            return (f"{cap}", "mAh", "", _TEXT, _TEXT)
+            return (f"{cap}", "mAh", "", style.FG_TEXT, style.FG_TEXT)
         if field == "Cycle":
             if cyc is None:
                 return self._nodata()
-            return (f"{cyc}", _("Power.Unit.Cycle"), "", _TEXT, _TEXT)
+            return (f"{cyc}", _("Power.Unit.Cycle"), "", style.FG_TEXT, style.FG_TEXT)
         if field in ("HwVer", "SwVer"):
             v = hw if field == "HwVer" else sw
             if v is None:
                 return self._nodata()
-            return (f"{v >> 8}.{v & 0xFF}", "", "", _TEXT, _TEXT)
+            return (f"{v >> 8}.{v & 0xFF}", "", "", style.FG_TEXT, style.FG_TEXT)
         if field == "Charging":
             if chg is None:
                 return self._nodata()
             return (_("Power.Charging") if chg else _("Power.Discharging"),
-                    "", "", _OK if chg else _TEXT, _OK if chg else _TEXT)
+                    "", "", style.LOAD_LOW if chg else style.FG_TEXT, style.LOAD_LOW if chg else style.FG_TEXT)
         if field == "FaultLevel":
             if level is None:
                 return self._nodata()
             text = (_("Power.FaultLevel.Normal"), _("Power.FaultLevel.Minor"),
                     _("Power.FaultLevel.Serious"), _("Power.FaultLevel.Fatal"))
-            colors = (_OK, _WARN, _ERR, _ERR)
+            colors = (style.LOAD_LOW, style.LOAD_MID, style.LOAD_HIGH, style.LOAD_HIGH)
             level = max(0, min(3, level))
             return (text[level], "", "", colors[level], colors[level])
         if field == "Warnings":
             if warn is None:
                 return self._nodata()
-            c = _OK if warn == 0 else _WARN
+            c = style.LOAD_LOW if warn == 0 else style.LOAD_MID
             s = _("Power.OK") if warn == 0 else _("Power.Abnormal")
             return (f"0x{warn:04X}", "", s, c, c)
         if field == "FaultList":
             if faults is None:
                 return self._nodata()
             if not faults:
-                return ("", "", _("Power.NoFault"), _OK, _OK)
+                return ("", "", _("Power.NoFault"), style.LOAD_LOW, style.LOAD_LOW)
             names = ", ".join(faults)   # 原始字段名，如 total_ov
-            return ("", "", names, _ERR, _ERR)
+            return ("", "", names, style.LOAD_HIGH, style.LOAD_HIGH)
         return self._nodata()
 
     # ── 生命周期 ──
@@ -750,6 +746,19 @@ class PowerMonitorPanel(QWidget):
         self._stale_timer.stop()
         self._state = P.PowerState()
         self._update_status_label()
+
+    def refresh_theme(self):
+        for rid, row in self._row_index.items():
+            if rid.startswith("sec."):
+                item = self._table.item(row, COL_PARAM)
+                item.setForeground(QBrush(QColor(style.FG_DIM)))
+                background = QColor(style.FG_DIM)
+                background.setAlpha(26)
+                item.setBackground(QBrush(background))
+            else:
+                self._table.item(row, COL_UNIT).setForeground(QBrush(QColor(style.FG_DIM)))
+        self._cell_cache.clear()
+        self._apply_rows([rid for rid in self._row_index if not rid.startswith("sec.")])
 
     def refresh_language(self):
         self._ctl_box.setTitle(_("Power.Control"))

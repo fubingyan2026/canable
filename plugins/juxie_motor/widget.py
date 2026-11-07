@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
 
 from cangui.i18n import _
 from cangui import style
+from cangui.plugin_ui import DisclosureSection, SectionPage, SectionTabs
 from canable_sdk.frame import CANFrame
 
 from . import protocol as P
@@ -50,11 +51,6 @@ class _FloatSpin(_WheelSpin, QDoubleSpinBox):
 
 logger = logging.getLogger("plugin.juxie_motor")
 
-_OK = style.LOAD_LOW
-_WARN = style.LOAD_MID
-_ERR = style.LOAD_HIGH
-_DIM = style.FG_DIM
-_TEXT = style.FG_TEXT
 
 # 清除故障：以短促脉冲形式重复若干帧，确保控制器看到 0→1 跳变
 CLEAR_BURST_FRAMES = 5
@@ -228,6 +224,7 @@ class JuxieMotorPanel(QWidget):
     # ── UI 构建 ──
 
     def _build_ui(self):
+        self._sections = []
         # 内容较多：放进滚动区，避免窗口偏小时目标设置等控件被裁剪到无法操作
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -240,27 +237,32 @@ class JuxieMotorPanel(QWidget):
         root.setSpacing(6)
 
         root.addWidget(self._build_dev_config())
-        root.addWidget(self._build_mit_control())
-        root.addWidget(self._build_sdo())
-        root.addWidget(self._build_wave())
         root.addWidget(self._build_feedback())
-        root.addStretch(1)
+        self._detail_tabs = SectionTabs()
+        for page in (self._build_mit_control(), self._build_sdo(), self._build_wave()):
+            self._detail_tabs.add_section(page)
+        root.addWidget(self._detail_tabs, 1)
 
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
+    def _section(self, key, page=False):
+        box = SectionPage(_(key)) if page else QGroupBox(_(key))
+        self._sections.append((box, key))
+        return box
+
     def _unit_label(self, text: str, width: int = 46) -> QLabel:
-        """Fixed-width unit label shown next to a field (never inside it)."""
+        """Unit label shown beside a field, without reserving empty width."""
         lbl = QLabel(text)
-        lbl.setStyleSheet(f"color: {_DIM};")
-        lbl.setFixedWidth(width)
+        style.set_text_color(lbl, style.FG_DIM)
+        lbl.setMaximumWidth(width)
         return lbl
 
     def _grid_label(self, key: str) -> QLabel:
         return QLabel(_(key))
 
     def _build_dev_config(self) -> QGroupBox:
-        box = QGroupBox(_("Juxie.DevConfig"))
+        box = self._section("Juxie.DevConfig")
         g = QGridLayout(box)
         g.setContentsMargins(8, 6, 8, 6)
         g.setHorizontalSpacing(6)
@@ -286,7 +288,7 @@ class JuxieMotorPanel(QWidget):
         self._mirror_id_spin.valueChanged.connect(self._on_mirror_id_changed)
         g.addWidget(self._mirror_id_spin, 0, 5)
         self._id_label = QLabel()
-        self._id_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._id_label, style.FG_DIM)
         g.addWidget(self._id_label, 0, 6, 1, 2)
 
         self._target_max_label = QLabel(_("Juxie.TargetMax"))
@@ -318,128 +320,132 @@ class JuxieMotorPanel(QWidget):
         g.setColumnStretch(2, 1)
         return box
 
-    def _build_mit_control(self) -> QGroupBox:
-        box = QGroupBox(_("Juxie.MITControl"))
+    def _build_mit_control(self) -> QWidget:
+        box = self._section("Juxie.MITControl", page=True)
         outer = QVBoxLayout(box)
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
+        tuning = DisclosureSection(_("Juxie.Tuning"))
+        self._sections.append((tuning, "Juxie.Tuning"))
+        tuning_grid = QGridLayout(tuning.body)
+        tuning_grid.setColumnStretch(6, 1)
         g = QGridLayout()
         g.setHorizontalSpacing(6)
         g.setVerticalSpacing(3)
 
         # ---- scale limits: (label, spin, unit) x 2 per row ----
-        g.addWidget(self._grid_label("Juxie.PosMax"), 0, 0)
+        tuning_grid.addWidget(self._grid_label("Juxie.PosMax"), 0, 0)
         self._pos_max_spin = _FloatSpin()
         self._pos_max_spin.setRange(1.0, 360.0)
         self._pos_max_spin.setDecimals(1)
         self._pos_max_spin.setSingleStep(1.0)
         self._pos_max_spin.setValue(180.0)
         self._pos_max_spin.valueChanged.connect(self._on_scale_changed)
-        g.addWidget(self._pos_max_spin, 0, 1)
-        g.addWidget(self._unit_label(_("Juxie.Unit.Deg")), 0, 2)
+        tuning_grid.addWidget(self._pos_max_spin, 0, 1)
+        tuning_grid.addWidget(self._unit_label(_("Juxie.Unit.Deg")), 0, 2)
 
-        g.addWidget(self._grid_label("Juxie.VelMax"), 0, 3)
+        tuning_grid.addWidget(self._grid_label("Juxie.VelMax"), 0, 3)
         self._vel_max_spin = _FloatSpin()
         self._vel_max_spin.setRange(1.0, 100000.0)
         self._vel_max_spin.setDecimals(0)
         self._vel_max_spin.setSingleStep(10.0)
         self._vel_max_spin.setValue(3000.0)
         self._vel_max_spin.valueChanged.connect(self._on_scale_changed)
-        g.addWidget(self._vel_max_spin, 0, 4)
-        g.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 0, 5)
+        tuning_grid.addWidget(self._vel_max_spin, 0, 4)
+        tuning_grid.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 0, 5)
 
-        g.addWidget(self._grid_label("Juxie.TorqueMax"), 1, 0)
+        tuning_grid.addWidget(self._grid_label("Juxie.TorqueMax"), 1, 0)
         self._torque_max_spin = _FloatSpin()
         self._torque_max_spin.setRange(MIN_TORQUE_MAX, 1000.0)
         self._torque_max_spin.setDecimals(1)
         self._torque_max_spin.setSingleStep(1.0)
         self._torque_max_spin.setValue(DEFAULT_TORQUE_MAX)
         self._torque_max_spin.valueChanged.connect(self._on_scale_changed)
-        g.addWidget(self._torque_max_spin, 1, 1)
-        g.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 1, 2)
+        tuning_grid.addWidget(self._torque_max_spin, 1, 1)
+        tuning_grid.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 1, 2)
 
-        g.addWidget(self._grid_label("Juxie.TargetVel"), 1, 3)
+        g.addWidget(self._grid_label("Juxie.TargetVel"), 0, 0)
         self._vel_spin = _FloatSpin()
         self._vel_spin.setRange(-500.0, 500.0)
         self._vel_spin.setDecimals(1)
         self._vel_spin.setSingleStep(10.0)
         self._vel_spin.setValue(0.0)
-        g.addWidget(self._vel_spin, 1, 4)
-        g.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 1, 5)
+        g.addWidget(self._vel_spin, 0, 1)
+        g.addWidget(self._unit_label(_("Juxie.Unit.RPM")), 0, 2)
 
-        g.addWidget(self._grid_label("Juxie.Kp"), 2, 0)
+        tuning_grid.addWidget(self._grid_label("Juxie.Kp"), 2, 0)
         self._kp_spin = _FloatSpin()
         self._kp_spin.setRange(0.0, P.KP_MAX)
         self._kp_spin.setDecimals(1)
         self._kp_spin.setSingleStep(1.0)
         self._kp_spin.setValue(6.0)
-        g.addWidget(self._kp_spin, 2, 1)
+        tuning_grid.addWidget(self._kp_spin, 2, 1)
         self._kp_unit = self._unit_label("", 70)
-        g.addWidget(self._kp_unit, 2, 2)
+        tuning_grid.addWidget(self._kp_unit, 2, 2)
 
-        g.addWidget(self._grid_label("Juxie.Kd"), 2, 3)
+        tuning_grid.addWidget(self._grid_label("Juxie.Kd"), 2, 3)
         self._kd_spin = _FloatSpin()
         self._kd_spin.setRange(0.0, P.KD_MAX)
         self._kd_spin.setDecimals(2)
         self._kd_spin.setSingleStep(0.01)
         self._kd_spin.setValue(0.1)
-        g.addWidget(self._kd_spin, 2, 4)
+        tuning_grid.addWidget(self._kd_spin, 2, 4)
         self._kd_unit = self._unit_label("", 70)
-        g.addWidget(self._kd_unit, 2, 5)
+        tuning_grid.addWidget(self._kd_unit, 2, 5)
 
         # ---- feedforward torque: wheel step 0.1 Nm ----
         self._torque_label = QLabel(_("Juxie.TargetTorque"))
-        g.addWidget(self._torque_label, 3, 0)
+        g.addWidget(self._torque_label, 0, 3)
         self._torque_spin = _FloatSpin()
         self._torque_spin.setRange(-DEFAULT_TORQUE_MAX, DEFAULT_TORQUE_MAX)
         self._torque_spin.setDecimals(2)
         self._torque_spin.setSingleStep(0.1)
         self._torque_spin.setValue(0.0)
-        g.addWidget(self._torque_spin, 3, 1)
-        g.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 3, 2)
+        g.addWidget(self._torque_spin, 0, 4)
+        g.addWidget(self._unit_label(_("Juxie.Unit.Nm")), 0, 5)
 
         self._tq_raw_chk = QCheckBox(_("Juxie.TorqueRaw"))
         self._tq_raw_chk.setToolTip(_("Juxie.TorqueRawTip"))
         self._tq_raw_chk.toggled.connect(self._on_tq_raw_changed)
-        g.addWidget(self._tq_raw_chk, 3, 3)
+        tuning_grid.addWidget(self._tq_raw_chk, 1, 3)
         self._tq_raw_spin = _IntSpin()
         self._tq_raw_spin.setRange(0, 4095)
         self._tq_raw_spin.setValue(2048)
         self._tq_raw_spin.setToolTip(_("Juxie.TorqueRawTip"))
         self._tq_raw_spin.valueChanged.connect(self._on_tq_raw_changed)
-        g.addWidget(self._tq_raw_spin, 3, 4)
-        g.addWidget(self._unit_label(""), 3, 5)
+        tuning_grid.addWidget(self._tq_raw_spin, 1, 4)
+        tuning_grid.addWidget(self._unit_label(""), 1, 5)
 
-        g.addWidget(self._grid_label("Juxie.TorqueZero"), 4, 0)
+        tuning_grid.addWidget(self._grid_label("Juxie.TorqueZero"), 3, 0)
         self._tq_zero_combo = QComboBox()
         self._tq_zero_combo.addItem(_("Juxie.TorqueZeroOffset"), "offset")
         self._tq_zero_combo.addItem(_("Juxie.TorqueZeroSigned"), "signed")
         self._tq_zero_combo.setToolTip(_("Juxie.TorqueZeroTip"))
         self._tq_zero_combo.currentIndexChanged.connect(self._on_tq_zero_changed)
-        g.addWidget(self._tq_zero_combo, 4, 1, 1, 5)
+        tuning_grid.addWidget(self._tq_zero_combo, 3, 1, 1, 5)
 
         for spin in (self._vel_spin, self._kp_spin, self._kd_spin,
                      self._torque_spin):
             spin.valueChanged.connect(self._on_target_params_changed)
 
         # ---- target position (widest row) ----
-        g.addWidget(self._grid_label("Juxie.TargetPos"), 5, 0)
+        g.addWidget(self._grid_label("Juxie.TargetPos"), 1, 0)
         self._pos_slider = QSlider(Qt.Horizontal)
         self._pos_slider.setRange(-1800, 1800)
         self._pos_slider.setSingleStep(5)
         self._pos_slider.setPageStep(50)
         self._pos_slider.setValue(0)
         self._pos_slider.valueChanged.connect(self._on_pos_changed)
-        g.addWidget(self._pos_slider, 5, 1, 1, 3)
+        g.addWidget(self._pos_slider, 1, 1, 1, 3)
         self._pos_label = QLabel("+0.0" + _("Juxie.Unit.Deg"))
         self._pos_label.setFixedWidth(58)
         self._pos_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._pos_label.setStyleSheet(f"color: {_DIM};")
-        g.addWidget(self._pos_label, 5, 4)
+        style.set_text_color(self._pos_label, style.FG_DIM)
+        g.addWidget(self._pos_label, 1, 4)
         self._mirror_target_label = QLabel("")
         self._mirror_target_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._mirror_target_label.setStyleSheet(f"color: {_DIM};")
-        g.addWidget(self._mirror_target_label, 5, 5)
+        style.set_text_color(self._mirror_target_label, style.FG_DIM)
+        g.addWidget(self._mirror_target_label, 1, 5)
         g.setColumnStretch(6, 1)
         outer.addLayout(g)
 
@@ -508,19 +514,22 @@ class JuxieMotorPanel(QWidget):
 
         self._send_btn = QPushButton(_("Juxie.SendMIT"))
         self._send_btn.clicked.connect(self._on_send_mit)
-        outer.addWidget(self._send_btn)
+        ctl_row.addWidget(self._send_btn)
 
         self._frame_label = QLabel("")
-        self._frame_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._frame_label, style.FG_DIM)
         self._frame_label.setToolTip(_("Juxie.FrameTip"))
-        outer.addWidget(self._frame_label)
+        tuning_grid.addWidget(self._frame_label, 4, 0, 1, 7)
+        outer.addStretch(1)
+        outer.addWidget(tuning)
         return box
 
     # ── SDO 电流 / 力矩控制（文档 §4.3）──
-    def _build_sdo(self) -> QGroupBox:
-        box = QGroupBox(_("Juxie.Sdo"))
+    def _build_sdo(self) -> QWidget:
+        box = self._section("Juxie.Sdo", page=True)
         lay = QVBoxLayout(box)
         lay.setSpacing(4)
+        lay.setAlignment(Qt.AlignTop)
 
         row = QHBoxLayout()
         self._sdo_cur_label = QLabel(_("Juxie.SdoCurrent"))
@@ -558,12 +567,12 @@ class JuxieMotorPanel(QWidget):
         lay.addLayout(row)
 
         self._sdo_hint = QLabel(_("Juxie.SdoHint"))
-        self._sdo_hint.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._sdo_hint, style.FG_DIM)
         self._sdo_hint.setWordWrap(True)
         lay.addWidget(self._sdo_hint)
 
         self._sdo_status = QLabel(_("Juxie.SdoIdle"))
-        self._sdo_status.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._sdo_status, style.FG_DIM)
         lay.addWidget(self._sdo_status)
         return box
 
@@ -602,7 +611,7 @@ class JuxieMotorPanel(QWidget):
         self._sdo_retried = False
         self._sdo_retry_args = retry
         self._sdo_status.setText(_("Juxie.SdoSending").format(what=what))
-        self._sdo_status.setStyleSheet(f"color: {_WARN};")
+        style.set_text_color(self._sdo_status, style.LOAD_MID)
         self._sdo_step()
 
     def _sdo_step(self):
@@ -623,11 +632,11 @@ class JuxieMotorPanel(QWidget):
             return
         if not self._sdo_expect_mode:
             self._sdo_status.setText(_("Juxie.SdoSent").format(what=self._sdo_what))
-            self._sdo_status.setStyleSheet(f"color: {_OK};")
+            style.set_text_color(self._sdo_status, style.LOAD_LOW)
             return
         # 序列发完：读回 6060h，确认驱动器真的切到了目标模式
         self._sdo_status.setText(_("Juxie.SdoVerify").format(what=self._sdo_what))
-        self._sdo_status.setStyleSheet(f"color: {_WARN};")
+        style.set_text_color(self._sdo_status, style.LOAD_MID)
         self._ctx.send_frame(P.build_sdo_read(self._dev_id_spin.value(), P.OBJ_MODES))
         self._sdo_read_timer.start()
 
@@ -637,7 +646,7 @@ class JuxieMotorPanel(QWidget):
         self._sdo_expect_mode = 0
         self._sdo_retry_args = None
         self._sdo_status.setText(_("Juxie.SdoModeOk").format(mode=mode))
-        self._sdo_status.setStyleSheet(f"color: {_OK};")
+        style.set_text_color(self._sdo_status, style.LOAD_LOW)
 
     def _sdo_fail(self, key: str, **kw):
         if self._sdo_expect_mode and not self._sdo_retried and self._sdo_retry_args:
@@ -646,7 +655,7 @@ class JuxieMotorPanel(QWidget):
             self._sdo_queue = P.build_mode_sequence_before_enable(
                 self._dev_id_spin.value(), mode, target)
             self._sdo_status.setText(_("Juxie.SdoRetry"))
-            self._sdo_status.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._sdo_status, style.LOAD_MID)
             logger.warning("SDO mode not applied (%s) -> retry mode-before-enable",
                            key)
             self._sdo_step()
@@ -655,7 +664,7 @@ class JuxieMotorPanel(QWidget):
         self._sdo_expect_mode = 0
         self._sdo_retry_args = None
         self._sdo_status.setText(_(key).format(**kw))
-        self._sdo_status.setStyleSheet(f"color: {_ERR};")
+        style.set_text_color(self._sdo_status, style.LOAD_HIGH)
         logger.warning("SDO mode verification failed: %s %s", key, kw)
 
     def _on_sdo_read_timeout(self):
@@ -702,9 +711,10 @@ class JuxieMotorPanel(QWidget):
             [P.build_sdo_target(self._dev_id_spin.value(), 0)],
             _("Juxie.SdoWhatZero"))
 
-    def _build_wave(self) -> QGroupBox:
-        box = QGroupBox(_("Juxie.Wave"))
+    def _build_wave(self) -> QWidget:
+        box = self._section("Juxie.Wave", page=True)
         outer = QVBoxLayout(box)
+        outer.setAlignment(Qt.AlignTop)
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
         g = QGridLayout()
@@ -780,24 +790,24 @@ class JuxieMotorPanel(QWidget):
         self._wave_log_chk.toggled.connect(self._on_wave_log_changed)
         g.addWidget(self._wave_log_chk, 2, 0, 1, 2)
         self._wave_log_path_label = QLabel("")
-        self._wave_log_path_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._wave_log_path_label, style.FG_DIM)
         g.addWidget(self._wave_log_path_label, 2, 2, 1, 3)
         self._wave_open_btn = QPushButton(_("Juxie.WaveOpenCsv"))
         self._wave_open_btn.clicked.connect(self._on_wave_open_csv)
         g.addWidget(self._wave_open_btn, 2, 5)
         self._wave_cur_label = QLabel("")
-        self._wave_cur_label.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+        style.set_text_color(self._wave_cur_label, style.LOAD_LOW, 'font-weight: 600;')
         self._wave_cur_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         g.addWidget(self._wave_cur_label, 2, 6, 1, 3)
 
         self._wave_info = QLabel("")
-        self._wave_info.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._wave_info, style.FG_DIM)
         g.addWidget(self._wave_info, 3, 0, 1, 9)
         outer.addLayout(g)
         return box
 
     def _build_feedback(self) -> QGroupBox:
-        box = QGroupBox(_("Juxie.Feedback"))
+        box = self._section("Juxie.Feedback")
         lay = QGridLayout(box)
         lay.setContentsMargins(8, 8, 8, 8)
 
@@ -819,41 +829,43 @@ class JuxieMotorPanel(QWidget):
         ]
 
         for m in (0, 1):
-            col = m * 3
+            col = m * 6
             head = QLabel("")
-            head.setStyleSheet(f"color: {_TEXT}; font-weight: 700;")
+            head.setWordWrap(True)
+            style.set_text_color(head, style.FG_TEXT, 'font-weight: 700;')
             self._fb_head.append(head)
-            lay.addWidget(head, 0, col, 1, 3)
+            lay.addWidget(head, 0, col, 1, 6)
 
             for r, (key, label_key, unit_key) in enumerate(fields, start=1):
+                row = 1 + (r - 1) // 2
+                field_col = col + ((r - 1) % 2) * 3
                 name_lbl = QLabel(_(label_key))
-                lay.addWidget(name_lbl, r, col)
+                lay.addWidget(name_lbl, row, field_col)
                 self._fb_field_labels.append((name_lbl, label_key))
                 val_lbl = QLabel(_("Juxie.NoData"))
-                val_lbl.setStyleSheet(f"color: {_OK}; font-weight: 600;")
-                lay.addWidget(val_lbl, r, col + 1)
+                style.set_text_color(val_lbl, style.LOAD_LOW, 'font-weight: 600;')
+                lay.addWidget(val_lbl, row, field_col + 1)
                 if unit_key:
                     unit_lbl = QLabel(_(unit_key))
-                    lay.addWidget(unit_lbl, r, col + 2)
+                    lay.addWidget(unit_lbl, row, field_col + 2)
                     self._fb_field_labels.append((unit_lbl, unit_key))
                 self._fb_labels[m][key] = val_lbl
 
             status_row = QHBoxLayout()
-            status_row.addWidget(QLabel(_("Juxie.Status")))
+            status_title = QLabel(_("Juxie.Status"))
+            self._fb_field_labels.append((status_title, "Juxie.Status"))
+            status_row.addWidget(status_title)
             st = QLabel("")
-            st.setStyleSheet(f"color: {_OK};")
+            style.set_text_color(st, style.LOAD_LOW)
             status_row.addWidget(st)
             status_row.addStretch(1)
             self._fb_status.append(st)
-            lay.addLayout(status_row, len(fields) + 1, col, 1, 3)
+            lay.addLayout(status_row, 1 + (len(fields) + 1) // 2, col, 1, 6)
 
-            update_row = QHBoxLayout()
             up = QLabel("")
-            up.setStyleSheet(f"color: {_DIM};")
-            update_row.addWidget(up)
-            update_row.addStretch(1)
+            style.set_text_color(up, style.FG_DIM)
+            status_row.addWidget(up)
             self._fb_update.append(up)
-            lay.addLayout(update_row, len(fields) + 2, col, 1, 3)
 
         return box
 
@@ -1076,10 +1088,10 @@ class JuxieMotorPanel(QWidget):
                 else:
                     rng = f"±{self._pos_max_spin.value():.0f}°"
                 head.setText(f"{tag}  ID={ids[m]}  (RX=0x{rx:03X})  {rng}")
-                head.setStyleSheet(f"color: {_TEXT}; font-weight: 700;")
+                style.set_text_color(head, style.FG_TEXT, 'font-weight: 700;')
             else:
                 head.setText(_("Juxie.NoData"))
-                head.setStyleSheet(f"color: {_DIM}; font-weight: 700;")
+                style.set_text_color(head, style.FG_DIM, 'font-weight: 700;')
 
     def _on_ctl_changed(self):
         self._cfg.set("enable", self._enable_chk.isChecked())
@@ -1726,9 +1738,9 @@ class JuxieMotorPanel(QWidget):
         labels["mode_feedback"].setText(self._mode_name(fb.mode_feedback))
 
         if fb.error_code != 0:
-            labels["error_code"].setStyleSheet(f"color: {_ERR}; font-weight: 600;")
+            style.set_text_color(labels["error_code"], style.LOAD_HIGH, 'font-weight: 600;')
         else:
-            labels["error_code"].setStyleSheet(f"color: {_OK}; font-weight: 600;")
+            style.set_text_color(labels["error_code"], style.LOAD_LOW, 'font-weight: 600;')
 
         status_parts = []
         status_parts.append(_("Juxie.Status.Enabled") if fb.enabled else _("Juxie.Status.Disabled"))
@@ -1740,10 +1752,10 @@ class JuxieMotorPanel(QWidget):
         age = time.monotonic() - self._last_rx[m]
         if age < 2.0:
             self._fb_update[m].setText(f"{_('Juxie.LastUpdate')}: {age:.1f}s")
-            self._fb_update[m].setStyleSheet(f"color: {_OK};")
+            style.set_text_color(self._fb_update[m], style.LOAD_LOW)
         else:
             self._fb_update[m].setText(_("Juxie.Offline"))
-            self._fb_update[m].setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._fb_update[m], style.LOAD_MID)
 
     def _mode_name(self, mode_val: int) -> str:
         name_map = {
@@ -1802,18 +1814,20 @@ class JuxieMotorPanel(QWidget):
         self._clear_feedback_display()
         for up in self._fb_update:
             up.setText(_("Juxie.Offline"))
-            up.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(up, style.LOAD_MID)
 
     def _clear_feedback_display(self):
         for m in (0, 1):
             for key in self._fb_labels[m]:
                 lbl = self._fb_labels[m][key]
                 lbl.setText(_("Juxie.NoData"))
-                lbl.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+                style.set_text_color(lbl, style.LOAD_LOW, 'font-weight: 600;')
             self._fb_status[m].setText("")
             self._fb_update[m].setText("")
 
     def refresh_language(self):
+        for section, key in self._sections:
+            section.setTitle(_(key))
         self._update_id_label()
         self._update_pos_label()
         self._update_ranges()

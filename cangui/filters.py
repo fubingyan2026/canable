@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from .worker import CANFilter
 from .i18n import _
 from . import icons as icon_lib
-from .style import id_color, FG_ACCENT
+from .style import id_color
+from . import style
 
 logger = logging.getLogger("cangui.filters")
 
@@ -100,13 +101,17 @@ class FilterPanel(QWidget):
         self._init_ui()
 
     def _init_ui(self):
+        self.setObjectName("filterPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         self.table = QTableWidget(0, len(self.HEADERS), self)
         self.table.setHorizontalHeaderLabels([_("Filter.HdrIndex"), _("Filter.HdrRange"), _("Filter.HdrType"), _("Filter.HdrAction")])
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(20)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setShowGrid(False)
@@ -118,6 +123,7 @@ class FilterPanel(QWidget):
         layout.addWidget(self.table, 1)
 
         bar = QHBoxLayout()
+        bar.setSpacing(6)
         self.add_btn   = QPushButton(_("Filter.Add"))
         self.add_btn.setIcon(icon_lib.make_icon("plus"))
         self.edit_btn  = QPushButton(_("Filter.Edit"))
@@ -248,8 +254,8 @@ class StatisticsPanel(QWidget):
         self.lbl_unique = QLabel("0")
 
         for lbl in (self.lbl_total, self.lbl_fps, self.lbl_unique):
-            lbl.setStyleSheet(f"color: {FG_ACCENT}; font-size: 18pt; font-weight: bold;")
-        self.lbl_load.setStyleSheet(f"color: {FG_ACCENT}; font-size: 18pt; font-weight: bold;")
+            style.set_text_color(lbl, style.FG_ACCENT, "font-size: 18pt; font-weight: bold;")
+        style.set_text_color(self.lbl_load, style.FG_ACCENT, "font-size: 18pt; font-weight: bold;")
 
         g.addWidget(QLabel(_("Stat.TotalFrames")), 0, 0); g.addWidget(self.lbl_total, 0, 1)
         g.addWidget(QLabel(_("Stat.FPS")), 0, 2); g.addWidget(self.lbl_fps, 0, 3)
@@ -259,7 +265,7 @@ class StatisticsPanel(QWidget):
 
         # ID 详细统计
         detail_label = QLabel(_("Stat.IDDetail"))
-        detail_label.setStyleSheet(f"color: {FG_ACCENT}; font-weight: bold; padding-top: 6px;")
+        style.set_text_color(detail_label, style.FG_ACCENT, "font-weight: bold; padding-top: 6px;")
         layout.addWidget(detail_label)
 
         self.table = QTableWidget(0, 5, self)
@@ -285,11 +291,12 @@ class StatisticsPanel(QWidget):
         self.lbl_unique.setText(f"{len(summary)}")
         self.lbl_load.setText(f"{load:.1f}%")
         if load < 40:
-            self.lbl_load.setStyleSheet("color: #4ec9b0; font-size: 18pt; font-weight: bold;")
+            color = style.LOAD_LOW
         elif load < 75:
-            self.lbl_load.setStyleSheet("color: #d7ba7d; font-size: 18pt; font-weight: bold;")
+            color = style.LOAD_MID
         else:
-            self.lbl_load.setStyleSheet("color: #f48771; font-size: 18pt; font-weight: bold;")
+            color = style.LOAD_HIGH
+        style.set_text_color(self.lbl_load, color, "font-size: 18pt; font-weight: bold;")
 
         # 表格
         self.table.setRowCount(len(summary))

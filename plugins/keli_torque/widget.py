@@ -21,17 +21,13 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
 
 from cangui.i18n import _
 from cangui import style
+from cangui.plugin_ui import SectionPage, SectionTabs
 
 from . import protocol as P
 from .scope import DEFAULT_WINDOW_S, WINDOW_CHOICES, ValueScope
 
 logger = logging.getLogger("plugin.keli_torque")
 
-_OK = style.LOAD_LOW
-_WARN = style.LOAD_MID
-_ERR = style.LOAD_HIGH
-_DIM = style.FG_DIM
-_TEXT = style.FG_TEXT
 
 ACK_TIMEOUT_MS = 300
 INFO_STEP_MS = 120
@@ -300,13 +296,13 @@ class KeliPanel(QWidget):
 
     def _unit(self, key: str, width: int = 36) -> QLabel:
         lbl = QLabel(_(key))
-        lbl.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(lbl, style.FG_DIM)
         lbl.setFixedWidth(width)
         self._static.append((lbl, key))
         return lbl
 
-    def _group(self, key: str) -> QGroupBox:
-        box = QGroupBox(_(key))
+    def _group(self, key: str, page=False):
+        box = SectionPage(_(key)) if page else QGroupBox(_(key))
         self._titles.append((box, key))
         return box
 
@@ -332,11 +328,11 @@ class KeliPanel(QWidget):
 
         root.addWidget(self._build_config())
         root.addWidget(self._build_value())
-        root.addWidget(self._build_scope())
-        root.addWidget(self._build_record())
-        root.addWidget(self._build_params())
-        root.addWidget(self._build_maint())
-        root.addStretch(1)
+        self._detail_tabs = SectionTabs()
+        for page in (self._build_scope(), self._build_params(),
+                     self._build_record(), self._build_maint()):
+            self._detail_tabs.add_section(page)
+        root.addWidget(self._detail_tabs, 1)
 
         scroll.setWidget(inner)
         outer.addWidget(scroll)
@@ -355,11 +351,11 @@ class KeliPanel(QWidget):
         self._addr_spin.valueChanged.connect(self._on_addr_changed)
         g.addWidget(self._addr_spin, 0, 1)
         self._id_label = QLabel()
-        self._id_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._id_label, style.FG_DIM)
         g.addWidget(self._id_label, 0, 2, 1, 2)
 
         self._status_label = QLabel(_("Keli.NoData"))
-        self._status_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._status_label, style.FG_DIM)
         g.addWidget(self._status_label, 0, 4, 1, 3)
 
         g.addWidget(self._label("Keli.Interval"), 1, 0)
@@ -386,7 +382,7 @@ class KeliPanel(QWidget):
         self._auto_start_chk.setChecked(True)
         self._auto_start_chk.toggled.connect(self._on_auto_start_changed)
         self._static.append((self._auto_start_chk, "Keli.AutoStart"))
-        g.addWidget(self._auto_start_chk, 2, 0, 1, 4)
+        g.addWidget(self._auto_start_chk, 0, 7, 1, 2)
         g.setColumnStretch(8, 1)
         return box
 
@@ -402,10 +398,10 @@ class KeliPanel(QWidget):
         big.setPointSize(max(18, big.pointSize() + 12))
         big.setBold(True)
         self._big_value.setFont(big)
-        self._big_value.setStyleSheet(f"color: {_OK};")
+        style.set_text_color(self._big_value, style.LOAD_LOW)
         g.addWidget(self._big_value, 0, 0, 1, 2)
         self._big_unit = self._unit("Keli.Unit.N", 30)
-        self._big_unit.setStyleSheet(f"color: {_DIM}; font-weight: 600;")
+        style.set_text_color(self._big_unit, style.FG_DIM, 'font-weight: 600;')
         g.addWidget(self._big_unit, 0, 2)
 
         self._fields = {}
@@ -423,7 +419,7 @@ class KeliPanel(QWidget):
             c = (i % 3) * 3
             g.addWidget(self._label(label_key), r, c)
             val = QLabel(_("Keli.NoData"))
-            val.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
+            style.set_text_color(val, style.FG_TEXT, 'font-weight: 600;')
             g.addWidget(val, r, c + 1)
             if unit_key:
                 g.addWidget(self._unit(unit_key), r, c + 2)
@@ -433,13 +429,13 @@ class KeliPanel(QWidget):
 
         # 诊断行：RX 计数 / 最近一帧 / 解析类型（单行覆盖更新，不做滚动日志）
         self._diag_label = QLabel(_("Keli.NoData"))
-        self._diag_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._diag_label, style.FG_DIM)
         g.addWidget(self._diag_label, 1 + (len(row) + 2) // 3, 0, 1, 9)
         g.setColumnStretch(9, 1)
         return box
 
-    def _build_scope(self) -> QGroupBox:
-        box = self._group("Keli.Scope")
+    def _build_scope(self) -> QWidget:
+        box = self._group("Keli.Scope", page=True)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
@@ -462,31 +458,33 @@ class KeliPanel(QWidget):
 
         self._scope = ValueScope(_("Keli.Title"), style.FG_ACCENT, "N")
         self._scope.set_no_data_text(_("Keli.ScopeNoData"))
-        lay.addWidget(self._scope)
+        lay.addWidget(self._scope, 1)
         return box
 
-    def _build_record(self) -> QGroupBox:
-        box = self._group("Keli.Record")
+    def _build_record(self) -> QWidget:
+        box = self._group("Keli.Record", page=True)
         row = QHBoxLayout(box)
+        row.setAlignment(Qt.AlignTop)
         row.setContentsMargins(8, 6, 8, 6)
         self._record_chk = QCheckBox(_("Keli.Record"))
         self._record_chk.toggled.connect(self._on_record_toggled)
         self._static.append((self._record_chk, "Keli.Record"))
         row.addWidget(self._record_chk)
         self._record_label = QLabel(_("Keli.NoFile"))
-        self._record_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._record_label, style.FG_DIM)
         row.addWidget(self._record_label)
         row.addStretch(1)
         self._open_btn = self._button("Keli.OpenCsv", self._on_open_csv)
         row.addWidget(self._open_btn)
         return box
 
-    def _build_params(self) -> QGroupBox:
-        box = self._group("Keli.Params")
+    def _build_params(self) -> QWidget:
+        box = self._group("Keli.Params", page=True)
         g = QGridLayout(box)
         g.setContentsMargins(8, 6, 8, 6)
         g.setHorizontalSpacing(6)
         g.setVerticalSpacing(4)
+        g.setAlignment(Qt.AlignTop)
 
         g.addWidget(self._label("Keli.Scale"), 0, 0)
         self._scale_combo = QComboBox()
@@ -533,12 +531,13 @@ class KeliPanel(QWidget):
         g.setColumnStretch(8, 1)
         return box
 
-    def _build_maint(self) -> QGroupBox:
-        box = self._group("Keli.Maint")
+    def _build_maint(self) -> QWidget:
+        box = self._group("Keli.Maint", page=True)
         g = QGridLayout(box)
         g.setContentsMargins(8, 6, 8, 6)
         g.setHorizontalSpacing(6)
         g.setVerticalSpacing(4)
+        g.setAlignment(Qt.AlignTop)
 
         zero_save = self._button("Keli.ZeroSave", self._on_zero_save, ack=True)
         g.addWidget(zero_save, 0, 0)
@@ -1026,26 +1025,26 @@ class KeliPanel(QWidget):
     def _update_status(self):
         if not self._ctx.is_connected():
             self._status_label.setText(_("Keli.Err.NotConnected"))
-            self._status_label.setStyleSheet(f"color: {_DIM};")
+            style.set_text_color(self._status_label, style.FG_DIM)
             return
         if not self._want_stream and not self._streaming:
             self._status_label.setText(_("Keli.NoData"))
-            self._status_label.setStyleSheet(f"color: {_DIM};")
+            style.set_text_color(self._status_label, style.FG_DIM)
             return
         if not self._link_up:
             # 已掉线：看门狗在后台每秒探测，传感器恢复后自动重新初始化
             self._status_label.setText(_("Keli.OfflineProbing"))
-            self._status_label.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._status_label, style.LOAD_MID)
             return
         stale_s = max(STALE_MIN_S, 5.0 * max(1, int(self._interval_spin.value())) / 1000.0)
         if self._last_rx and (time.monotonic() - self._last_rx) <= stale_s:
             self._status_label.setText("%s · %s %s" % (
                 _("Keli.Streaming"), _("Keli.LastUpdate"),
                 datetime.now().strftime("%H:%M:%S")))
-            self._status_label.setStyleSheet(f"color: {_OK};")
+            style.set_text_color(self._status_label, style.LOAD_LOW)
         else:
             self._status_label.setText(_("Keli.Offline"))
-            self._status_label.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._status_label, style.LOAD_MID)
 
     # ── 热插拔：链路看门狗 + 自动探测 + 自动恢复 ──
     def _mark_link_up(self):

@@ -20,16 +20,12 @@ from PySide6.QtWidgets import (QCheckBox, QFrame, QGridLayout, QGroupBox,
 
 from cangui.i18n import _
 from cangui import style
+from cangui.plugin_ui import SectionPage, SectionTabs
 
 from . import protocol as P
 
 logger = logging.getLogger("plugin.battery_monitor")
 
-_OK = style.LOAD_LOW
-_WARN = style.LOAD_MID
-_ERR = style.LOAD_HIGH
-_DIM = style.FG_DIM
-_TEXT = style.FG_TEXT
 
 STALE_S = 2.0          # 超过该时间没有响应视为离线
 RAW_MAX_LINES = 80     # 原始报文日志上限
@@ -219,13 +215,13 @@ class BatteryPanel(QWidget):
 
     def _unit(self, key: str, width: int = 34) -> QLabel:
         lbl = QLabel(_(key))
-        lbl.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(lbl, style.FG_DIM)
         lbl.setFixedWidth(width)
         self._static.append((lbl, key))
         return lbl
 
-    def _group(self, key: str) -> QGroupBox:
-        box = QGroupBox(_(key))
+    def _group(self, key: str, page=False):
+        box = SectionPage(_(key)) if page else QGroupBox(_(key))
         self._titles.append((box, key))
         return box
 
@@ -248,11 +244,11 @@ class BatteryPanel(QWidget):
 
         root.addWidget(self._build_config())
         root.addWidget(self._build_overview())
-        root.addWidget(self._build_cells())
-        root.addWidget(self._build_temps_and_state())
-        root.addWidget(self._build_protect())
-        root.addWidget(self._build_raw())
-        root.addStretch(1)
+        self._detail_tabs = SectionTabs()
+        for page in (self._build_cells(), self._build_temps_and_state(),
+                     self._build_protect(), self._build_raw()):
+            self._detail_tabs.add_section(page)
+        root.addWidget(self._detail_tabs, 1)
 
         scroll.setWidget(inner)
         outer.addWidget(scroll)
@@ -284,7 +280,7 @@ class BatteryPanel(QWidget):
         self._poll_spin.valueChanged.connect(self._on_poll_interval_changed)
         g.addWidget(self._poll_spin, 0, 4)
         self._poll_unit = QLabel("ms")
-        self._poll_unit.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._poll_unit, style.FG_DIM)
         self._poll_unit.setFixedWidth(34)
         g.addWidget(self._poll_unit, 0, 5)
 
@@ -299,7 +295,7 @@ class BatteryPanel(QWidget):
         g.addWidget(self._refresh_btn, 1, 2)
 
         self._status_label = QLabel(_("Batt.NoData"))
-        self._status_label.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._status_label, style.FG_DIM)
         g.addWidget(self._status_label, 1, 3, 1, 3)
         g.setColumnStretch(6, 1)
         return box
@@ -329,21 +325,22 @@ class BatteryPanel(QWidget):
             r, c = i // 4, (i % 4) * 3
             g.addWidget(self._label(label_key), r, c)
             val = QLabel(_("Batt.NoData"))
-            val.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+            style.set_text_color(val, style.LOAD_LOW, 'font-weight: 600;')
             g.addWidget(val, r, c + 1)
             g.addWidget(self._unit(unit_key), r, c + 2)
             self._ov[key] = val
-        g.setColumnStretch(12, 1)
+        for column in (1, 4, 7, 10):
+            g.setColumnStretch(column, 1)
         return box
 
-    def _build_cells(self) -> QGroupBox:
-        box = self._group("Batt.Cells")
+    def _build_cells(self) -> QWidget:
+        box = self._group("Batt.Cells", page=True)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
 
         self._cell_summary = QLabel(_("Batt.NoData"))
-        self._cell_summary.setStyleSheet(f"color: {_DIM};")
+        style.set_text_color(self._cell_summary, style.FG_DIM)
         lay.addWidget(self._cell_summary)
 
         self._cell_table = QTableWidget(0, 4)
@@ -356,7 +353,7 @@ class BatteryPanel(QWidget):
         self._cell_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._cell_table.setSelectionMode(
             QTableWidget.SelectionMode.NoSelection)
-        self._cell_table.setMinimumHeight(245)
+        self._cell_table.setMinimumHeight(120)
         self._cell_table.verticalHeader().setDefaultSectionSize(22)
         for col in range(4):
             self._cell_table.horizontalHeader().setSectionResizeMode(
@@ -364,12 +361,13 @@ class BatteryPanel(QWidget):
         lay.addWidget(self._cell_table)
         return box
 
-    def _build_temps_and_state(self) -> QGroupBox:
-        box = self._group("Batt.Temps")
+    def _build_temps_and_state(self) -> QWidget:
+        box = self._group("Batt.Temps", page=True)
         g = QGridLayout(box)
         g.setContentsMargins(8, 6, 8, 6)
         g.setHorizontalSpacing(6)
         g.setVerticalSpacing(4)
+        g.setAlignment(Qt.AlignTop)
 
         self._temp_labels = {}
         rows = [
@@ -382,7 +380,7 @@ class BatteryPanel(QWidget):
             r, c = i // 2, (i % 2) * 3
             g.addWidget(self._label(label_key), r, c)
             val = QLabel(_("Batt.NoData"))
-            val.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
+            style.set_text_color(val, style.FG_TEXT, 'font-weight: 600;')
             g.addWidget(val, r, c + 1)
             g.addWidget(self._unit(unit_key), r, c + 2)
             self._temp_labels[key] = val
@@ -401,18 +399,19 @@ class BatteryPanel(QWidget):
             c = (i % 2) * 3
             g.addWidget(self._label(label_key), r, c)
             val = QLabel(_("Batt.NoData"))
-            val.setStyleSheet(f"color: {_OK}; font-weight: 600;")
+            style.set_text_color(val, style.LOAD_LOW, 'font-weight: 600;')
             g.addWidget(val, r, c + 1, 1, 2)
             self._temp_labels[key] = val
         g.setColumnStretch(6, 1)
         return box
 
-    def _build_protect(self) -> QGroupBox:
-        box = self._group("Batt.Protect")
+    def _build_protect(self) -> QWidget:
+        box = self._group("Batt.Protect", page=True)
         g = QGridLayout(box)
         g.setContentsMargins(8, 6, 8, 6)
         g.setHorizontalSpacing(10)
         g.setVerticalSpacing(2)
+        g.setAlignment(Qt.AlignTop)
 
         self._bit_labels = []
         entries = list(_PROTECT_BITS) + [
@@ -426,14 +425,14 @@ class BatteryPanel(QWidget):
         for i, (key, _byte, _bit) in enumerate(entries):
             r, c = i % per_col, (i // per_col) * 2
             lbl = QLabel(_(key))
-            lbl.setStyleSheet(f"color: {_DIM};")
+            style.set_text_color(lbl, style.FG_DIM)
             g.addWidget(lbl, r, c, 1, 2)
             self._bit_labels.append((key, lbl))
         g.setColumnStretch(6, 1)
         return box
 
-    def _build_raw(self) -> QGroupBox:
-        box = self._group("Batt.Raw")
+    def _build_raw(self) -> QWidget:
+        box = self._group("Batt.Raw", page=True)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
@@ -447,11 +446,11 @@ class BatteryPanel(QWidget):
 
         self._raw = QPlainTextEdit()
         self._raw.setReadOnly(True)
-        self._raw.setMaximumHeight(120)
+        self._raw.setMinimumHeight(80)
         mono = QFont("Monospace")
         mono.setStyleHint(QFont.StyleHint.TypeWriter)
         self._raw.setFont(mono)
-        lay.addWidget(self._raw)
+        lay.addWidget(self._raw, 1)
         return box
 
     # ── config ──
@@ -611,11 +610,11 @@ class BatteryPanel(QWidget):
                 table.setItem(row, col + 1, val_item)
             no_item.setText(str(i + 1))
             val_item.setText(str(mv))
-            color = _TEXT
+            color = style.FG_TEXT
             if mv == mx:
-                color = _ERR
+                color = style.LOAD_HIGH
             elif mv == mn:
-                color = _WARN
+                color = style.LOAD_MID
             val_item.setForeground(QColor(color))
         # 清除多余单元格（串数减少时）
         for i in range(len(cells), 4 * half):
@@ -686,9 +685,9 @@ class BatteryPanel(QWidget):
                     active.add(key)
         for key, lbl in self._bit_labels:
             if key in active:
-                lbl.setStyleSheet(f"color: {_ERR}; font-weight: 600;")
+                style.set_text_color(lbl, style.LOAD_HIGH, 'font-weight: 600;')
             else:
-                lbl.setStyleSheet(f"color: {_DIM};")
+                style.set_text_color(lbl, style.FG_DIM)
 
     def _on_soc(self, data: P.SocData):
         self._soc = data
@@ -718,21 +717,21 @@ class BatteryPanel(QWidget):
     def _update_status_label(self):
         if not self._ctx.is_connected():
             self._status_label.setText(_("Batt.NotConnected"))
-            self._status_label.setStyleSheet(f"color: {_DIM};")
+            style.set_text_color(self._status_label, style.FG_DIM)
             return
         if not self._last_rx:
             self._status_label.setText(_("Batt.Offline"))
-            self._status_label.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._status_label, style.LOAD_MID)
             return
         age = time.monotonic() - self._last_rx
         if age <= STALE_S:
             stamp = datetime.now().strftime("%H:%M:%S")
             self._status_label.setText(
                 f"{_('Batt.Online')} · {_('Batt.UpdatedAt')} {stamp}")
-            self._status_label.setStyleSheet(f"color: {_OK};")
+            style.set_text_color(self._status_label, style.LOAD_LOW)
         else:
             self._status_label.setText(_("Batt.Offline"))
-            self._status_label.setStyleSheet(f"color: {_WARN};")
+            style.set_text_color(self._status_label, style.LOAD_MID)
 
     def _refresh_status(self):
         self._update_status_label()
@@ -764,6 +763,10 @@ class BatteryPanel(QWidget):
         self._asm.reset()
         self._last_rx = 0.0
         self._update_status_label()
+
+    def refresh_theme(self):
+        if self._voltage is not None:
+            self._on_voltage(self._voltage)
 
     def refresh_language(self):
         for box, key in self._titles:
