@@ -11,7 +11,7 @@ from typing import Optional
 
 from .constants import (
     CAN_FD_DLC_MAP, DLC_BOUNDARIES,
-    MSG_TxFrame,
+    MSG_TxFrame, MSG_RxFrame, MSG_TxEcho,
     CAN_ID_Error, CAN_ID_29Bit, CAN_ID_RTR, CAN_MASK_11, CAN_MASK_29,
     ECHO_RxData,
     FRM_FDF, FRM_BRS, FRM_ESI,
@@ -19,8 +19,6 @@ from .constants import (
     ERID_Tx_Timeout, ERID_Arbitration_lost,
     ERID_Controller_problem, ERID_Protocol_violation, ERID_Transceiver_error,
     ERID_Bus_error, ERID_Controller_restarted,
-    BUS_StatusOff, BUS_StatusPassive, BUS_StatusWarning, ER1_Bus_is_back_active,
-    APP_CanTxOverflow, APP_CanTxTimeout, APP_CanRxFail, APP_CanTxFail, APP_UsbInOverflow,
 )
 
 
@@ -100,8 +98,29 @@ class CANFrame:
     def __repr__(self) -> str:
         return f"CANFrame({self})"
 
+    def tx_payload(self) -> bytes:
+        """Validate a TX frame and return its actual, DLC-aligned wire data."""
+        mask = CAN_MASK_29 if self.extended else CAN_MASK_11
+        if not isinstance(self.can_id, int) or not 0 <= self.can_id <= mask:
+            raise ValueError("CAN ID is outside the selected identifier range")
+        if self.is_error:
+            raise ValueError("error reports cannot be transmitted as CAN frames")
+        if self.fd and self.rtr:
+            raise ValueError("CAN FD does not support RTR frames")
+        if not self.fd and (self.brs or self.esi):
+            raise ValueError("BRS and ESI require CAN FD")
+        data = bytes(self.data)
+        if len(data) > (64 if self.fd else 8):
+            raise ValueError("CAN payload exceeds the frame's maximum length")
+        # The firmware rounds the byte count up to a DLC without clearing its
+        # reusable USB buffer. Supply every byte that the controller will read.
+        return data.ljust(_pad_to_dlc(len(data)), b'\x00') if self.fd else data
+
     # ----- ElmueSoft TX packing ----- #
     def to_elmue_bytes(self, marker: int = 0) -> bytes:
+        raw_data = self.tx_payload()
+        if not 0 <= marker <= 255:
+            raise ValueError("TX marker must be in 0..255")
         can_id_raw = self.can_id
         if self.extended:
             can_id_raw |= CAN_ID_29Bit
@@ -116,12 +135,6 @@ class CANFrame:
         if self.esi:
             flags |= FRM_ESI
 
-        # ElmueSoft 是变长协议：数据长度由 header.size 携带，不应填充。
-        # 仅 Classic CAN 限制为最多 8 字节（截断，不填充）。
-        raw_data = bytes(self.data)
-        if not self.fd:
-            raw_data = raw_data[:8]
-
         size = 8 + len(raw_data)
         header = struct.pack('<BB', size, MSG_TxFrame)
         body = struct.pack('<BIB', flags, can_id_raw, marker)
@@ -130,6 +143,10 @@ class CANFrame:
     # ----- ElmueSoft RX parsing ----- #
     @classmethod
     def from_elmue_rx(cls, raw: bytes, has_timestamp: bool) -> "CANFrame":
+        minimum = 11 if has_timestamp else 7
+        if (len(raw) < minimum or raw[0] != len(raw)
+                or raw[1] != MSG_RxFrame):
+            raise ValueError("invalid ElmueSoft RX message length or header")
         offset = 2
         flags = raw[offset]
         can_id_raw = struct.unpack_from('<I', raw, offset + 1)[0]
@@ -141,12 +158,14 @@ class CANFrame:
             offset += 4
 
         data = raw[offset:]
+        if len(data) > (64 if flags & FRM_FDF else 8):
+            raise ValueError("invalid ElmueSoft RX payload length")
 
         extended = bool(can_id_raw & CAN_ID_29Bit)
         rtr = bool(can_id_raw & CAN_ID_RTR)
         can_id = can_id_raw & CAN_MASK_29 if extended else can_id_raw & CAN_MASK_11
         is_fd = bool(flags & FRM_FDF)
-        ts = ts_us / 1_000_000.0 if ts_us else time.time()
+        ts = ts_us / 1_000_000.0 if has_timestamp else time.time()
 
         return cls(
             can_id=can_id, data=bytes(data), extended=extended, rtr=rtr,
@@ -157,15 +176,20 @@ class CANFrame:
     # ----- ElmueSoft TX echo parsing ----- #
     @classmethod
     def from_elmue_echo(cls, raw: bytes, has_timestamp: bool,
-                        tx_frames: dict = None) -> "CANFrame":
+                        tx_frames: dict = None) -> Optional["CANFrame"]:
+        if (len(raw) != (7 if has_timestamp else 3)
+                or raw[0] != len(raw) or raw[1] != MSG_TxEcho):
+            raise ValueError("invalid ElmueSoft TX echo length or header")
         marker = raw[2]
         ts_us = 0
         if has_timestamp and len(raw) >= 7:
             ts_us = struct.unpack_from('<I', raw, 3)[0]
-        ts = ts_us / 1_000_000.0 if ts_us else time.time()
+        ts = ts_us / 1_000_000.0 if has_timestamp else time.time()
 
-        if tx_frames and marker in tx_frames:
-            orig = tx_frames[marker]
+        if tx_frames is not None:
+            orig = tx_frames.pop(marker, None)
+            if orig is None:
+                return None
             return cls(
                 can_id=orig.can_id, data=orig.data, extended=orig.extended,
                 rtr=orig.rtr, fd=orig.fd, brs=orig.brs, esi=orig.esi,
@@ -176,7 +200,8 @@ class CANFrame:
 
     # ----- Legacy parsing ----- #
     @classmethod
-    def from_legacy_bytes(cls, raw: bytes) -> Optional["CANFrame"]:
+    def from_legacy_bytes(cls, raw: bytes, has_timestamp: Optional[bool] = None,
+                          fd_mode: Optional[bool] = None) -> Optional["CANFrame"]:
         if len(raw) < 12:
             return None
 
@@ -188,18 +213,22 @@ class CANFrame:
             return None
 
         is_fd = bool(flags & FRM_FDF)
+        if has_timestamp is None:
+            # Compatibility for standalone callers. Drivers must supply the
+            # negotiated mode: 76-byte transfers can carry Classic CAN too.
+            has_timestamp = len(raw) in (24, 80)
+        if fd_mode is None:
+            fd_mode = is_fd or len(raw) in (76, 80)
+        expected = 12 + (64 if fd_mode else 8) + (4 if has_timestamp else 0)
+        if len(raw) != expected or (is_fd and not fd_mode):
+            return None
         actual_len = cls.dlc_to_len(dlc) if is_fd else min(dlc, 8)
         data = raw[12:12 + actual_len]
 
         ts = time.time()
-        if is_fd and len(raw) >= 80:
-            ts_us = struct.unpack_from('<I', raw, 76)[0]
-            if ts_us:
-                ts = ts_us / 1_000_000.0
-        elif not is_fd and len(raw) >= 24:
-            ts_us = struct.unpack_from('<I', raw, 20)[0]
-            if ts_us:
-                ts = ts_us / 1_000_000.0
+        if has_timestamp:
+            ts_us = struct.unpack_from('<I', raw, 76 if is_fd else 20)[0]
+            ts = ts_us / 1_000_000.0
 
         extended = bool(can_id_full & CAN_ID_29Bit)
         rtr = bool(can_id_full & CAN_ID_RTR)
@@ -245,6 +274,7 @@ class CANFrame:
 
     # ----- Legacy TX packing ----- #
     def to_legacy_bytes(self) -> bytes:
+        raw_data = self.tx_payload()
         can_id_raw = self.can_id
         if self.extended:
             can_id_raw |= CAN_ID_29Bit
@@ -263,12 +293,12 @@ class CANFrame:
         dlc = self.dlc
 
         if self.fd:
-            data_padded = bytes(self.data).ljust(64, b'\x00')
+            data_padded = raw_data.ljust(64, b'\x00')
             return struct.pack('<IIBBBB64sI',
                                echo_id, can_id_raw, dlc, 0,
                                flags, 0, data_padded, 0)
         else:
-            data_padded = bytes(self.data).ljust(8, b'\x00')[:8]
+            data_padded = raw_data.ljust(8, b'\x00')
             return struct.pack('<IIBBBB8s',
                                echo_id, can_id_raw, dlc, 0,
                                flags, 0, data_padded)

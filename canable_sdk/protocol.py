@@ -3,6 +3,9 @@
 import logging
 import struct
 import time
+import threading
+from collections import deque
+from dataclasses import replace
 from typing import Optional
 
 from .constants import (
@@ -14,7 +17,6 @@ from .constants import (
     ERID_Tx_Timeout, ERID_Arbitration_lost,
     ERID_Controller_problem, ERID_Protocol_violation, ERID_Transceiver_error,
     ERID_Bus_error, ERID_Controller_restarted,
-    BUS_StatusOff, BUS_StatusPassive, BUS_StatusWarning, BUS_StatusActive,
     ER1_Bus_is_back_active,
     ER1_Rx_Errors_at_warning_level, ER1_Tx_Errors_at_warning_level,
     ER1_Rx_Passive_status_reached, ER1_Tx_Passive_status_reached,
@@ -34,7 +36,10 @@ from .frame import CANFrame
 
 logger = logging.getLogger("canable_sdk.protocol")
 
-MAX_BUFFER_SIZE = 2048
+_MESSAGE_LENGTHS = {
+    MSG_RxFrame: (7, 71), MSG_TxFrame: (8, 72), MSG_TxEcho: (3, 3),
+    MSG_Error: (14, 14), MSG_Busload: (3, 3), MSG_String: (2, MAX_ELMUE_MSG_SIZE),
+}
 
 # 错误帧 Byte3/Byte4 名称表（模块级常量，避免每次解析重建）
 _ERR3_LOCATION_NAMES = {
@@ -70,61 +75,94 @@ class _ElmueProtocol:
         self._buffer = bytearray()
         self._has_timestamp = False
         self._tx_frames: dict = {}
-        self._pending_frames: list = []
+        self._tx_lock = threading.Lock()
+        self._next_marker = 0
+        self._pending_frames = deque()
+        self.bus_load = None
 
     def set_timestamp_mode(self, enabled: bool):
         self._has_timestamp = enabled
 
     def store_tx_frame(self, marker: int, frame: CANFrame):
-        self._tx_frames[marker] = frame
+        snapshot = replace(frame, data=frame.tx_payload())
+        with self._tx_lock:
+            if marker in self._tx_frames:
+                raise RuntimeError("TX marker is still awaiting an echo")
+            self._tx_frames[marker] = snapshot
+
+    def reserve_tx_frame(self, frame: CANFrame) -> int:
+        snapshot = replace(frame, data=frame.tx_payload())
+        with self._tx_lock:
+            for _ in range(255):
+                self._next_marker = self._next_marker % 255 + 1
+                if self._next_marker not in self._tx_frames:
+                    self._tx_frames[self._next_marker] = snapshot
+                    return self._next_marker
+        raise RuntimeError("all TX markers are awaiting echoes; receive frames or recover CAN")
 
     def clear(self):
+        self.reset_rx()
+        with self._tx_lock:
+            self._tx_frames.clear()
+
+    def reset_rx(self):
+        """Discard an interrupted RX stream without reusing in-flight markers."""
         self._buffer.clear()
         self._pending_frames.clear()
-        self._tx_frames.clear()
+        self.bus_load = None
 
     def feed(self, raw: bytes) -> list:
         self._buffer.extend(raw)
-        if len(self._buffer) > MAX_BUFFER_SIZE:
-            logger.warning("buffer overflow, discarding %d bytes", len(self._buffer))
-            self._buffer.clear()
-            return []
-
         frames = []
-        while len(self._buffer) >= 2:
-            size = self._buffer[0]
-            msg_type = self._buffer[1]
+        offset = 0
+        available = len(self._buffer)
+        while available - offset >= 2:
+            size = self._buffer[offset]
+            msg_type = self._buffer[offset + 1]
 
             if size < 2 or size > MAX_ELMUE_MSG_SIZE or msg_type not in VALID_MSG_TYPES:
-                self._buffer.pop(0)
+                offset += 1
                 continue
-
-            if len(self._buffer) < size:
+            minimum, maximum = _MESSAGE_LENGTHS[msg_type]
+            if self._has_timestamp and msg_type in (MSG_RxFrame, MSG_TxEcho, MSG_Error):
+                minimum += 4
+                maximum += 4
+            if not minimum <= size <= maximum:
+                offset += 1
+                continue
+            if available - offset < size:
                 break
 
-            msg = bytes(self._buffer[:size])
-            del self._buffer[:size]
+            msg = bytes(self._buffer[offset:offset + size])
+            offset += size
 
-            frame = self._parse_message(msg, msg_type)
+            try:
+                frame = self._parse_message(msg, msg_type)
+            except (ValueError, struct.error):
+                continue
             if frame is not None:
                 frames.append(frame)
-
+        del self._buffer[:offset]
         return frames
 
     def flush_frames(self) -> list:
-        frames = self._pending_frames
-        self._pending_frames = []
+        frames = list(self._pending_frames)
+        self._pending_frames.clear()
         return frames
+
+    def pop_pending(self) -> Optional[CANFrame]:
+        return self._pending_frames.popleft() if self._pending_frames else None
 
     def push_pending(self, frames: list):
         """Prepend frames for next receive call."""
-        self._pending_frames = frames + self._pending_frames
+        self._pending_frames.extendleft(reversed(frames))
 
     def _parse_message(self, msg: bytes, msg_type: int) -> Optional[CANFrame]:
         if msg_type == MSG_RxFrame:
             return CANFrame.from_elmue_rx(msg, self._has_timestamp)
         elif msg_type == MSG_TxEcho:
-            return CANFrame.from_elmue_echo(msg, self._has_timestamp, self._tx_frames)
+            with self._tx_lock:
+                return CANFrame.from_elmue_echo(msg, self._has_timestamp, self._tx_frames)
         elif msg_type == MSG_TxFrame:
             return self._parse_tx_frame(msg)
         elif msg_type == MSG_Error:
@@ -187,14 +225,11 @@ class _ElmueProtocol:
         if err_id & ERID_CRC_Error:
             parts.append("CRC-ERR")
 
-        # --- Byte 1: Bus status + error level ---
+        # Byte 1 contains independent RX/TX flags, not a BUS_Status enum.
         byte1 = err_data[1] if len(err_data) > 1 else 0
-        bus_status = byte1 & 0x30
-        if bus_status == BUS_StatusOff:
-            parts.append("BUS-OFF")
-        elif bus_status == BUS_StatusPassive:
+        if byte1 & (ER1_Rx_Passive_status_reached | ER1_Tx_Passive_status_reached):
             parts.append("ERROR-PASSIVE")
-        elif bus_status == BUS_StatusWarning:
+        elif byte1 & (ER1_Rx_Errors_at_warning_level | ER1_Tx_Errors_at_warning_level):
             parts.append("ERROR-WARNING")
         if byte1 & ER1_Rx_Errors_at_warning_level:
             parts.append("RX-WARNING")
@@ -276,5 +311,4 @@ class _ElmueProtocol:
 
     def _parse_busload(self, msg: bytes):
         if len(msg) >= 3:
-            load = msg[2]
-            logger.debug("busload: %d%%", load)
+            self.bus_load = msg[2]

@@ -17,9 +17,9 @@ import sys as _sys
 # to the DLL search path so pyusb can find the backend.
 if _sys.platform == "win32":
     _dll_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    os.add_dll_directory(_dll_dir)
+    _dll_handle = os.add_dll_directory(_dll_dir)
 
-from .driver import ZDTCanable  # noqa: E402
+from .driver import ZDTCanable, CANableCommandError  # noqa: E402
 from .frame import CANFrame  # noqa: E402
 from .constants import logger, CANABLE_VID, CANABLE_PID, FRM_FDF, FRM_BRS, FRM_ESI  # noqa: E402
 
@@ -27,6 +27,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "ZDTCanable",
+    "CANableCommandError",
     "CANFrame",
     "logger",
     "CANABLE_VID", "CANABLE_PID",

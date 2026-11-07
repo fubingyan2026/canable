@@ -4,10 +4,12 @@ Main entrypoint: ZDTCanable class.
 """
 from __future__ import annotations
 
-import logging
+import math
 import struct
 import threading
 import time
+from dataclasses import replace
+from contextlib import contextmanager
 from typing import Callable, List, Optional
 
 import usb.core
@@ -15,7 +17,7 @@ import usb.util
 
 from .constants import (
     CANABLE_VID, CANABLE_PID, EP_IN, EP_OUT, MAX_PACKET_SIZE,
-    HOST_FORMAT_MAGIC, LEGACY_FRAME_SIZE,
+    HOST_FORMAT_MAGIC,
     GS_ReqSetHostFormat, GS_ReqSetBitTiming, GS_ReqSetDeviceMode,
     GS_ReqGetCapabilities, GS_ReqGetDeviceVersion, GS_ReqGetTimestamp,
     GS_ReqIdentify, GS_ReqSetBitTimingFD, GS_ReqGetCapabilitiesFD,
@@ -23,20 +25,25 @@ from .constants import (
     ELM_ReqGetBoardInfo, ELM_ReqSetFilter, ELM_ReqGetLastError,
     ELM_ReqSetBusLoadReport, ELM_ReqSetPinStatus, ELM_ReqGetPinStatus,
     GS_DevFlagListenOnly, GS_DevFlagLoopback, GS_DevFlagOneShot,
-    GS_DevFlagTimestamp, GS_DevFlagIdentify, GS_DevFlagCAN_FD,
-    GS_DevFlagBitTimingFD, GS_DevFlagTermination,
+    GS_DevFlagTimestamp, GS_DevFlagCAN_FD, GS_DevFlagBitTimingFD,
     ELM_DevFlagProtocolElmue, ELM_DevFlagDisableTxEcho,
-    GS_ModeStart, GS_TerminationON, GS_TerminationOFF,
-    FIL_ClearAll, FIL_AcceptMask11bit, FIL_AcceptMask29bit,
-    PINOP_Reset, PINOP_Set, PINOP_Tristate, PINOP_PullDown,
-    PINOP_PullUp, PINOP_Disable, PINOP_Enable,
-    PINID_BOOT0, PINST_High, PINST_Enabled,
+    GS_ModeStart, FIL_ClearAll,
     FEEDBACK_NAMES,
     logger,
 )
-from .bitrate import NOMINAL_BITTIMING, DATA_BITTIMING
+from .bitrate import NOMINAL_BITTIMING, DATA_BITTIMING, TimingLimits, DATA_LIMITS, calculate_timing
 from .frame import CANFrame
 from .protocol import _ElmueProtocol
+
+
+class CANableCommandError(RuntimeError):
+    """A control transfer succeeded, but the firmware rejected its command."""
+
+    def __init__(self, request: int, feedback: int):
+        self.request = request
+        self.feedback = feedback
+        name = FEEDBACK_NAMES.get(feedback, f"unknown({feedback})")
+        super().__init__(f"CAN command 0x{request:02X} failed: {name} (eFeedback={feedback})")
 
 
 class ZDTCanable:
@@ -44,12 +51,24 @@ class ZDTCanable:
         self.vid    = vid or CANABLE_VID
         self.pid    = pid or CANABLE_PID
         self.serial = serial
+        if port is not None and (not isinstance(port, (tuple, list)) or len(port) != 2
+                                 or not all(isinstance(v, int) and v >= 0 for v in port)):
+            raise ValueError("port must be a USB (bus, address) pair")
+        self._port = tuple(port) if port is not None else None
+        self._backend = backend
         self.dev:    Optional[usb.core.Device] = None
         self.ep_out: Optional[usb.core.Endpoint] = None
         self.ep_in:  Optional[usb.core.Endpoint] = None
 
-        self._lock       = threading.Lock()
+        self._lock       = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._receive_lock = threading.RLock()
+        self._reader_lock = threading.Lock()
+        self._listener_lock = threading.Lock()
+        self._listen_stop = threading.Event()
+        self._recv_thr = None
         self._running    = False
+        self._session_id = 0
         self._fd_mode    = False
         self._bitrate:   Optional[int] = None
         self._sample_point: Optional[float] = None
@@ -59,10 +78,19 @@ class ZDTCanable:
         self._capabilities_fd: int = 0
         self._protocol:  Optional[str] = None
         self._parser:    Optional[_ElmueProtocol] = None
-        self._marker_counter: int = 0
         self._has_timestamp: bool = False
         self._listen_only: bool = False
         self._loopback: bool = False
+        self._disable_echo: bool = False
+        self._one_shot: bool = False
+        self._nominal_configured = False
+        self._data_configured = False
+        self._needs_reconfigure = False
+        self._filters = []
+        self._bus_load_interval = 0
+        self._can_clock = 160_000_000
+        self._nominal_limits = TimingLimits()
+        self._data_limits = DATA_LIMITS
         self._callbacks: List[Callable[[CANFrame], None]] = []
         self._overflow_cb: Optional[Callable[[], None]] = None
         self._last_error_info: Optional[str] = None
@@ -75,6 +103,21 @@ class ZDTCanable:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+    @contextmanager
+    def _lifecycle(self):
+        # A callback must be able to exit when another thread is stopping and
+        # joining it. Never wait indefinitely on that thread's lifecycle lock.
+        if threading.current_thread() is self._recv_thr:
+            while not self._lifecycle_lock.acquire(timeout=0.05):
+                if self._listen_stop.is_set():
+                    raise RuntimeError("receive listener is stopping")
+        else:
+            self._lifecycle_lock.acquire()
+        try:
+            yield
+        finally:
+            self._lifecycle_lock.release()
+
     @property
     def running(self) -> bool:
         return self._running
@@ -85,7 +128,10 @@ class ZDTCanable:
 
     @fd_mode.setter
     def fd_mode(self, value: bool):
-        self._fd_mode = value
+        with self._lock:
+            if self._running:
+                raise RuntimeError("stop CAN before changing FD mode")
+            self._fd_mode = bool(value)
 
     # ================================================================
     #  Device enumeration
@@ -119,7 +165,19 @@ class ZDTCanable:
     #  Connection & disconnection
     # ================================================================
     def open(self):
+        with self._lifecycle():
+            self._open()
+
+    def _open(self):
+        if self.dev is not None:
+            raise RuntimeError("USB device is already open")
+        if self._recv_thr is not None and self._recv_thr.is_alive():
+            raise RuntimeError("previous receive thread has not exited")
         kwargs = dict(idVendor=self.vid, idProduct=self.pid)
+        if self._backend is not None:
+            kwargs["backend"] = self._backend
+        if self._port is not None:
+            kwargs.update(bus=self._port[0], address=self._port[1])
         if self.serial:
             kwargs.setdefault("serial_number", self.serial)
         logger.debug("查找设备: VID=0x%04X PID=0x%04X", self.vid, self.pid)
@@ -134,31 +192,56 @@ class ZDTCanable:
         except Exception:
             logger.info("设备已打开: serial=<unknown>")
 
-        self._setup_usb()
-        self._init_device()
-        self._detect_protocol()
-        logger.debug("协议检测完成: protocol=%s", self._protocol.__class__.__name__)
+        try:
+            self._capabilities = self._capabilities_fd = 0
+            self._protocol = None
+            self._can_clock = 160_000_000
+            self._nominal_limits = TimingLimits()
+            self._data_limits = DATA_LIMITS
+            self._setup_usb()
+            self._init_device()
+            self._clear_receive_buffers(drain=True)
+            self._nominal_configured = self._data_configured = False
+            self._needs_reconfigure = True
+            self._tx_blocked_until = 0.0
+            self._last_error_info = None
+        except Exception:
+            self.close()
+            raise
+        logger.debug("协议检测完成: protocol=%s", self._protocol)
 
     def close(self):
+        with self._lifecycle():
+            self._close()
+
+    def _close(self):
         logger.debug("关闭设备")
-        if self._running:
+        self.stop_listening()
+        if self.dev is not None:
             try:
-                self.stop()
+                # Also reset after an unconfirmed START: a failed feedback
+                # read does not prove that the controller stayed stopped.
+                with self._lock:
+                    self._stop_controller()
             except Exception:
-                pass
+                logger.debug("CAN reset during close failed", exc_info=True)
         # 关闭 LED 识别（非关键操作，短超时避免阻塞断开）
         try:
             self._ctrl_out(GS_ReqIdentify, data=struct.pack('<I', 0), timeout=100)
         except Exception:
             pass
-        if self.dev is not None:
-            try:
-                usb.util.dispose_resources(self.dev)
-            except Exception:
-                pass
-            self.dev = None
-        self.ep_in = self.ep_out = None
         self._running = False
+        self._session_id += 1
+        with self._lock, self._receive_lock:
+            if self.dev is not None:
+                try:
+                    usb.util.dispose_resources(self.dev)
+                except Exception:
+                    logger.debug("USB resource cleanup failed", exc_info=True)
+                self.dev = None
+            self.ep_in = self.ep_out = None
+            self._nominal_configured = self._data_configured = False
+            self._clear_receive_buffers()
 
     def _setup_usb(self):
         try:
@@ -194,13 +277,16 @@ class ZDTCanable:
     def _init_device(self):
         self._reset_device()
 
-        self._ctrl_out_checked(GS_ReqSetHostFormat,
-                               data=struct.pack('<I', HOST_FORMAT_MAGIC))
-
-        caps = self._ctrl_in(GS_ReqGetCapabilities, length=44)
+        caps = self._ctrl_in(GS_ReqGetCapabilities, length=40)
         if caps and len(caps) >= 4:
             self._capabilities = struct.unpack_from('<I', bytes(caps), 0)[0]
+            self._load_timing_limits(bytes(caps))
             logger.info("capabilities: 0x%X", self._capabilities)
+        else:
+            raise RuntimeError("device returned invalid capabilities")
+        self._detect_protocol()
+        self._ctrl_out_checked(GS_ReqSetHostFormat,
+                               data=struct.pack('<I', HOST_FORMAT_MAGIC))
 
         ver = self._ctrl_in(GS_ReqGetDeviceVersion, length=16)
         if ver and len(ver) >= 12:
@@ -236,35 +322,73 @@ class ZDTCanable:
                          | usb.util.CTRL_RECIPIENT_INTERFACE)
         if data is None:
             data = []
-        return self.dev.ctrl_transfer(bmRequestType, req, value, index, data, timeout)
+        with self._lock:
+            if self.dev is None:
+                raise RuntimeError("USB device is not open")
+            written = self.dev.ctrl_transfer(bmRequestType, req, value, index, data, timeout)
+            if written != len(data):
+                raise RuntimeError(f"short USB control write: {written}/{len(data)} bytes")
+            return written
 
     def _ctrl_in(self, req, value=0, index=0, length=64, timeout=1000):
         bmRequestType = (usb.util.CTRL_IN
                          | usb.util.CTRL_TYPE_VENDOR
                          | usb.util.CTRL_RECIPIENT_INTERFACE)
-        return self.dev.ctrl_transfer(bmRequestType, req, value, index, length, timeout)
+        with self._lock:
+            if self.dev is None:
+                raise RuntimeError("USB device is not open")
+            return self.dev.ctrl_transfer(bmRequestType, req, value, index, length, timeout)
 
     def _ctrl_out_checked(self, req, value=0, index=0, data=None, timeout=1000):
-        self._ctrl_out(req, value, index, data, timeout)
-        return self._check_last_error()
+        # Keep SET + GetLastError atomic: any other SETUP request clears the
+        # firmware feedback. Legacy firmware has no GetLastError command.
+        with self._lock:
+            self._ctrl_out(req, value, index, data, timeout)
+            if self._protocol == "elmue":
+                feedback = self._check_last_error()
+                if feedback not in (0, 2):
+                    raise CANableCommandError(req, feedback)
 
-    def _check_last_error(self) -> Optional[int]:
-        try:
-            result = self._ctrl_in(ELM_ReqGetLastError, length=1)
-            if result and len(result) >= 1:
-                feedback = result[0]
-                if feedback != 0 and feedback != 2:
-                    name = FEEDBACK_NAMES.get(feedback, f"unknown({feedback})")
-                    logger.warning("control request failed: eFeedback=%d (%s)", feedback, name)
-                    return feedback
-        except usb.core.USBError:
-            pass
-        return None
+    def _check_last_error(self) -> int:
+        result = self._ctrl_in(ELM_ReqGetLastError, length=1)
+        if result is None or len(result) != 1:
+            raise RuntimeError("device returned invalid command feedback")
+        return result[0]
 
     # ================================================================
     #  CAN controller lifecycle
     # ================================================================
-    def start(self, loopback: bool = False, disable_echo: bool = False, one_shot: bool = False):
+    def start(self, loopback: Optional[bool] = None, disable_echo: Optional[bool] = None,
+              one_shot: Optional[bool] = None):
+        with self._lifecycle(), self._lock:
+            self._start(loopback, disable_echo, one_shot)
+
+    def _start(self, loopback, disable_echo, one_shot):
+        if self.dev is None:
+            raise RuntimeError("USB device is not open")
+        if self._running:
+            raise RuntimeError("CAN is already started")
+        if self._bitrate is None:
+            raise RuntimeError("set nominal bitrate before starting CAN")
+        if self._fd_mode and self._data_bitrate is None:
+            raise RuntimeError("set data bitrate before starting CAN FD")
+        loopback = self._loopback if loopback is None else bool(loopback)
+        disable_echo = self._disable_echo if disable_echo is None else bool(disable_echo)
+        one_shot = self._one_shot if one_shot is None else bool(one_shot)
+
+        # FD is enabled implicitly by configuring data timing in this firmware.
+        if self._data_configured and not self._fd_mode:
+            raise RuntimeError("data timing is configured; enable FD mode before starting CAN")
+        if not self._nominal_configured:
+            self.set_bitrate(self._bitrate, self._sample_point)
+        if self._fd_mode and not self._data_configured:
+            self.set_data_bitrate(self._data_bitrate, self._data_sample_point)
+        if self._needs_reconfigure and self._filters:
+            self._ctrl_out_checked(ELM_ReqSetFilter, data=struct.pack('<BIIII', FIL_ClearAll, 0, 0, 0, 0))
+            for operation, can_id, mask in self._filters:
+                self._ctrl_out_checked(ELM_ReqSetFilter,
+                                       data=struct.pack('<BIIII', operation, can_id, mask, 0, 0))
+        self._clear_receive_buffers(drain=True)
         flags = 0
         if self._protocol == "elmue":
             flags |= ELM_DevFlagProtocolElmue
@@ -272,7 +396,7 @@ class ZDTCanable:
         if self._listen_only:
             flags |= GS_DevFlagListenOnly
 
-        if loopback or self._loopback:
+        if loopback:
             flags |= GS_DevFlagLoopback
 
         if one_shot:
@@ -292,218 +416,261 @@ class ZDTCanable:
             self._parser.set_timestamp_mode(self._has_timestamp)
 
         self._running = True
+        self._loopback, self._disable_echo, self._one_shot = loopback, disable_echo, one_shot
+        self._needs_reconfigure = False
+        self._last_error_info = None
+        if self._bus_load_interval:
+            self.set_bus_load_report(self._bus_load_interval)
         time.sleep(0.05)  # allow transceiver/isolator to power up
         logger.info("CAN started (protocol=%s, FD=%s, loopback=%s, flags=0x%X, bitrate=%s, data_bitrate=%s)",
                     self._protocol, self._fd_mode, bool(flags & GS_DevFlagLoopback),
                     flags, self._bitrate, self._data_bitrate)
 
     def stop(self):
-        flags = 0
-        if self._protocol == "elmue":
-            flags |= ELM_DevFlagProtocolElmue
+        with self._lifecycle():
+            self.stop_listening()
+            with self._lock:
+                if self.dev is None:
+                    self._running = False
+                    self._clear_receive_buffers()
+                    return
+                self._stop_controller()
+
+    def _protocol_flag(self):
+        return ELM_DevFlagProtocolElmue if self._protocol == "elmue" else 0
+
+    def _stop_controller(self):
         try:
             self._ctrl_out_checked(GS_ReqSetDeviceMode,
-                                   data=struct.pack('<II', 0, flags))
-        except usb.core.USBError as e:
-            logger.warning("stop USB error: %s", e)
-        self._running = False
+                                   data=struct.pack('<II', 0, self._protocol_flag()))
+        finally:
+            # On a transport failure the device state is uncertain. Do not
+            # permit more TX until configuration/start has succeeded again.
+            self._running = False
+            self._session_id += 1
+            self._nominal_configured = self._data_configured = False
+            self._needs_reconfigure = True
+            self._clear_receive_buffers(drain=True)
         logger.info("CAN stopped")
 
     def recover(self):
-        flags = ELM_DevFlagProtocolElmue if self._protocol == "elmue" else 0
-        self._ctrl_out(GS_ReqSetDeviceMode, data=struct.pack('<II', 0, flags))
-        time.sleep(0.05)
+        with self._lifecycle():
+            listening = self._is_listening()
+            self.stop()
+            self.start()
+            self._tx_blocked_until = time.monotonic() + 0.3
+            self._resume_listener(listening)
+            logger.info("CAN recovered")
 
-        if self._parser is not None:
-            self._parser.clear()
+    def _clear_receive_buffers(self, drain=False):
+        with self._receive_lock:
+            if self._parser is not None:
+                self._parser.clear()
+            if drain and self.ep_in is not None:
+                # A stopped controller cannot generate new CAN data. Drain its
+                # queued USB messages before accepting frames in a new session.
+                for _ in range(256):
+                    try:
+                        self.ep_in.read(256, timeout=1)
+                    except usb.core.USBError:
+                        break
 
-        try:
-            for _ in range(16):
-                self.ep_in.read(256, timeout=10)
-        except usb.core.USBError:
-            pass
-
-        if self._bitrate:
-            self.set_bitrate(self._bitrate, sample_point=self._sample_point)
-        if self._fd_mode and self._data_bitrate:
-            self.set_data_bitrate(self._data_bitrate, sample_point=self._data_sample_point)
-
-        self.start(loopback=self._loopback)
-        self._tx_blocked_until = time.time() + 0.3
-        logger.info("CAN recovered")
+    def _load_timing_limits(self, raw, fd=False):
+        if len(raw) < (72 if fd else 40):
+            return
+        clock = struct.unpack_from('<I', raw, 4)[0]
+        nominal = TimingLimits(*struct.unpack_from('<8I', raw, 8))
+        data = TimingLimits(*struct.unpack_from('<8I', raw, 40)) if fd else None
+        for limits in (nominal, data):
+            if limits is not None and not (1 <= limits.seg1_min <= limits.seg1_max <= 256
+                    and 1 <= limits.seg2_min <= limits.seg2_max <= 128
+                    and 1 <= limits.brp_min <= limits.brp_max <= 1024
+                    and 1 <= limits.brp_inc <= limits.brp_max
+                    and 1 <= limits.sjw_max <= 128):
+                raise RuntimeError("device returned invalid bit timing limits")
+        if clock <= 0:
+            raise RuntimeError("device returned invalid CAN clock")
+        self._can_clock = clock
+        self._nominal_limits = nominal
+        if data is not None:
+            self._data_limits = data
 
     # ================================================================
     #  Bit timing configuration
     # ================================================================
     def set_bitrate(self, bitrate: int, sample_point: float | None = None):
-        if sample_point is None:
-            if bitrate not in NOMINAL_BITTIMING:
-                brp, seg1, seg2, sjw = self._calc_bitrate_params(bitrate)
-            else:
-                brp, seg1, seg2, sjw = NOMINAL_BITTIMING[bitrate]
-        else:
-            brp, seg1, seg2, sjw = self._calc_bitrate_params(
-                bitrate, sample_point=sample_point)
-
-        prop = 0
-        payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
-        self._ctrl_out_checked(GS_ReqSetBitTiming, data=payload)
-        self._bitrate = bitrate
-        self._sample_point = sample_point
+        with self._lock:
+            if self._running:
+                raise RuntimeError("stop CAN before changing bitrate")
+            brp, seg1, seg2, sjw = self._select_timing(bitrate, sample_point, False)
+            payload = struct.pack('<IIIII', 0, seg1, seg2, sjw, brp)
+            self._ctrl_out_checked(GS_ReqSetBitTiming, data=payload)
+            self._bitrate = bitrate
+            self._sample_point = sample_point
+            self._nominal_configured = True
         sample_pct = (1 + seg1) / (1 + seg1 + seg2) * 100
         logger.info("nominal bitrate set: %d bps (brp=%d seg1=%d seg2=%d sjw=%d sample=%.1f%%)",
                     bitrate, brp, seg1, seg2, sjw, sample_pct)
 
     def set_data_bitrate(self, data_bitrate: int, sample_point: float | None = None):
-        # 8Mbps 数据段固件要求固定 50% 采样点，不参与可调
-        if sample_point is None or data_bitrate == 8_000_000:
-            if data_bitrate not in DATA_BITTIMING:
-                brp, seg1, seg2, sjw = self._calc_bitrate_params(data_bitrate, data_phase=True)
-            else:
-                brp, seg1, seg2, sjw = DATA_BITTIMING[data_bitrate]
-        else:
-            brp, seg1, seg2, sjw = self._calc_bitrate_params(
-                data_bitrate, data_phase=True, sample_point=sample_point)
-
-        prop = 0
-        payload = struct.pack('<IIIII', prop, seg1, seg2, sjw, brp)
-        self._ctrl_out_checked(GS_ReqSetBitTimingFD, data=payload)
-        self._data_bitrate = data_bitrate
-        self._data_sample_point = sample_point
+        with self._lock:
+            if self._running:
+                raise RuntimeError("stop CAN before changing data bitrate")
+            if not self._capabilities_fd and self._capabilities & GS_DevFlagCAN_FD:
+                self.check_fd_support()
+            brp, seg1, seg2, sjw = self._select_timing(data_bitrate, sample_point, True)
+            payload = struct.pack('<IIIII', 0, seg1, seg2, sjw, brp)
+            self._ctrl_out_checked(GS_ReqSetBitTimingFD, data=payload)
+            self._data_bitrate = data_bitrate
+            self._data_sample_point = 0.5 if data_bitrate == 8_000_000 else sample_point
+            self._data_configured = True
         sample_pct = (1 + seg1) / (1 + seg1 + seg2) * 100
         logger.info("data bitrate set: %d bps (brp=%d seg1=%d seg2=%d sjw=%d sample=%.1f%%)",
                     data_bitrate, brp, seg1, seg2, sjw, sample_pct)
 
     def _calc_bitrate_params(self, bitrate: int, data_phase: bool = False,
                              sample_point: float | None = None):
-        # STM32G4 FDCAN 数据相限制：TSEG1≤15, TSEG2≤15, SJW≤15, BRP≤32 (DBRP 5位)
-        # 标称相限制较宽：TSEG1≤32, TSEG2≤16, BRP≤512 (NBRP 9位)
-        seg1_max = 15 if data_phase else 32
-        seg2_max = 15 if data_phase else 16
-        brp_max  = 32 if data_phase else 512
-        clock = 160_000_000
-
+        if not isinstance(bitrate, int) or isinstance(bitrate, bool) or bitrate <= 0:
+            raise ValueError("bitrate must be a positive integer")
         if sample_point is None:
-            best_err = float('inf')
-            best = None
-            for seg1 in range(1, seg1_max + 1):
-                for seg2 in range(1, min(seg1 + 1, seg2_max + 1)):
-                    total = 1 + seg1 + seg2
-                    for brp in range(1, brp_max + 1):
-                        calc = clock / brp / total
-                        err = abs(calc - bitrate) / bitrate
-                        if err < best_err:
-                            best_err = err
-                            best = (brp, seg1, seg2, min(seg2, 4))
-                        if err < 0.001:
-                            return best
-            if best_err > 0.05:
-                raise ValueError(f"cannot compute bit timing for {bitrate} bps (error {best_err:.1%})")
-            return best
+            sample_point = 0.75 if data_phase else 0.875
+        if not math.isfinite(sample_point) or not 0 < sample_point < 1:
+            raise ValueError("sample point must be between 0 and 1")
+        limits = self._data_limits if data_phase else self._nominal_limits
+        return calculate_timing(bitrate, self._can_clock, limits, sample_point)
 
-        # 指定采样点：在 TSEG1/TSEG2 限制内搜索最接近 (波特率, 采样点) 的时序
-        # 同等精度下优先更大的 time quanta 总数，时序更稳健
-        best_err = (float('inf'), float('inf'))
-        best_total = -1
-        best = None
-        for seg1 in range(1, seg1_max + 1):
-            for seg2 in range(1, seg2_max + 1):
-                total = 1 + seg1 + seg2
-                brp = int(round(clock / (total * bitrate)))
-                if brp < 1 or brp > brp_max:
-                    continue
-                calc = clock / (brp * total)
-                rate_err = abs(calc - bitrate) / bitrate
-                if rate_err > 0.01:
-                    continue
-                sample_err = abs((1 + seg1) / total - sample_point)
-                key = (rate_err, sample_err)
-                if key < best_err or (key == best_err and total > best_total):
-                    best_err = key
-                    best_total = total
-                    best = (brp, seg1, seg2, min(seg2, 4))
-        if best is None:
-            raise ValueError(f"cannot compute bit timing for {bitrate} bps")
-        return best
+    def _select_timing(self, bitrate, sample_point, data_phase):
+        # Validate even when a precomputed timing will be used.
+        if sample_point is not None and (not math.isfinite(sample_point)
+                                        or not 0 < sample_point < 1):
+            raise ValueError("sample point must be between 0 and 1")
+        effective_sample = 0.5 if data_phase and bitrate == 8_000_000 else sample_point
+        timing = self._calc_bitrate_params(bitrate, data_phase, effective_sample)
+        table = DATA_BITTIMING if data_phase else NOMINAL_BITTIMING
+        limits = self._data_limits if data_phase else self._nominal_limits
+        if (sample_point is None or (data_phase and bitrate == 8_000_000)):
+            preset = table.get(bitrate)
+            if self._can_clock == 160_000_000 and preset and limits.accepts(preset):
+                return preset
+        return timing
 
     # ================================================================
     #  Send / Receive
     # ================================================================
     def send(self, frame: CANFrame, timeout: int = 1000):
-        if not self._running:
-            raise RuntimeError("CAN not started")
-
-        now = time.time()
-        if now < self._tx_blocked_until:
-            raise RuntimeError("CAN recovering, please wait")
-
-        if self._protocol == "elmue":
-            self._marker_counter = (self._marker_counter + 1) & 0xFF
-            if self._marker_counter == 0:
-                self._marker_counter = 1
-            marker = self._marker_counter
-            raw = frame.to_elmue_bytes(marker=marker)
-            if self._parser and isinstance(self._parser, _ElmueProtocol):
-                self._parser.store_tx_frame(marker, frame)
-        else:
-            raw = frame.to_legacy_bytes()
-
+        if not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError("send timeout must be a positive number of milliseconds")
+        short_write = False
         try:
             with self._lock:
-                self.ep_out.write(raw, timeout=timeout)
+                if not self._running:
+                    raise RuntimeError("CAN not started")
+                if time.monotonic() < self._tx_blocked_until:
+                    raise RuntimeError("CAN recovering, please wait")
+                if frame.fd and not self._fd_mode:
+                    raise ValueError("CAN FD is not enabled on this controller")
+                snapshot = replace(frame, data=frame.tx_payload())
+                if self._protocol == "elmue":
+                    marker = 0 if self._disable_echo else self._parser.reserve_tx_frame(snapshot)
+                    raw = snapshot.to_elmue_bytes(marker=marker)
+                else:
+                    raw = snapshot.to_legacy_bytes()
+                written = self.ep_out.write(raw, timeout=timeout)
+                if written != len(raw):
+                    short_write = True
+                    raise usb.core.USBError(f"short USB write: {written}/{len(raw)} bytes", errno=5)
                 if len(raw) > 0 and len(raw) % MAX_PACKET_SIZE == 0:
                     self.ep_out.write(b'', timeout=timeout)
         except usb.core.USBError as e:
-            if getattr(e, 'errno', None) in (32, 232) or 'pipe' in str(e).lower():
-                logger.warning("USB pipe error, clearing STALL")
+            pipe_error = getattr(e, 'errno', None) in (32, 232) or 'pipe' in str(e).lower()
+            if pipe_error or short_write:
+                logger.warning("USB TX failed; recovering controller: %s", e)
                 try:
-                    usb.util.clear_stall(self.ep_out)
+                    if pipe_error:
+                        self.ep_out.clear_halt()
+                    self.recover()
+                    self._tx_blocked_until = time.monotonic() + 0.5
                 except Exception:
-                    pass
-                self.recover()
-                self._tx_blocked_until = time.time() + 0.5
+                    self._running = False
+                    logger.exception("USB TX recovery failed")
+                    raise
+            # Never retransmit automatically: the device may have accepted it.
             raise
 
     def send_periodic(self, frame: CANFrame, interval_s: float = 0.01, count: int = 0):
+        if not math.isfinite(interval_s) or interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        if not isinstance(count, int) or count < 0:
+            raise ValueError("count must be a nonnegative integer")
         sent = 0
+        deadline = time.monotonic()
         while count == 0 or sent < count:
             self.send(frame)
             sent += 1
             if count == 0 or sent < count:
-                time.sleep(interval_s)
+                deadline += interval_s
+                now = time.monotonic()
+                if deadline < now:
+                    deadline = now
+                time.sleep(max(0.0, deadline - now))
 
     def receive(self, timeout: float = 1.0) -> Optional[CANFrame]:
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("receive timeout must be finite and nonnegative")
         if not self._running:
             raise RuntimeError("CAN not started")
+        if self._is_listening() and threading.current_thread() is not self._recv_thr:
+            raise RuntimeError("background listener owns CAN receive")
+        if not self._reader_lock.acquire(blocking=False):
+            raise RuntimeError("another thread owns CAN receive")
+        try:
+            return self._receive_until(timeout)
+        finally:
+            self._reader_lock.release()
 
-        if self._protocol == "elmue":
-            return self._recv_elmue(timeout)
-        else:
-            return self._recv_legacy(timeout)
+    def _receive_until(self, timeout):
+        deadline = time.monotonic() + timeout
+        session_id = self._session_id
+        first = True
+        # Only hold the RX state lock during a bounded read/parse. Callbacks
+        # run outside it so they can safely stop or recover the controller.
+        while (self._running and session_id == self._session_id
+               and (first or time.monotonic() < deadline)):
+            if threading.current_thread() is self._recv_thr and self._listen_stop.is_set():
+                break
+            first = False
+            remaining = max(0.0, min(0.1, deadline - time.monotonic()))
+            with self._receive_lock:
+                if not self._running or session_id != self._session_id:
+                    break
+                self._rx_overflow = False
+                frame = (self._recv_elmue(remaining) if self._protocol == "elmue"
+                         else self._recv_legacy(remaining))
+            if not self._running or session_id != self._session_id:
+                break
+            if self._rx_overflow:
+                self._notify_overflow()
+            if frame is not None:
+                if frame.is_error:
+                    self._last_error_info = frame._error_info
+                return frame
+        return None
 
     def _recv_elmue(self, timeout: float = 1.0) -> Optional[CANFrame]:
         if self._parser is not None:
-            frames = self._parser.flush_frames()
-            if frames:
-                return self._take_first_frame(frames)
+            frame = self._parser.pop_pending()
+            if frame is not None:
+                return frame
 
         try:
-            data = self.ep_in.read(256, timeout=int(timeout * 1000))
+            data = self.ep_in.read(256, timeout=max(1, math.ceil(timeout * 1000)))
         except usb.core.USBError as e:
             errno = getattr(e, "errno", None)
             if errno in (110, 10060) or "timeout" in str(e).lower():
                 return None
             if errno in (75, 121) or "overflow" in str(e).lower():
-                logger.debug("USB overflow, flushing endpoint buffer")
-                try:
-                    self.ep_in.read(256, timeout=10)
-                except Exception:
-                    pass
-                if self._overflow_cb:
-                    try:
-                        self._overflow_cb()
-                    except Exception:
-                        logger.exception("overflow callback failed")
+                self._parser.reset_rx()
+                self._rx_overflow = True
                 return None
             raise
 
@@ -525,23 +692,30 @@ class ZDTCanable:
 
     def _recv_legacy(self, timeout: float = 1.0) -> Optional[CANFrame]:
         try:
-            data = self.ep_in.read(LEGACY_FRAME_SIZE, timeout=int(timeout * 1000))
+            # Round to an endpoint packet multiple to avoid libusb overflow
+            # when a transfer contains the 64-byte first packet of an FD frame.
+            data = self.ep_in.read(128, timeout=max(1, math.ceil(timeout * 1000)))
         except usb.core.USBError as e:
             errno = getattr(e, "errno", None)
             if errno in (110, 10060) or "timeout" in str(e).lower():
                 return None
             if errno in (75, 121) or "overflow" in str(e).lower():
-                try:
-                    self.ep_in.read(LEGACY_FRAME_SIZE, timeout=10)
-                except Exception:
-                    pass
+                self._rx_overflow = True
                 return None
             raise
 
         if not data:
             return None
 
-        return CANFrame.from_legacy_bytes(bytes(data))
+        return CANFrame.from_legacy_bytes(bytes(data), has_timestamp=self._has_timestamp,
+                                          fd_mode=self._fd_mode)
+
+    def _notify_overflow(self):
+        if self._overflow_cb:
+            try:
+                self._overflow_cb()
+            except Exception:
+                logger.exception("overflow callback failed")
 
     # ================================================================
     #  Feature queries & settings
@@ -551,6 +725,7 @@ class ZDTCanable:
             caps_fd = self._ctrl_in(GS_ReqGetCapabilitiesFD, length=72)
             if caps_fd and len(caps_fd) >= 4:
                 self._capabilities_fd = struct.unpack_from('<I', bytes(caps_fd), 0)[0]
+                self._load_timing_limits(bytes(caps_fd), fd=True)
         except usb.core.USBError:
             pass
 
@@ -569,9 +744,11 @@ class ZDTCanable:
                 sw = struct.unpack_from('<I', bytes(ver), 4)[0]
                 hw = struct.unpack_from('<I', bytes(ver), 8)[0]
                 # BCD format: 0x251023 → "25.10.23"
-                major = (sw >> 16) & 0xFF
-                minor = (sw >> 8) & 0xFF
-                patch = sw & 0xFF
+                def bcd(value):
+                    return (value >> 4) * 10 + (value & 0x0F)
+                major = bcd((sw >> 16) & 0xFF)
+                minor = bcd((sw >> 8) & 0xFF)
+                patch = bcd(sw & 0xFF)
                 return f"{major}.{minor:02d}.{patch:02d} (fw=0x{sw:08X}, hw=0x{hw:08X})"
         except usb.core.USBError:
             pass
@@ -590,12 +767,17 @@ class ZDTCanable:
             pass
 
     def set_silent(self, enable: bool) -> bool:
-        was_running = self._running
-        if was_running:
-            self.stop()
-        self._listen_only = enable
-        if was_running:
-            self.start()
+        with self._lifecycle():
+            if self._listen_only == bool(enable):
+                return True
+            was_running = self._running
+            listening = self._is_listening()
+            if was_running:
+                self.stop()
+            self._listen_only = bool(enable)
+            if was_running:
+                self.start()
+                self._resume_listener(listening)
         return True
 
     # ================================================================
@@ -609,8 +791,13 @@ class ZDTCanable:
             can_id: Filter value (e.g. 0x7E0). Ignored for FIL_ClearAll.
             mask: Mask value (e.g. 0x7FF). Ignored for FIL_ClearAll.
         """
-        payload = struct.pack('<BIIII', operation, can_id, mask, 0, 0)
-        self._ctrl_out_checked(ELM_ReqSetFilter, data=payload)
+        with self._lock:
+            payload = struct.pack('<BIIII', operation, can_id, mask, 0, 0)
+            self._ctrl_out_checked(ELM_ReqSetFilter, data=payload)
+            if operation == FIL_ClearAll:
+                self._filters.clear()
+            else:
+                self._filters.append((operation, can_id, mask))
         logger.info("filter set: op=%d id=0x%X mask=0x%X", operation, can_id, mask)
 
     def clear_filters(self):
@@ -635,16 +822,20 @@ class ZDTCanable:
         """Enable periodic bus load report.
 
         Args:
-            interval: Report interval in 0=off, 1..255=interval unit.
+            interval: 0=off, 1..100 in units of 100 ms.
         """
-        payload = struct.pack('<B', interval)
-        self._ctrl_out_checked(ELM_ReqSetBusLoadReport, data=payload)
+        if not isinstance(interval, int) or not 0 <= interval <= 100:
+            raise ValueError("bus load interval must be in 0..100 (100 ms units)")
+        with self._lock:
+            payload = struct.pack('<B', interval)
+            self._ctrl_out_checked(ELM_ReqSetBusLoadReport, data=payload)
+            self._bus_load_interval = interval
 
     def get_board_info(self) -> Optional[dict]:
         """Return board information (MCU name, board name, device ID)."""
         try:
             result = self._ctrl_in(ELM_ReqGetBoardInfo, length=55)
-            if result and len(result) >= 6:
+            if result and len(result) >= 52:
                 raw = bytes(result)
                 mcu_id = struct.unpack_from('<H', raw, 0)[0]
                 # Two 25-char null-terminated strings at offset 2 and 27
@@ -707,21 +898,54 @@ class ZDTCanable:
         self._overflow_cb = callback
 
     def start_listening(self):
-        self._running = True
-        self._recv_thr = threading.Thread(target=self._listen_loop, daemon=True)
-        self._recv_thr.start()
+        with self._lifecycle(), self._listener_lock:
+            if not self._running:
+                raise RuntimeError("start CAN before starting the listener")
+            if self._recv_thr is not None and self._recv_thr.is_alive():
+                if self._listen_stop.is_set():
+                    raise RuntimeError("previous receive thread is still stopping")
+                return
+            if self._reader_lock.locked():
+                raise RuntimeError("another thread owns CAN receive")
+            self._listen_stop = threading.Event()
+            self._recv_thr = threading.Thread(target=self._listen_loop,
+                                              args=(self._listen_stop,), daemon=True)
+            self._recv_thr.start()
 
-    def _listen_loop(self):
-        while self._running:
+    def stop_listening(self):
+        """Stop callback delivery and wait for the receive thread to exit."""
+        with self._listener_lock:
+            thread = self._recv_thr
+            self._listen_stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("receive callback has not exited; USB device remains open")
+
+    def _is_listening(self):
+        return (self._recv_thr is not None and self._recv_thr.is_alive()
+                and not self._listen_stop.is_set())
+
+    def _resume_listener(self, was_listening):
+        if was_listening:
+            if threading.current_thread() is self._recv_thr:
+                self._listen_stop.clear()
+            else:
+                self.start_listening()
+
+    def _listen_loop(self, stop_event):
+        while self._running and not stop_event.is_set():
             try:
                 frame = self.receive(timeout=0.1)
                 if frame is not None:
-                    for cb in self._callbacks:
+                    for cb in tuple(self._callbacks):
+                        if stop_event.is_set():
+                            break
                         try:
                             cb(frame)
                         except Exception:
-                            pass
+                            logger.exception("receive callback failed")
             except Exception as e:
-                if self._running:
+                if self._running and not stop_event.is_set():
                     logger.warning("receive error: %s", e)
-                time.sleep(0.01)
+                stop_event.wait(0.01)

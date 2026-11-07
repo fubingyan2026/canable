@@ -1,4 +1,4 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
     "cmake.sourceDirectory": "C:/Users/32457/Desktop/canable/G0_Torque_SetID"
 }

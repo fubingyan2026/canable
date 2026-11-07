@@ -43,7 +43,7 @@ Windows 需安装 WinUSB 驱动（ElmueSoft 固件支持自动安装），并将
 ## 公开 API
 
 ```python
-from canable_sdk import ZDTCanable, CANFrame, logger, CANABLE_VID, CANABLE_PID
+from canable_sdk import ZDTCanable, CANFrame, CANableCommandError, logger, CANABLE_VID, CANABLE_PID
 ```
 
 ### ZDTCanable
@@ -57,13 +57,15 @@ from canable_sdk import ZDTCanable, CANFrame, logger, CANABLE_VID, CANABLE_PID
 | `close()` | 关闭连接（停止 CAN、释放 USB 资源） |
 | 上下文管理器 | 支持 `with ZDTCanable() as bus:` |
 
+`ZDTCanable(serial=..., port=(bus, address), backend=...)` 可按序列号或 USB 总线/设备地址选择设备；`backend` 接收 PyUSB backend 对象。`port` 不是串口名称。
+
 #### CAN 控制器生命周期
 
 | 方法 | 说明 |
 |------|------|
-| `start(loopback=False, disable_echo=False, one_shot=False)` | 启动 CAN 控制器，自动按 `fd_mode`/`silent` 设置标志 |
+| `start(loopback=None, disable_echo=None, one_shot=None)` | 启动 CAN 控制器；首次省略的选项默认为 False，后续省略则保留上次成功启动的选项 |
 | `stop()` | 停止 CAN 控制器 |
-| `recover()` | 从 bus-off 恢复：复位 → 清缓冲 → 重新设置位定时 → 重启，并启用 500ms TX 冷却 |
+| `recover()` | 复位 → 清缓冲 → 恢复位时序、启动选项、过滤器和负载报告 → 重启，启用 300ms TX 冷却；USB TX 错误恢复后为 500ms |
 
 #### 位定时配置
 
@@ -99,7 +101,7 @@ from canable_sdk import ZDTCanable, CANFrame, logger, CANABLE_VID, CANABLE_PID
 | `set_filter(operation, can_id, mask)` | 硬件验收过滤器（`FIL_ClearAll`/`FIL_AcceptMask11bit`/`FIL_AcceptMask29bit`，最多 8 个） |
 | `clear_filters()` | 清除所有过滤器 |
 | `get_termination()` / `set_termination(enabled)` | 120Ω 终端电阻读写 |
-| `set_bus_load_report(interval)` | 启用/关闭总线负载百分比报告（0=off, 1..255=周期） |
+| `set_bus_load_report(interval)` | 启用/关闭总线负载百分比报告（0=off, 1..100，单位 100ms） |
 | `set_pin_status(pin_id, operation)` | 控制处理器引脚（如 BOOT0：`PINOP_Reset`/`PINOP_Set`/`PINOP_Tristate` 等） |
 | `get_pin_status(pin_id)` | 读取引脚状态位标志（`PINST_High`/`PINST_Enabled`） |
 
@@ -110,6 +112,9 @@ from canable_sdk import ZDTCanable, CANFrame, logger, CANABLE_VID, CANABLE_PID
 | `on_receive(callback)` | 注册接收回调（参数为 `CANFrame`） |
 | `on_overflow(callback)` | 注册溢出回调 |
 | `start_listening()` | 启动后台接收线程，自动分发到已注册回调 |
+| `stop_listening()` | 停止回调并等待接收线程退出，保持 CAN 控制器运行 |
+
+先调用 `start()` 再调用 `start_listening()`；重复启动监听不会创建额外线程。后台监听运行时由它独占 `receive()`，调用方通过回调接收帧。`stop()` / `close()` 会等待监听线程退出；回调应及时返回。`recover()` / 运行中切换静默模式会恢复此前的监听状态。
 
 #### 属性
 
@@ -146,8 +151,10 @@ from canable_sdk import ZDTCanable, CANFrame, logger, CANABLE_VID, CANABLE_PID
 | `to_elmue_bytes(marker)` | 序列化为 ElmueSoft TX 字节流 |
 | `from_elmue_rx(raw, has_timestamp)` (classmethod) | 从 ElmueSoft RX 字节流解析 |
 | `from_elmue_echo(raw, has_timestamp, tx_frames)` (classmethod) | 从 ElmueSoft TX Echo 解析 |
-| `to_legacy_bytes()` | 序列化为 Legacy 80 字节帧 |
-| `from_legacy_bytes(raw)` (classmethod) | 从 Legacy 80 字节帧解析（含错误帧识别） |
+| `to_legacy_bytes()` | 序列化为 Legacy 帧（Classic TX 20 字节，FD TX 80 字节） |
+| `from_legacy_bytes(raw, has_timestamp=None, fd_mode=None)` (classmethod) | 从 Legacy 帧解析；驱动显式传入协商模式，独立调用时可省略并按包长推断 |
+
+发送前会校验 ID、长度和标志组合：Classic CAN 超过 8 字节、FD 超过 64 字节、FD+RTR、Classic+BRS/ESI 都会抛出 `ValueError`。FD 的 9/10/11 等非标准长度会补零至下一合法 DLC 长度；原始 `CANFrame.data` 不变，TX 回显返回实际上总线的数据（含补零）。
 
 ## FD 模式配置顺序
 
@@ -160,11 +167,12 @@ bus.start()                               # 4. 启动
 
 ⚠️ **关键约束**：
 
-- `set_data_bitrate()` 必须在 `start()` **之前**调用，启动后设置会静默失败
-- `start()` 时会自动在 flags 中加上 `GS_DevFlagCAN_FD`，否则 STM32 FDCAN 运行在 Classic 模式会丢弃 FD 帧
-- 若对端使用 BRS（数据波特率 > 标称），`data_bitrate` **必须大于** `nominal_bitrate`，否则固件不会置 BRSE 位，FDCAN 会丢弃所有 BRS=1 的帧
-- 数据相时序限制：TSEG1≤15, TSEG2≤15, SJW≤15（STM32G4 硬件限制），固件内置值为 Seg1=5、Seg2=2、采样点 75%
-- 错误的 Seg1 会触发 `FBK_InvalidParameter` (eFeedback=50)，导致数据比特率未存储，启动时返回 `FBK_BaudrateNotSet` (58)
+- 位时序和 `fd_mode` 必须在 `start()` **之前**设置，运行中修改会抛出异常。
+- 当前固件通过数据相位时序隐式启用 FD；配置过数据时序后，启动时必须将 `fd_mode` 设为 True。切回 Classic 可先 `stop()`，再设 `fd_mode=False` 并 `start()`。
+- SDK 从固件能力应答读取 CAN 时钟和位时序范围；缺少扩展能力时，数据相采用保守限制 TSEG1/TSEG2/SJW≤15、BRP≤32。
+- 自定义时序按波特率误差、采样点误差、时间量子总数选择；波特率误差不得超过 1%。默认标称采样点 87.5%，数据相 75%，8Mbps 固定为 50%。
+- `stop()` 会使固件清除位时序。SDK 在下次 `start()` 时自动恢复最后成功设置的配置。
+- 固件返回 `FBK_InvalidParameter`、`FBK_BaudrateNotSet` 等错误时，SDK 抛出 `CANableCommandError`，其 `request` 和 `feedback` 字段保留命令和错误码。
 
 ## USB 标识
 
@@ -181,13 +189,15 @@ bus.start()                               # 4. 启动
 驱动自动检测并适配两种协议：
 
 - **ElmueSoft 变长协议**（优先，能力标志含 `ELM_DevFlagProtocolElmue`）：消息头 `{size, msg_type}`，类型包括 `MSG_TxFrame`/`MSG_TxEcho`/`MSG_RxFrame`/`MSG_Error`/`MSG_String`/`MSG_Busload`，TX 帧使用 1 字节 marker（1-255）做 Echo 匹配
-- **Legacy 固定 80 字节协议**：向后兼容旧固件，TX 始终回显不可关闭，错误帧每秒重复数百次
+- **Legacy 协议**：向后兼容旧固件，接收包长由控制器 FD/时间戳模式决定（20/24/76/80 字节），不可仅根据当前帧的 FD 标志推断时间戳。
 
 ## 错误处理
 
-- 每个 `ctrl_out` 命令后自动调用 `ELM_ReqGetLastError` 检查执行结果，失败时通过 logger 输出 `eFeedback` 名称
-- `send()` 遇到 USB pipe 错误时自动清除 STALL、调用 `recover()`、设置 500ms TX 冷却期
-- `receive()` 遇到 USB overflow 时自动清空端点缓冲
+- ElmueSoft 模式下，控制写入和 `ELM_ReqGetLastError` 查询作为一个加锁事务执行，固件拒绝命令或反馈读取失败都会抛出异常；Legacy 模式不查询该扩展命令。
+- `send()` 遇到 USB pipe 错误时通过端点 `clear_halt()` 清除 STALL；短写也视为失败并重置控制器。错误恢复后仍向调用方报告该次发送失败，不自动重发，以免重复发送可能已被设备接收的帧。
+- 开启回显时最多保留 255 个在途 marker，收到回显后释放；全部占用时明确报错，不覆盖未确认记录。持续发送时应同步接收（或启用后台监听）；无需回显的 ElmueSoft 应用可用 `start(disable_echo=True)`。
+- `receive()` 遇到 USB overflow 时丢弃中断的协议片段并调用溢出回调，保留下次读取的数据和未确认 TX 记录。
+- `receive(timeout=0)` 做一次 USB 读取并将 USB 超时设为 1ms，不会把零传给 libusb 而无限等待。其他超时采用单调时钟，并等待正常帧而跳过负载报告等辅助消息。
 - 错误帧解析支持 `eErrFlagsCanID` 全部位（`Bus-off`/`No-ACK`/`CRC-Err`/`Arbitration lost` 等）和 Byte1-Byte5 详细字段
 
 ## 命令行工具
@@ -198,6 +208,14 @@ python -m canable_sdk --fd      # CAN FD 模式监听（2M 数据相）
 ```
 
 启动后会列出所有设备，自动以 500kbps（FD 模式外加 2Mbps 数据相）启动并打印所有收到的帧，`Ctrl+C` 退出。
+
+## 回归测试
+
+无需连接设备，模拟 USB 端点及固件控制状态：
+
+```bash
+python -B -m unittest discover -s tests -v
+```
 
 ## 平台支持
 

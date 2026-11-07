@@ -154,6 +154,11 @@ class CANWorker(QObject):
             self.state_changed.emit(True, f"{_('Status.ConnectedAt')} {self.bitrate:,} bps")
         except Exception as e:
             logger.exception("连接失败: %s", e)
+            if self._bus is not None:
+                try:
+                    self._bus.close()
+                except Exception:
+                    logger.exception("连接失败后释放 USB 资源失败")
             self._bus = None
             self._connected = False
             self.error.emit(f"{_('Error.ConnectFailed')}: {e}")
