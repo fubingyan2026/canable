@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from struct import Struct
 from typing import Optional
 
 # --------------------------------------------------------------------- #
@@ -33,8 +34,10 @@ class Cmd(IntEnum):
     CANCEL     = 0x06   # H→N
     DATA_START = 0x07   # H→N
     DATA_END   = 0x08   # H→N
+    GET_INFO   = 0x09   # H→N (claw_ctrl)
     ACK        = 0x10   # N→H
     NACK       = 0x11   # N→H
+    INFO       = 0x12   # N→H (claw_ctrl)
 
 
 # --------------------------------------------------------------------- #
@@ -63,6 +66,50 @@ class Err(IntEnum):
 BLOCK_SIZE = 1024                       # 1KB
 PROTOCOL_HEADER_LEN = 2                 # Cmd + Seq
 SUPPORTED_FRAME_SIZES = (8, 12, 16, 20, 24, 32, 48, 64)
+INFO_PAGE_COUNT = 5
+_INFO_PAYLOAD = Struct(">IIIIIHBBB")
+_CLAW_IMAGE_HEADER = Struct("<IIII")
+
+
+@dataclass(frozen=True)
+class FirmwareInfo:
+    version: int
+    reboot_count: int
+    metadata_revision: int
+    size: int
+    crc32: int
+    hardware_id: int
+    flags: int
+    last_result: int
+    last_error: int
+
+
+def format_version(version: int) -> str:
+    return f"{version >> 16}.{(version >> 8) & 0xFF}.{version & 0xFF}"
+
+
+def claw_image_version(fw: bytes) -> Optional[int]:
+    if len(fw) < 0x200 + _CLAW_IMAGE_HEADER.size:
+        return None
+    magic, target, version_magic, version = _CLAW_IMAGE_HEADER.unpack_from(fw, 0x200)
+    if (magic, target, version_magic) == (0x41505031, 0x434C4157, 0x56524531) and version <= 0xFFFFFF:
+        return version
+    return None
+
+
+def build_get_info(token: int) -> bytes:
+    return bytes((Cmd.GET_INFO, token)) + bytes(6)
+
+
+def parse_info_page(data: bytes, token: int) -> Optional[tuple[int, bytes]]:
+    if len(data) == 8 and data[0] == Cmd.INFO and data[1] == token and data[2] < INFO_PAGE_COUNT:
+        return data[2], bytes(data[3:])
+    return None
+
+
+def parse_info(pages: dict[int, bytes]) -> FirmwareInfo:
+    payload = b"".join(pages[i] for i in range(INFO_PAGE_COUNT))
+    return FirmwareInfo(*_INFO_PAYLOAD.unpack(payload))
 
 # 节点回这些错误码时在 NACK 负载中带期望块号，Host 据此重同步/断点续传
 RESYNC_STATUS = (Err.BLOCK_INDEX_MISMATCH, Err.INVALID_FRAME, Err.TIMEOUT)

@@ -13,6 +13,7 @@ from canable_sdk import CANFrame
 
 # ── CAN ID 基址 ──
 SYNC_ID = 0x80
+SINGLE_CONTROL_BASE = 0x100
 MIT_SINGLE_BASE = 0x110
 FEEDBACK_ID_BASE = 0x300
 ZERO_ID_BASE = 0x600      # 标零：CANopen SDO 写请求
@@ -23,6 +24,8 @@ BIT_BRAKE = 0x40
 BIT_CLEAR_ERR = 0x20
 MODE_MASK = 0x1E
 MODE_MIT = 0x06
+SINGLE_MODE_TORQUE = 0x07   # §3.1 力矩传感器闭环；使能 + 释放抱闸 = 0xCE
+SINGLE_CONTROL_MODES = (1, 2, 3, 4, 5, SINGLE_MODE_TORQUE)
 
 # ── MIT 参数固定量程 ──
 # 文档 docs/juxie_canfd_cmd.md §4.1（9 字节帧）的增益满量程
@@ -105,6 +108,56 @@ def raw_to_torque(raw: int, torque_max: float, signed: bool = False) -> float:
         v = raw - 4096 if raw >= 2048 else raw
         return v / 2047.0 * tmax
     return (raw / 4095.0 * 2.0 - 1.0) * tmax
+
+
+def build_single_control(dev_id: int, enable: bool, brake: bool,
+                         clear_err: bool, mode: int, target: int,
+                         acceleration: int = 0, profile_velocity: int = 0,
+                         *, fd: bool = False) -> CANFrame:
+    """§3.1：7 字节单执行器控制；target 为有符号协议原始值。
+
+    位置原始值 -32768..32767 对应 -180..180°；速度为 RPM，
+    电流为 mA，力矩模式 0x07 为 0.1 Nm。轮廓加速度为无符号 RPM/s；
+    轮廓速度使用非负 RPM。其余模式未定义的字段固定填零。
+    """
+    if not 0 <= dev_id <= 255:
+        raise ValueError("Dev_ID must be in 0..255")
+    if mode not in SINGLE_CONTROL_MODES:
+        raise ValueError("Single actuator mode must be 1, 2, 3, 4, 5 or 7")
+    if not -32768 <= target <= 32767:
+        raise ValueError("Target must be a signed 16-bit value")
+    if not 0 <= acceleration <= 20000:
+        raise ValueError("Acceleration must be in 0..20000 RPM/s")
+    if not 0 <= profile_velocity <= 65535:
+        raise ValueError("Profile velocity must be in 0..65535 RPM")
+    data = struct.pack(">BhHH", build_control_byte(enable, brake, clear_err, mode),
+                       target, acceleration if mode in (1, 2) else 0,
+                       profile_velocity if mode == 1 else 0)
+    return CANFrame(can_id=SINGLE_CONTROL_BASE | dev_id, data=data,
+                    extended=False, fd=fd, brs=fd)
+
+
+def build_single_control_units(dev_id: int, enable: bool, brake: bool,
+                               clear_err: bool, mode: int, target: float,
+                               acceleration: int = 0, profile_velocity: int = 0,
+                               *, fd: bool = False) -> CANFrame:
+    """§3.1 物理单位入口：位置 °、速度 RPM、电流 mA、力矩 Nm。
+
+    按 §3.2：90° = 16384 count，20 Nm = 200 count。
+    位置 +180° 饱和为 32767，避免溢出成 -180°；-180° 为 -32768。
+    """
+    limits = {1: (-180.0, 180.0), 2: (-32768, 32767),
+              3: (-180.0, 180.0), 4: (-32768, 32767),
+              5: (-32768, 32767), SINGLE_MODE_TORQUE: (-3276.8, 3276.7)}
+    if mode not in limits:
+        raise ValueError("Single actuator mode must be 1, 2, 3, 4, 5 or 7")
+    if not math.isfinite(target) or not limits[mode][0] <= target <= limits[mode][1]:
+        raise ValueError("Target is outside the physical range for this mode")
+    scale = (32768.0 / 180.0 if mode in (1, 3) else
+             10.0 if mode == SINGLE_MODE_TORQUE else 1.0)
+    raw = _clamp_int16(_lround(target * scale))
+    return build_single_control(dev_id, enable, brake, clear_err, mode, raw,
+                                acceleration, profile_velocity, fd=fd)
 
 
 # ── MIT 单轴控制帧构造 ──
@@ -319,7 +372,7 @@ def parse_feedback(data: bytes) -> FeedbackData | None:
         return None
 
     pos_raw = struct.unpack('>h', data[0:2])[0]
-    position = pos_raw * 180.0 / 32767.0
+    position = max(-180.0, pos_raw * 180.0 / 32767.0)
     speed = struct.unpack('>h', data[2:4])[0]
     current = struct.unpack('>h', data[4:6])[0]
     error_code = struct.unpack('>H', data[6:8])[0]
@@ -342,7 +395,7 @@ def parse_feedback(data: bytes) -> FeedbackData | None:
     position_reached = bool(status & 0x10)
 
     return FeedbackData(
-        position=round(position, 2),
+        position=position,
         speed=speed,
         current=current,
         error_code=error_code,

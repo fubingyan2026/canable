@@ -12,7 +12,7 @@
     └─────────────────────────────────────────────┘
 
 升级期间 UpgradeTask 在宿主 CAN worker 线程上运行，直接操作已打开的 ZDTCanable
-（帧间 1ms 节流 + 中途 NACK 拦截，对齐 flash_tool）。
+（可配置帧间隔和中途 NACK 拦截）。
 插件不管理设备生命周期，只负责数据收发。
 """
 from __future__ import annotations
@@ -21,18 +21,20 @@ import logging
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QGroupBox,
                                 QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                 QPlainTextEdit, QProgressBar, QPushButton,
                                 QSpinBox, QVBoxLayout, QWidget)
 
+from canable_sdk import CANFrame
 from cangui.i18n import _, get_language
 from cangui.plugin_ui import FlowLayout
 
 from . import protocol as P
-from .upgrader import UpgradeTask, UpgradeSignals, BootConfig
+from .upgrader import (UpgradeTask, UpgradeSignals, BootConfig,
+                       DEFAULT_FRAME_INTERVAL_MS, MAX_FRAME_INTERVAL_MS)
 
 logger = logging.getLogger("plugin.boot_upgrade")
 
@@ -59,8 +61,28 @@ _I18N_KEYS = {
     "Boot.Browse":           ("浏览…",            "Browse…"),
     "Boot.HostCanID":        ("主机 CAN ID",       "Host CAN ID"),
     "Boot.HardwareID":       ("硬件兼容 ID",       "Hardware ID"),
-    "Boot.FirmwareVersion":  ("固件版本",          "Firmware Version"),
+    "Boot.FirmwareVersion":  ("传输版本",          "Transfer Version"),
     "Boot.FrameSize":        ("帧长度",           "Frame Size"),
+    "Boot.FrameInterval":    ("帧间隔",           "Frame Interval"),
+    "Boot.PacingResult":      ("主机 DATA 发送间隔：平均 {:.2f} ms，最短 {:.2f} ms（{} 个样本）",
+                              "Host DATA send spacing: {:.2f} ms average, {:.2f} ms minimum ({} samples)"),
+    "Boot.DeviceInfo":       ("板端固件信息",      "Device Firmware Info"),
+    "Boot.QueryInfo":        ("读取固件信息",      "Read Firmware Info"),
+    "Boot.InfoIdle":         ("点击读取以获取板端版本和启动次数。", "Read the installed version and boot count."),
+    "Boot.InfoWaiting":      ("正在读取…",         "Reading…"),
+    "Boot.InfoTimeout":      ("板端无应答，或固件不支持查询。", "No reply or firmware does not support this query."),
+    "Boot.InfoVersion":      ("固件 V{}  ·  硬件 ID 0x{:04X}", "Firmware V{}  ·  Hardware ID 0x{:04X}"),
+    "Boot.InfoDetails":      ("启动 {} 次  ·  元数据修订 {}  ·  {} 字节  ·  CRC32 {:08X}",
+                              "Boots {}  ·  Metadata revision {}  ·  {} bytes  ·  CRC32 {:08X}"),
+    "Boot.InfoInvalid":      ("板端元数据不可用",    "Device metadata unavailable"),
+    "Boot.LastInstall":      ("上次安装：{}",       "Last installation: {}"),
+    "Boot.InstallNone":      ("无记录",            "No record"),
+    "Boot.InstallSuccess":   ("成功",              "Successful"),
+    "Boot.InstallFailed":    ("失败",              "Failed"),
+    "Boot.InstallPending":   ("待安装",            "Installation pending"),
+    "Boot.InstallBadImage":  ("镜像无效",          "Invalid image"),
+    "Boot.InstallFlash":     ("Flash 写入或校验失败", "Flash programming or verification failed"),
+    "Boot.Unknown":          ("未知",              "Unknown"),
     "Boot.Progress":         ("进度",             "Progress"),
     "Boot.OverallProgress":  ("总进度",           "Overall"),
     "Boot.State":            ("状态",             "State"),
@@ -73,8 +95,8 @@ _I18N_KEYS = {
     "Boot.NotConnected":     ("CAN 未连接，请先在主界面连接设备",
                               "CAN not connected. Connect a device first."),
     "Boot.NoFile":           ("请先选择固件文件",   "Please select a firmware file first."),
-    "Boot.StartConfirm":     ("确认开始升级？\n\n固件: {}\n大小: {} 字节\n版本: 0x{:04X}\n硬件 ID: 0x{:04X}\n帧长: {}",
-                              "Start upgrade?\n\nFirmware: {}\nSize: {} bytes\nVersion: 0x{:04X}\nHW ID: 0x{:04X}\nFrame: {}"),
+    "Boot.StartConfirm":     ("确认开始升级？\n\n固件: {}\n大小: {} 字节\n版本: {}\n硬件 ID: 0x{:04X}\n帧长: {}\n帧间隔: {} ms",
+                              "Start upgrade?\n\nFirmware: {}\nSize: {} bytes\nVersion: {}\nHW ID: 0x{:04X}\nFrame: {}\nFrame interval: {} ms"),
     "Boot.CancelConfirm":    ("升级进行中，确认取消？",
                               "Upgrade in progress. Cancel?"),
     "Boot.Done":             ("升级完成",          "Upgrade complete"),
@@ -98,6 +120,7 @@ class _ConfigStore:
         "hw_id":        0x0001,
         "fw_version":   0x0100,
         "frame_size":   64,
+        "frame_interval_ms": DEFAULT_FRAME_INTERVAL_MS,
     }
 
     def __init__(self, ctx):
@@ -149,6 +172,13 @@ class BootUpgradePanel(QWidget):
         self._task: Optional[UpgradeTask] = None
         self._signals: Optional[UpgradeSignals] = None
         self._current_state = BootState.IDLE
+        self._info: Optional[P.FirmwareInfo] = None
+        self._info_status = "Boot.InfoIdle"
+        self._info_token = 0
+        self._info_pages: dict[int, bytes] = {}
+        self._info_timer = QTimer(self)
+        self._info_timer.setSingleShot(True)
+        self._info_timer.timeout.connect(self._on_info_timeout)
         self._build_ui()
         self._load_config_to_ui()
         self._wire_config_save()
@@ -200,12 +230,17 @@ class BootUpgradePanel(QWidget):
         self._rebuild_frame_size_combo()
         self._frame_size_combo.setCurrentIndex(self._frame_size_combo.findData(64))
         self._lbl_frame_size = QLabel(self._tr("Boot.FrameSize"))
+        self._interval_spin = QSpinBox()
+        self._interval_spin.setRange(0, MAX_FRAME_INTERVAL_MS)
+        self._interval_spin.setSuffix(" ms")
+        self._lbl_interval = QLabel(self._tr("Boot.FrameInterval"))
 
         fields = FlowLayout()
         for label, control in ((self._lbl_host_can_id, self._host_id_spin),
                                (self._lbl_hardware_id, self._hw_id_spin),
                                (self._lbl_firmware_version, self._fw_version_spin),
-                               (self._lbl_frame_size, self._frame_size_combo)):
+                               (self._lbl_frame_size, self._frame_size_combo),
+                               (self._lbl_interval, self._interval_spin)):
             pair = QWidget()
             pair_layout = QHBoxLayout(pair)
             pair_layout.setContentsMargins(0, 0, 0, 0)
@@ -214,6 +249,17 @@ class BootUpgradePanel(QWidget):
             fields.addWidget(pair)
         cfg_layout.addLayout(fields)
         layout.addWidget(self._cfg_box)
+
+        self._info_box = QGroupBox(self._tr("Boot.DeviceInfo"))
+        info_layout = QVBoxLayout(self._info_box)
+        self._query_btn = QPushButton(self._tr("Boot.QueryInfo"))
+        self._query_btn.clicked.connect(self._on_query_info)
+        info_layout.addWidget(self._query_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self._info_label = QLabel(self._tr(self._info_status))
+        self._info_label.setWordWrap(True)
+        self._info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        info_layout.addWidget(self._info_label)
+        layout.addWidget(self._info_box)
 
         # --- 进度区 ---
         self._prog_box = QGroupBox(self._tr("Boot.Progress"))
@@ -286,6 +332,7 @@ class BootUpgradePanel(QWidget):
         self._host_id_spin.setValue(int(self._cfg.get("host_id")))
         self._hw_id_spin.setValue(int(self._cfg.get("hw_id")))
         self._fw_version_spin.setValue(int(self._cfg.get("fw_version")))
+        self._interval_spin.setValue(int(self._cfg.get("frame_interval_ms")))
         idx = self._frame_size_combo.findData(int(self._cfg.get("frame_size")))
         if idx >= 0:
             self._frame_size_combo.setCurrentIndex(idx)
@@ -293,6 +340,7 @@ class BootUpgradePanel(QWidget):
     def _wire_config_save(self) -> None:
         self._host_id_spin.valueChanged.connect(
             lambda v: self._cfg.set("host_id", v))
+        self._host_id_spin.valueChanged.connect(lambda _: self._clear_info())
         self._hw_id_spin.valueChanged.connect(
             lambda v: self._cfg.set("hw_id", v))
         self._fw_version_spin.valueChanged.connect(
@@ -300,6 +348,8 @@ class BootUpgradePanel(QWidget):
         self._frame_size_combo.currentIndexChanged.connect(
             lambda i: self._cfg.set("frame_size",
                                      self._frame_size_combo.itemData(i)))
+        self._interval_spin.valueChanged.connect(
+            lambda v: self._cfg.set("frame_interval_ms", v))
 
     # ------------------------------------------------------------------ #
     #  按钮事件
@@ -337,31 +387,87 @@ class BootUpgradePanel(QWidget):
             return
 
         version = self._fw_version_spin.value()
+        embedded = P.claw_image_version(fw)
+        version_text = f"0x{version:04X}" if embedded is None else f"V{P.format_version(embedded)}"
         hw_id = self._hw_id_spin.value()
         host_id = self._host_id_spin.value()
+        interval_ms = self._interval_spin.value()
 
         confirm = self._tr("Boot.StartConfirm").format(
-            os.path.basename(path), len(fw), version, hw_id, frame_size)
+            os.path.basename(path), len(fw), version_text, hw_id, frame_size, interval_ms)
         if QMessageBox.question(self, self._tr("Boot.Start"), confirm) != \
                 QMessageBox.StandardButton.Yes:
             return
 
         self._log_view.clear()
         self._overall_bar.setValue(0)
+        self._clear_info()
 
         config = BootConfig(
             fw=fw, fw_version=version, hw_id=hw_id,
             max_frame_size=frame_size, host_id=host_id,
+            frame_interval_ms=interval_ms,
         )
 
         self._signals = UpgradeSignals()
         self._signals.state_changed.connect(self._on_state)
         self._signals.progress.connect(self._on_progress)
         self._signals.log.connect(self._on_log)
+        self._signals.timing.connect(self._on_timing)
         self._signals.finished.connect(self._on_finished)
 
         self._task = UpgradeTask(config, self._signals)
-        self._ctx.start_upgrade(self._task)
+        self._on_state(BootState.HANDSHAKE)
+        try:
+            self._ctx.start_upgrade(self._task)
+        except RuntimeError as exc:
+            self._on_finished(False, str(exc))
+
+    def _on_query_info(self):
+        if not self._ctx.is_connected() or self._task is not None:
+            return
+        self._info_token = (self._info_token + 1) & 0xFF
+        self._info = None
+        self._info_pages.clear()
+        self._info_status = "Boot.InfoWaiting"
+        self._info_timer.start(1500)
+        self._show_info()
+        self._refresh_state(self._current_state)
+        self._ctx.send_frame(CANFrame(can_id=self._host_id_spin.value(),
+                                      data=P.build_get_info(self._info_token)))
+
+    def _clear_info(self, status="Boot.InfoIdle"):
+        self._info_timer.stop()
+        self._info_pages.clear()
+        self._info = None
+        self._info_status = status
+        self._show_info()
+        self._refresh_state(self._current_state)
+
+    def _on_info_timeout(self):
+        self._clear_info("Boot.InfoTimeout")
+
+    def _show_info(self):
+        info = self._info
+        if info is None:
+            self._info_label.setText(self._tr(self._info_status))
+            return
+        lines = [self._tr("Boot.InfoVersion").format(P.format_version(info.version), info.hardware_id)]
+        if info.flags & 1:
+            lines.append(self._tr("Boot.InfoDetails").format(
+                info.reboot_count, info.metadata_revision, info.size, info.crc32))
+            result_key = {0: "Boot.InstallNone", 1: "Boot.InstallSuccess", 2: "Boot.InstallFailed"}
+            result = self._tr(result_key.get(info.last_result, "Boot.Unknown"))
+            if info.last_error:
+                error_key = {1: "Boot.InstallBadImage", 2: "Boot.InstallFlash"}
+                error = self._tr(error_key.get(info.last_error, "Boot.Unknown"))
+                result += f" ({error}, 0x{info.last_error:02X})"
+            lines.append(self._tr("Boot.LastInstall").format(result))
+            if info.flags & 2:
+                lines.append(self._tr("Boot.InstallPending"))
+        else:
+            lines.append(self._tr("Boot.InfoInvalid"))
+        self._info_label.setText("\n".join(lines))
 
     def _on_cancel(self):
         if self._task is None:
@@ -392,6 +498,8 @@ class BootUpgradePanel(QWidget):
         self._hw_id_spin.setEnabled(not busy)
         self._fw_version_spin.setEnabled(not busy)
         self._frame_size_combo.setEnabled(not busy)
+        self._interval_spin.setEnabled(not busy)
+        self._query_btn.setEnabled(not busy and self._ctx.is_connected() and not self._info_timer.isActive())
 
     def _on_progress(self, block: int, total: int):
         pct = int(block * 100 / total) if total > 0 else 0
@@ -400,6 +508,9 @@ class BootUpgradePanel(QWidget):
     def _on_log(self, level: str, msg: str):
         prefix = {"info": "", "warn": "⚠ ", "error": "✗ "}.get(level, "")
         self._log_view.appendPlainText(f"{prefix}{msg}")
+
+    def _on_timing(self, average_ms: float, min_ms: float, count: int):
+        self._log_view.appendPlainText(self._tr("Boot.PacingResult").format(average_ms, min_ms, count))
 
     def _on_finished(self, success: bool, msg: str):
         if success:
@@ -410,24 +521,40 @@ class BootUpgradePanel(QWidget):
         self._task = None
         self._signals = None
         self._cancel_btn.setText(self._tr("Boot.Cancel"))
-        self._refresh_state(BootState.DONE if success else BootState.FAILED)
+        self._on_state(BootState.DONE if success else BootState.FAILED)
 
     # ------------------------------------------------------------------ #
     #  插件回调
     # ------------------------------------------------------------------ #
     def on_connect(self):
-        pass
+        self._refresh_state(self._current_state)
 
     def on_disconnect(self):
-        pass
+        self._clear_info()
 
     def on_frames(self, frames):
-        pass  # Upgrader 在 worker 线程直接收发，不依赖宿主派发
+        if not self._info_timer.isActive():
+            return
+        node_id = (self._host_id_spin.value() + 1) & 0x7FF
+        for frame in frames:
+            if frame.can_id != node_id or frame.extended or frame.is_error:
+                continue
+            page = P.parse_info_page(frame.data, self._info_token)
+            if page is not None:
+                index, data = page
+                self._info_pages[index] = data
+        if len(self._info_pages) == P.INFO_PAGE_COUNT:
+            self._info_timer.stop()
+            self._info = P.parse_info(self._info_pages)
+            self._show_info()
+            self._refresh_state(self._current_state)
 
     def refresh_language(self):
         self._cfg_box.setTitle(self._tr("Boot.Config"))
         self._prog_box.setTitle(self._tr("Boot.Progress"))
         self._log_box.setTitle(self._tr("Boot.Log"))
+        self._info_box.setTitle(self._tr("Boot.DeviceInfo"))
+        self._query_btn.setText(self._tr("Boot.QueryInfo"))
         self._browse_btn.setText(self._tr("Boot.Browse"))
         self._start_btn.setText(self._tr("Boot.Start"))
         if self._task is None:
@@ -437,9 +564,11 @@ class BootUpgradePanel(QWidget):
         self._lbl_hardware_id.setText(self._tr("Boot.HardwareID"))
         self._lbl_firmware_version.setText(self._tr("Boot.FirmwareVersion"))
         self._lbl_frame_size.setText(self._tr("Boot.FrameSize"))
+        self._lbl_interval.setText(self._tr("Boot.FrameInterval"))
         self._overall_label.setText(self._tr("Boot.OverallProgress"))
         self._clear_log_btn.setText(self._tr("Boot.ClearLog"))
         self._rebuild_frame_size_combo()
+        self._show_info()
         self._state_label.setText(
             f"{self._tr('Boot.State')}: {self._state_text(self._current_state)}")
 

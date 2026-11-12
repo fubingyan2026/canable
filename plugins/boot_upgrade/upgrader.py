@@ -5,12 +5,15 @@ UpgradeTask: plain object, worker 线程调用 task.run(bus)。
 
 对齐 flash_tool/worker.py 的稳定实现：
 - 同步 while 循环状态机
-- _poll_response() 帧间 1ms 节流 + 中途 NACK 拦截
+- 可配置帧间隔和中途 NACK 拦截
 - _last_rx_monotonic 节点失联检测
 - 断点续传 + 重同步 (RESYNC_STATUS)
 """
 from __future__ import annotations
 
+import logging
+from queue import Empty, SimpleQueue
+from threading import Event, Thread
 import time
 from typing import Optional
 
@@ -20,25 +23,33 @@ from canable_sdk import ZDTCanable, CANFrame
 from . import protocol as P
 from .protocol import Cmd, Err, parse_nack_block_index, RESYNC_STATUS
 
+logger = logging.getLogger("plugin.boot_upgrade")
+
 # ── 超时 / 重试常量 (对齐 flash_tool) ──
 BLOCK_ACK_TIMEOUT = 1.0
 HANDSHAKE_TIMEOUT = 5.0
 MAX_RETRIES = 3
 NODE_LOST_TIMEOUT = 6.0
 MAX_SAME_BLOCK = 5
+DEFAULT_FRAME_INTERVAL_MS = 1
+MAX_FRAME_INTERVAL_MS = 50
 
 
 class BootConfig:
     """升级配置 (由 UI 构建)。"""
     def __init__(self, *, fw: bytes, fw_version: int = 0x0100,
                  hw_id: int = 0x0001, max_frame_size: int = 64,
-                 host_id: int = 0x701):
+                 host_id: int = P.DEFAULT_HOST_ID,
+                 frame_interval_ms: int = DEFAULT_FRAME_INTERVAL_MS):
+        if not 0 <= frame_interval_ms <= MAX_FRAME_INTERVAL_MS:
+            raise ValueError(f"frame_interval_ms must be in 0..{MAX_FRAME_INTERVAL_MS}")
         self.fw = fw
         self.fw_version = fw_version & 0xFFFF
         self.hw_id = hw_id & 0xFFFF
         self.max_frame_size = max_frame_size
         self.host_id = host_id & 0x7FF
         self.node_id = (host_id + 1) & 0x7FF
+        self.frame_interval_ms = frame_interval_ms
 
 
 class UpgradeSignals(QObject):
@@ -47,6 +58,7 @@ class UpgradeSignals(QObject):
     progress = Signal(int, int)
     block_progress = Signal(int, int)
     log = Signal(str, str)
+    timing = Signal(float, float, int)
     finished = Signal(bool, str)
 
 
@@ -65,6 +77,13 @@ class UpgradeTask:
         self._cfg = config
         self._sig = signals
         self.cancel_requested = False
+        self._responses = SimpleQueue()
+        self._stop_rx = Event()
+        self._next_send_at = 0.0
+        self._previous_data_send = None
+        self._gap_count = 0
+        self._gap_total = 0.0
+        self._gap_min = float("inf")
 
     def cancel(self):
         """主线程调用：请求取消升级。"""
@@ -75,13 +94,15 @@ class UpgradeTask:
         """在 worker 线程上执行同步升级状态机。bus 是宿主已打开的 ZDTCanable。"""
         self._bus = bus
         success = False
+        message = "升级完成"
+        receiver = Thread(target=self._receive_responses, name="boot-upgrade-rx")
         try:
+            receiver.start()
             self._do_upgrade()
             success = True
-            self._sig.finished.emit(True, "升级完成")
         except Exception as e:
             self._log_e(f"升级失败: {e}")
-            self._sig.finished.emit(False, str(e))
+            message = str(e)
         finally:
             if not success and self.cancel_requested:
                 try:
@@ -89,6 +110,16 @@ class UpgradeTask:
                     self._log_i("→ CANCEL (节点退回 IDLE)")
                 except Exception:
                     pass
+            self._stop_rx.set()
+            if receiver.ident is not None:
+                receiver.join()
+            if self._gap_count:
+                average_ms = 1000 * self._gap_total / self._gap_count
+                min_ms = 1000 * self._gap_min
+                logger.info("Host DATA TX spacing: set %d ms, avg %.2f ms, min %.2f ms (%d samples)",
+                            self._cfg.frame_interval_ms, average_ms, min_ms, self._gap_count)
+                self._sig.timing.emit(average_ms, min_ms, self._gap_count)
+            self._sig.finished.emit(success, message)
 
     # ── 日志 ──
     def _log_i(self, msg: str):
@@ -101,34 +132,69 @@ class UpgradeTask:
         self._sig.log.emit("error", msg)
 
     # ── CAN 收发 ──
+    def _wait_send_slot(self):
+        # Python 3.12 on Windows uses GetTickCount64 for monotonic().
+        remaining = self._next_send_at - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+
     def _send(self, data: bytes, frame_size: int):
+        self._wait_send_slot()
+        if self.cancel_requested and data[0] != Cmd.CANCEL:
+            raise RuntimeError("用户取消")
         frame = CANFrame(
             can_id=self._cfg.host_id, data=data.ljust(frame_size, b'\x00'),
             extended=False, fd=frame_size > 8, brs=False,
         )
+        sent_at = time.perf_counter()
         self._bus.send(frame)
+        self._next_send_at = sent_at + self._cfg.frame_interval_ms / 1000
+        cmd = data[0]
+        if cmd in (Cmd.DATA, Cmd.DATA_END) and self._previous_data_send is not None:
+            gap = sent_at - self._previous_data_send
+            self._gap_count += 1
+            self._gap_total += gap
+            self._gap_min = min(self._gap_min, gap)
+        self._previous_data_send = sent_at if cmd == Cmd.DATA else None
+
+    def _receive_responses(self):
+        """Keep USB reads off the frame pacing path while the worker owns the bus."""
+        try:
+            while not self._stop_rx.is_set():
+                frame = self._bus.receive(timeout=0.05)
+                if (frame is not None and frame.can_id == self._cfg.node_id
+                        and not frame.extended and not frame.is_tx and not frame.is_error
+                        and len(frame.data) >= 2 and frame.data[0] in (Cmd.ACK, Cmd.NACK)):
+                    self._responses.put(frame)
+        except Exception as exc:
+            self._responses.put(exc)
+
+    def _take_response(self, timeout: float = 0.0) -> Optional[CANFrame]:
+        try:
+            response = self._responses.get(timeout=timeout)
+        except Empty:
+            return None
+        if isinstance(response, Exception):
+            raise response
+        self._last_rx_monotonic = time.perf_counter()
+        return response
 
     def _recv(self, timeout: float) -> Optional[CANFrame]:
-        end_time = time.monotonic() + timeout
-        while time.monotonic() < end_time:
+        end_time = time.perf_counter() + timeout
+        while time.perf_counter() < end_time:
             if self.cancel_requested:
                 raise RuntimeError("用户取消")
-            remaining = end_time - time.monotonic()
+            remaining = end_time - time.perf_counter()
             if remaining <= 0:
                 break
-            frame = self._bus.receive(timeout=min(remaining, 0.2))
-            if frame is not None and frame.can_id == self._cfg.node_id:
-                self._last_rx_monotonic = time.monotonic()
+            frame = self._take_response(min(remaining, 0.05))
+            if frame is not None:
                 return frame
         return None
 
     def _poll_response(self) -> Optional[CANFrame]:
-        """1ms 短超时：帧间节流 + 中途 NACK 拦截。"""
-        frame = self._bus.receive(timeout=0.001)
-        if frame is not None and frame.can_id == self._cfg.node_id:
-            self._last_rx_monotonic = time.monotonic()
-            return frame
-        return None
+        """取出发帧间隔内已经收到的响应。"""
+        return self._take_response()
 
     def _reseek_index(self, data: Optional[bytes]) -> Optional[int]:
         if data is None or len(data) < 3 or data[0] != Cmd.NACK:
@@ -165,6 +231,8 @@ class UpgradeTask:
             if len(data) < 2:
                 continue
             cmd, acked_cmd = data[0], data[1]
+            if expected_cmd == Cmd.DATA_END and acked_cmd == Cmd.DATA and self._reseek_index(data) is not None:
+                return False, resp
             if cmd == Cmd.ACK and acked_cmd == expected_cmd:
                 return True, resp
             if cmd == Cmd.NACK and acked_cmd == expected_cmd:
@@ -179,13 +247,14 @@ class UpgradeTask:
 
         self._log_i("=" * 50)
         self._log_i(f"固件升级: {actual_fw_size}B, v0x{cfg.fw_version:04X}, "
-                     f"HW 0x{cfg.hw_id:04X}, frame={cfg.max_frame_size}")
+                     f"HW 0x{cfg.hw_id:04X}, frame={cfg.max_frame_size}, "
+                     f"interval={cfg.frame_interval_ms}ms")
         self._log_i("=" * 50)
 
         blocks = _block_chunks(fw_data)
         total_blocks = len(blocks)
 
-        self._last_rx_monotonic = time.monotonic()
+        self._last_rx_monotonic = time.perf_counter()
 
         # Phase 1: Handshake
         self._sig.state_changed.emit("handshake")
@@ -226,7 +295,7 @@ class UpgradeTask:
                     attempt = 0
                     continue
                 if resp is None:
-                    if time.monotonic() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
+                    if time.perf_counter() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
                         raise TimeoutError(f"节点失联超过 {NODE_LOST_TIMEOUT:.0f}s")
                     self._log_w(f"Block {block_idx} DATA_START 无响应, 重试…")
                     continue
@@ -238,13 +307,12 @@ class UpgradeTask:
                 self._log_i(f"{tag} 重试 #{attempt}")
             self._log_i(f"{tag} DATA_START → ACK ✓")
 
-            # DATA 帧序列 (帧间 1ms 节流 + NACK 拦截)
+            # DATA 帧序列。在下一帧的发送时刻先检查已到达的 NACK。
             interrupted_to = None
             total_frames = frames_per_block
-            for seq_idx in range(frames_per_block - 1):
-                chunk = block[seq_idx * d:(seq_idx + 1) * d]
-                self._send(P.build_data(seq_idx, chunk), cfg.max_frame_size)
-                self._sig.block_progress.emit(seq_idx + 1, total_frames)
+            checksum = P.calc_16bit_checksum(block)
+            for seq_idx in range(total_frames):
+                self._wait_send_slot()
                 poll = self._poll_response()
                 reseek = self._reseek_index(poll.data) if poll is not None else None
                 if reseek is not None:
@@ -252,24 +320,17 @@ class UpgradeTask:
                     self._log_w(f"途中拦截 NACK [{_err_name(code)}]: 重同步到块 {reseek}")
                     interrupted_to = reseek
                     break
-                if self.cancel_requested:
-                    raise RuntimeError("用户取消")
+                chunk = block[seq_idx * d:(seq_idx + 1) * d]
+                data = (P.build_data_end(seq_idx, checksum, chunk) if seq_idx == total_frames - 1
+                        else P.build_data(seq_idx, chunk))
+                self._send(data, cfg.max_frame_size)
+                self._sig.block_progress.emit(seq_idx + 1, total_frames)
 
             if interrupted_to is not None:
                 same_block_streak = (same_block_streak + 1) if interrupted_to == block_idx else 0
                 block_idx = interrupted_to
                 attempt = 0
                 continue
-
-            # DATA_END
-            last_start = (frames_per_block - 1) * d
-            remaining = block[last_start:last_start + d]
-            checksum = P.calc_16bit_checksum(block)
-            end_raw = P.build_data_end(frames_per_block - 1, checksum, remaining)
-            self._send(end_raw, cfg.max_frame_size)
-            self._sig.block_progress.emit(total_frames, total_frames)
-            if self.cancel_requested:
-                raise RuntimeError("用户取消")
 
             ack, resp = self._wait_block(Cmd.DATA_END)
             if ack:
@@ -304,7 +365,7 @@ class UpgradeTask:
                     self._log_i(f"{tag} NACK: CHECKSUM, 重试")
                     continue
                 raise RuntimeError(f"Block {block_idx + 1} DATA_END NACK: {_err_name(n_code)} (0x{n_code:02X})")
-            if time.monotonic() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
+            if time.perf_counter() - self._last_rx_monotonic > NODE_LOST_TIMEOUT:
                 raise TimeoutError(f"节点失联超过 {NODE_LOST_TIMEOUT:.0f}s")
             self._log_w(f"Block {block_idx + 1} 无响应, 重试…")
 

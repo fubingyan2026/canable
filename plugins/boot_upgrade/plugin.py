@@ -85,7 +85,8 @@ class BootUpgradePlugin(Plugin):
             self._panel.on_disconnect()
 
     def on_frames(self, frames) -> None:
-        pass  # Upgrader 自有 CAN 连接，不依赖宿主派发帧
+        if self._panel is not None:
+            self._panel.on_frames(frames)
 
     def refresh_language(self) -> None:
         if self._panel is not None:

@@ -1,0 +1,2 @@
+﻿cycle,elapsed_s,cmd_max_deg,kp,kd,primary_fb_deg,mirror_fb_deg,primary_err_deg,mirror_err_deg
+1,0.500,30.000,12.000,0.020,15.854,-17.447,-14.146,12.553

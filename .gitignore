@@ -1,5 +1,7 @@
 *.o
 /dist
+/.venv-build/
+/build/packaging/
 send_list.csv
 trace.csv
 logs/

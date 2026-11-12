@@ -4,12 +4,28 @@
 #   排除所有未使用的 Qt 模块 — 减小体积
 
 from PyInstaller.building.datastruct import Tree
+from PyInstaller.depend.bindepend import resolve_library_path
+from pathlib import Path
+import os
+import sys
+
+if sys.platform == 'win32':
+    usb_library = str(Path(SPECPATH) / 'libusb-1.0.dll')
+elif sys.platform.startswith('linux'):
+    usb_library = resolve_library_path('libusb-1.0.so.0')
+else:
+    raise SystemExit('Packaging is supported on Windows and Linux only.')
+if not usb_library or not Path(usb_library).is_file():
+    raise SystemExit('libusb not found: Windows needs libusb-1.0.dll in the project root; '
+                     'Linux needs the libusb-1.0-0 system package.')
+
+liangzhi_assets = Path('docs/良质关节驱动协议手册/图片和附件')
 
 a = Analysis(
     ['cangui.py'],
     pathex=[],
     binaries=[
-        ('libusb-1.0.dll', '.'),
+        (usb_library, '.'),
     ],
     datas=[
         ('cangui/logo.svg', 'cangui'),
@@ -19,6 +35,9 @@ a = Analysis(
         ('cangui/arrow_down.svg', 'cangui'),
         ('cangui/arrow_down_dark.svg', 'cangui'),
         ('cangui/logo.ico', 'cangui'),
+        *((str(path), liangzhi_assets.as_posix())
+          for pattern in ('endpoint*.json', 'ds402.eds')
+          for path in (Path(SPECPATH) / liangzhi_assets).glob(pattern)),
     ],
     hiddenimports=[
         'usb.backend.libusb1',
@@ -40,6 +59,11 @@ a = Analysis(
         'plugins.juxie_motor.plugin',
         'plugins.juxie_motor.protocol',
         'plugins.juxie_motor.widget',
+        'plugins.liangzhi_motor',
+        'plugins.liangzhi_motor.plugin',
+        'plugins.liangzhi_motor.faults',
+        'plugins.liangzhi_motor.protocol',
+        'plugins.liangzhi_motor.widget',
         # torque_sensor 插件
         'plugins.torque_sensor',
         'plugins.torque_sensor.plugin',
@@ -58,6 +82,11 @@ a = Analysis(
         'plugins.keli_torque.protocol',
         'plugins.keli_torque.scope',
         'plugins.keli_torque.widget',
+        # fill_light 插件
+        'plugins.fill_light',
+        'plugins.fill_light.plugin',
+        'plugins.fill_light.protocol',
+        'plugins.fill_light.widget',
     ],
     hookspath=[],
     hooksconfig={},
@@ -124,6 +153,16 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+if sys.platform == 'win32':
+    # Qt uses Windows' unversioned ICU API. An unrelated ICU on PATH (e.g.
+    # Poppler's versioned ICU) can be picked up by dependency analysis and
+    # break QtWidgets at startup. Keep these OS libraries out of the bundle.
+    system32 = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32'
+    system_icu = {'icu.dll', 'icuuc.dll', 'icuin.dll'}
+    a.binaries = [entry for entry in a.binaries
+                  if not (Path(entry[0]).name.lower() in system_icu
+                          and (system32 / Path(entry[0]).name).is_file())]
+
 # 插件目录：Tree 递归收集所有文件，排除 __pycache__
 a.datas += Tree('plugins', prefix='plugins', excludes=['__pycache__'])
 pyz = PYZ(a.pure)
@@ -138,7 +177,7 @@ exe = EXE(
     name='CANable2.5',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=sys.platform != 'win32',
     upx=False,
     console=False,
     disable_windowed_traceback=False,
@@ -146,5 +185,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['cangui/logo.ico'],
+    icon=['cangui/logo.ico'] if sys.platform == 'win32' else None,
 )

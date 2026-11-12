@@ -41,6 +41,7 @@
 - **参数持久化** — 窗口布局、比特率、过滤器、发送列表等自动保存恢复
 - **Trace 导出** — 支持 CSV / JSON Lines / ASC 格式
 - **插件系统** — 中心 Tab 支持加载自定义插件（`plugins/` 目录）
+- **补光灯控制插件** — 支持亮度滑条、百分比输入、开关及预设，核对控制板目标亮度并监控心跳（[使用说明](plugins/fill_light/README.md)）
 - **日志系统** — 每次启动生成独立日志文件（`logs/canable_YYYYMMDD_HHMMSS.log`），终端 INFO + 文件 DEBUG
 
 ## 环境搭建
@@ -103,19 +104,50 @@ python -m cangui
 
 ## 打包 EXE
 
-```powershell
-# 1. 安装 PyInstaller
-pip install pyinstaller
+项目根目录提供 Windows / Linux 自动打包脚本，首次运行会创建独立环境
+`.venv-build/<平台>/`，自动安装 `requirements.txt` 和 PyInstaller，再生成单文件程序。
+需要 Python 3.10+，推荐 Python 3.12。首次安装依赖需要联网。
 
-# 2. 使用 spec 文件打包（onedir 模式，UPX 已禁用以加快启动）
+Windows（也可双击 `build_exe.bat`）：
+
+```powershell
+.\build_exe.bat
+```
+
+输出：`dist/windows/CANable2.5.exe`。
+
+Linux（以 Debian / Ubuntu 为例）：
+
+```bash
+sudo apt install python3 python3-venv libusb-1.0-0 binutils
+bash build_exe.sh
+```
+
+输出：`dist/linux/CANable2.5`，运行 `./dist/linux/CANable2.5`。
+Linux 桌面仍需具备 Qt 所需的系统图形库；设备访问权限可通过 `install_udev.sh` 配置。
+
+后续可跳过依赖安装；也可使用已准备好的当前 Python 环境：
+
+```bash
+python build_exe.py --skip-install
+python build_exe.py --current-env --skip-install
+```
+
+这两个参数也可以传给 `.bat` / `.sh` 脚本。脚本可以从其他工作目录启动。
+Windows 和 Linux 程序需要分别在对应平台构建，架构跟随构建所用的 Python。
+Linux 建议在需要支持的最旧发行版上构建，以减少 glibc 版本兼容问题。
+
+手动打包仍可使用原配置：
+
+```bash
+python -m pip install -r requirements.txt pyinstaller
 pyinstaller --clean --noconfirm CANable2.5.spec
 ```
 
-输出：`dist/CANable2.5/CANable2.5.exe`
+手动打包输出：`dist/CANable2.5.exe`（Windows）或 `dist/CANable2.5`（Linux）。
 
-`CANable2.5.spec` 已配置：
-- 资源文件：`logo.svg`、`check.svg`、`close.svg`、`close_hover.svg`、`libusb-1.0.dll`
-- 隐藏导入：`usb.backend.libusb1`、`usb.backend.libusb0`、`PySide6.QtXml`
+`CANable2.5.spec` 使用 onefile 模式，禁用 UPX；收集图标、插件及其隐藏导入，
+Windows 携带项目根目录的 `libusb-1.0.dll`，Linux 查找并携带系统 `libusb-1.0.so.0`。
 
 `settings.json` 和 `send_list.csv` 保存在 exe 同目录下，持久化不丢失。
 

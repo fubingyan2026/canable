@@ -219,8 +219,8 @@ class ThemeTests(unittest.TestCase):
         self.assertTrue(self.window.act_theme_light.isChecked())
 
     def test_all_plugins_fit_default_viewport_in_both_languages_and_themes(self):
-        names = {"battery_monitor", "boot_upgrade", "juxie_motor",
-                 "keli_torque", "power_monitor", "torque_sensor"}
+        names = {"battery_monitor", "boot_upgrade", "juxie_motor", "liangzhi_motor",
+                 "keli_torque", "power_monitor", "torque_sensor", "fill_light"}
         self.assertEqual({p.name for p in self.window.plugins._plugins}, names)
         self.window.resize(1400, 850)
         panels = {name: self.activate(name) for name in names}

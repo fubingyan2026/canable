@@ -8,3 +8,8 @@ bound,0x601,False,False,True,True,8,23 40 25 00 03 00 00 00,100.0,False
 cx,0x80,False,False,True,True,8,00 00 00 00 00 00 00 00,100.0,False
 save,0x601,False,False,True,True,8,23 39 25 00 01 00 00 00,100.0,False
 rb,0x601,False,False,True,True,8,40 40 25 00 00 00 00 00,100.0,False
+固件版本,0x601,False,False,True,True,8,40 0A 10 00 00 00 00 00,100.0,False
+V1,0x601,False,False,True,True,8,60 00 00 00 00 00 00 00,100.0,False
+v2,0x601,False,False,True,True,8,70 00 00 00 00 00 00 00,100.0,False
+LZ设置5M波特率,0x24,False,False,False,False,8,01 49 00 00 40 4B 4C 00,100.0,False
+LZ保存&重启,0x3F,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
