@@ -64,6 +64,9 @@ a = Analysis(
         'plugins.liangzhi_motor.faults',
         'plugins.liangzhi_motor.protocol',
         'plugins.liangzhi_motor.widget',
+        'plugins.liangzhi_position',
+        'plugins.liangzhi_position.plugin',
+        'plugins.liangzhi_position.widget',
         # torque_sensor 插件
         'plugins.torque_sensor',
         'plugins.torque_sensor.plugin',

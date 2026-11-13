@@ -1,6 +1,6 @@
-"""claw_ctrl CAN protocol V1.1: fill-light control and board heartbeat.
+"""claw_ctrl CAN protocol V1.3: fill-light control and board status query.
 
-Reference: claw_ctrl/docs/can-protocol.md (2026-11-10).
+Reference: claw_ctrl/docs/can-protocol.md.
 No Qt dependency. All frames are standard CAN FD, DLC 8, BRS off.
 """
 from __future__ import annotations
@@ -10,10 +10,10 @@ import struct
 
 from canable_sdk import CANFrame
 
-CONTROL_ID = 0x220
+REQUEST_ID = 0x220
 STATUS_ID = 0x221
 BITRATE = 1_000_000
-HEARTBEAT_TIMEOUT = 1.5
+STATUS_TIMEOUT = 1.5
 MAX_LEVEL = 1000
 
 
@@ -27,7 +27,12 @@ class BoardStatus:
 def build_light_control(level: int) -> CANFrame:
     if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= MAX_LEVEL:
         raise ValueError("PWM level must be an integer in 0..1000")
-    return CANFrame(can_id=CONTROL_ID, data=struct.pack('<BBH4x', 1, 1, level),
+    return CANFrame(can_id=REQUEST_ID, data=struct.pack('<BBH4x', 1, 1, level),
+                    extended=False, fd=True, brs=False)
+
+
+def build_status_query() -> CANFrame:
+    return CANFrame(can_id=REQUEST_ID, data=b'\x01' + bytes(7),
                     extended=False, fd=True, brs=False)
 
 

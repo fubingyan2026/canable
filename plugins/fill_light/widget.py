@@ -1,4 +1,4 @@
-"""Native Qt controls for claw_ctrl fill-light protocol V1.1."""
+"""Native Qt controls for claw_ctrl fill-light protocol V1.3."""
 from __future__ import annotations
 
 import time
@@ -21,7 +21,8 @@ class FillLightPanel(QWidget):
         self._status = None
         self._last_rx = None
         self._pending_level = None
-        self._sent_at = None
+        self._request_sent_at = None
+        self._request_timed_out = False
         self._message_key = 'FillLight.Ready'
         self._message_args = {}
         self._active = False
@@ -36,9 +37,9 @@ class FillLightPanel(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(150)
         self._debounce.timeout.connect(self._apply)
-        self._poll = QTimer(self)
-        self._poll.setInterval(100)
-        self._poll.timeout.connect(self._refresh_status)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(100)
+        self._status_timer.timeout.connect(self._refresh_status)
 
         root = QVBoxLayout(self)
         hint = self._label('FillLight.Hint')
@@ -87,6 +88,9 @@ class FillLightPanel(QWidget):
 
         self._board = QGroupBox(_('FillLight.Board'))
         form = QFormLayout(self._board)
+        self._query_btn = self._button('FillLight.Query', self._query_status)
+        self._send_buttons.append(self._query_btn)
+        form.addRow(self._query_btn)
         self._connection = QLabel()
         self._connection.setWordWrap(True)
         self._accepted = QLabel()
@@ -156,58 +160,78 @@ class FillLightPanel(QWidget):
             self._ctx.status_message(_(error), 4000)
             return
         level = self._slider.value()
-        self._ctx.send_frame(P.build_light_control(level))
-        self._pending_level = level
-        self._sent_at = time.monotonic()
         self._set_message('FillLight.Waiting', value=level / 10)
+        self._send_request(P.build_light_control(level), level)
+
+    def _query_status(self):
+        if not self._active or not self._ready():
+            return
+        self._send_request(P.build_status_query())
+
+    def _send_request(self, frame, level=None):
+        self._pending_level = level
+        self._request_sent_at = time.monotonic()
+        self._request_timed_out = False
+        self._ctx.send_frame(frame)
+        self._refresh_status()
 
     def on_frames(self, frames):
-        if not self._active or not self._ctx.is_connected():
+        if not self._active or not self._ready() or self._request_sent_at is None:
             return
-        for frame in frames:
+        self._refresh_status()
+        if self._request_sent_at is None:
+            return
+        for frame in reversed(frames):
             status = P.parse_status(frame)
             if status is None:
                 continue
             self._status, self._last_rx = status, time.monotonic()
+            self._request_sent_at = None
             if self._pending_level is not None:
                 if status.level == self._pending_level:
-                    self._pending_level = self._sent_at = None
                     self._set_message('FillLight.Matched', value=status.level / 10)
                 else:
                     self._set_message('FillLight.Mismatch', value=status.level / 10)
+                self._pending_level = None
+            break
         self._refresh_status()
 
     def _refresh_status(self):
         now = time.monotonic()
         age = None if self._last_rx is None else now - self._last_rx
         connected = self._ctx.is_connected()
+        if self._request_sent_at is not None and now - self._request_sent_at >= P.STATUS_TIMEOUT:
+            self._request_sent_at = None
+            self._request_timed_out = True
+            if self._pending_level is not None:
+                self._pending_level = None
+                self._set_message('FillLight.Timeout')
         key = ('FillLight.Disconnected' if not connected else
+               'FillLight.Querying' if self._request_sent_at is not None else
+               'FillLight.QueryTimeout' if self._request_timed_out else
                'FillLight.Unknown' if age is None else
-               'FillLight.Offline' if age >= P.HEARTBEAT_TIMEOUT else 'FillLight.Online')
+               'FillLight.LastReply')
         self._connection.setText(_(key).format(age=age))
-        fresh = connected and age is not None and age < P.HEARTBEAT_TIMEOUT
-        if fresh:
+        if connected and self._status is not None and not self._request_timed_out:
             self._accepted.setText(f'{self._status.level / 10:.1f}%')
             self._motor.setText(_(f'FillLight.Motor.{self._status.motor_state}'))
             self._uptime.setText(_('FillLight.UptimeValue').format(seconds=self._status.uptime_ms / 1000))
         else:
             for label in (self._accepted, self._motor, self._uptime):
                 label.setText(_('FillLight.NoData'))
-        if self._pending_level is not None and now - self._sent_at >= P.HEARTBEAT_TIMEOUT:
-            self._pending_level = self._sent_at = None
-            self._set_message('FillLight.Timeout')
         for button in self._send_buttons:
-            button.setEnabled(self._ready())
+            button.setEnabled(self._active and self._ready())
 
     def on_activated(self):
         self._active = True
-        self._poll.start()
+        self._status_timer.start()
         self._refresh_status()
 
     def _reset(self):
         self._debounce.stop()
         self._status = self._last_rx = None
-        self._pending_level = self._sent_at = None
+        self._pending_level = self._request_sent_at = None
+        self._request_timed_out = False
         self._set_message('FillLight.Ready')
         self._refresh_status()
 
@@ -220,8 +244,8 @@ class FillLightPanel(QWidget):
     def on_deactivating(self):
         self._active = False
         self._debounce.stop()
-        self._poll.stop()
-        self._pending_level = self._sent_at = None
+        self._status_timer.stop()
+        self._pending_level = self._request_sent_at = None
 
     def refresh_language(self):
         for widget, key in self._texts:

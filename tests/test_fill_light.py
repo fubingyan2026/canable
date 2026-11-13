@@ -38,6 +38,14 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(level=level), self.assertRaises(ValueError):
                 P.build_light_control(level)
 
+    def test_status_query_vector(self):
+        frame = P.build_status_query()
+        self.assertEqual(frame.can_id, 0x220)
+        self.assertEqual(frame.data, bytes.fromhex('01 00 00 00 00 00 00 00'))
+        self.assertEqual(frame.dlc, 8)
+        self.assertTrue(frame.fd)
+        self.assertFalse(frame.brs or frame.extended or frame.rtr)
+
     def test_heartbeat_and_uint32_wrap_values(self):
         self.assertEqual(P.parse_status(heartbeat()), P.BoardStatus(2, 500, 10000))
         for state in range(5):
@@ -109,11 +117,11 @@ class PanelTests(unittest.TestCase):
     def test_presets_off_and_restore_last_nonzero(self):
         button = self.panel._presets[0][0]
         button.click()
-        self.assertEqual(self.ctx.frames[-1].data, P.build_light_control(250).data)
+        self.assertEqual(self.ctx.frames[-1], P.build_light_control(250))
         self.panel._off.click()
-        self.assertEqual(self.ctx.frames[-1].data, P.build_light_control(0).data)
+        self.assertEqual(self.ctx.frames[-1], P.build_light_control(0))
         self.panel._on.click()
-        self.assertEqual(self.ctx.frames[-1].data, P.build_light_control(250).data)
+        self.assertEqual(self.ctx.frames[-1], P.build_light_control(250))
         self.assertEqual(len(self.ctx.frames), 3)
 
     def test_auto_debounce_and_immediate_off_cancel_pending_send(self):
@@ -122,13 +130,11 @@ class PanelTests(unittest.TestCase):
         self.panel._slider.setValue(600)
         self.assertFalse(self.ctx.frames)
         QTest.qWait(200)
-        self.assertEqual(len(self.ctx.frames), 1)
-        self.assertEqual(self.ctx.frames[-1].data, P.build_light_control(600).data)
+        self.assertEqual(self.ctx.frames, [P.build_light_control(600)])
         self.panel._slider.setValue(800)
         self.panel._off.click()
         QTest.qWait(200)
-        self.assertEqual(len(self.ctx.frames), 2)
-        self.assertEqual(self.ctx.frames[-1].data, P.build_light_control(0).data)
+        self.assertEqual(self.ctx.frames, [P.build_light_control(600), P.build_light_control(0)])
 
     def test_invalid_bus_configuration_never_sends(self):
         for config in ({'connected': False}, {'fd': False}, {'bitrate': 500000}):
@@ -136,36 +142,52 @@ class PanelTests(unittest.TestCase):
                 old = {key: getattr(self.ctx, key) for key in config}
                 for key, value in config.items(): setattr(self.ctx, key, value)
                 self.panel._apply()
+                self.panel._query_status()
                 self.assertFalse(self.ctx.frames)
                 for key, value in old.items(): setattr(self.ctx, key, value)
 
-    def test_heartbeat_freshness_matching_and_timeout(self):
+    def test_manual_query_and_snapshot_age(self):
         with patch('plugins.fill_light.widget.time.monotonic', return_value=10):
             self.plugin.on_frames([heartbeat()])
+            self.assertIsNone(self.panel._last_rx)
+            self.panel._query_btn.click()
+            self.assertEqual(self.ctx.frames, [P.build_status_query()])
+            self.assertEqual(self.panel._connection.text(), i18n._('FillLight.Querying'))
+            self.plugin.on_frames([heartbeat(250), heartbeat(500)])
+            self.assertEqual(self.panel._accepted.text(), '50.0%')
+        with patch('plugins.fill_light.widget.time.monotonic', return_value=20):
+            self.panel._refresh_status()
+            self.assertEqual(self.panel._connection.text(), i18n._('FillLight.LastReply').format(age=10))
+            self.assertEqual(self.panel._accepted.text(), '50.0%')
+            self.assertEqual(len(self.ctx.frames), 1)
+
+    def test_adjustment_replies_match_mismatch_and_timeout(self):
+        with patch('plugins.fill_light.widget.time.monotonic', return_value=10):
             self.panel._apply_btn.click()
-            self.assertIsNotNone(self.panel._pending_level)  # Old snapshot is not a reply.
+            self.assertIsNotNone(self.panel._pending_level)
             self.plugin.on_frames([heartbeat(250)])
             self.assertEqual(self.panel._message_key, 'FillLight.Mismatch')
+            self.panel._apply_btn.click()
             self.plugin.on_frames([heartbeat(500)])
             self.assertEqual(self.panel._message_key, 'FillLight.Matched')
-        with patch('plugins.fill_light.widget.time.monotonic', return_value=11.5):
-            self.panel._refresh_status()
-            self.assertEqual(self.panel._accepted.text(), i18n._('FillLight.NoData'))
-            self.assertEqual(self.panel._connection.text(), i18n._('FillLight.Offline'))
         with patch('plugins.fill_light.widget.time.monotonic', return_value=12):
             self.panel._apply()
         with patch('plugins.fill_light.widget.time.monotonic', return_value=13.5):
             self.panel._refresh_status()
             self.assertEqual(self.panel._message_key, 'FillLight.Timeout')
             self.assertIsNone(self.panel._pending_level)
+            self.assertEqual(self.panel._accepted.text(), i18n._('FillLight.NoData'))
+            self.assertEqual(self.panel._connection.text(), i18n._('FillLight.QueryTimeout'))
+            self.panel._query_btn.click()
             self.plugin.on_frames([heartbeat(500, 4, 0)])
             self.assertEqual(self.panel._motor.text(), i18n._('FillLight.Motor.4'))
             self.assertEqual(self.panel._accepted.text(), '50.0%')
 
     def test_invalid_frames_do_not_refresh_online_time(self):
+        self.panel._query_btn.click()
         self.plugin.on_frames([replace(heartbeat(), is_tx=True), heartbeat(1001)])
         self.assertIsNone(self.panel._last_rx)
-        self.assertEqual(self.panel._connection.text(), i18n._('FillLight.Unknown'))
+        self.assertEqual(self.panel._connection.text(), i18n._('FillLight.Querying'))
 
     def test_deactivation_disconnect_stop_deferred_commands(self):
         self.panel._auto.setChecked(True)
@@ -180,7 +202,7 @@ class PanelTests(unittest.TestCase):
         self.plugin.on_deactivating()
         QTest.qWait(200)
         self.assertFalse(self.ctx.frames)
-        self.assertFalse(self.panel._poll.isActive())
+        self.assertFalse(self.panel._status_timer.isActive())
 
 
 if __name__ == '__main__':

@@ -13,3 +13,5 @@ V1,0x601,False,False,True,True,8,60 00 00 00 00 00 00 00,100.0,False
 v2,0x601,False,False,True,True,8,70 00 00 00 00 00 00 00,100.0,False
 LZ设置5M波特率,0x24,False,False,False,False,8,01 49 00 00 40 4B 4C 00,100.0,False
 LZ保存&重启,0x3F,False,False,False,False,8,00 00 00 00 00 00 00 00,100.0,False
+LZ-ID2标零,0x44,False,False,False,False,8,00 96 01 00 00 00 00 00,100.0,False
+LZ-ID1标零,0x24,False,False,False,False,8,00 96 01 00 00 00 00 00,100.0,False
